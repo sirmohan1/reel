@@ -319,6 +319,16 @@ def watching(jid, ttl=None):
     return any(v["id"] == jid for v in viewers(ttl))
 
 
+def viewer_count(jid):
+    """How many devices are on this item right now, this one included.
+
+    Counts only devices actively playing: the page reports its position as it
+    plays, so a paused or backgrounded one ages out within seconds. That is the
+    honest reading -- someone who paused ten minutes ago is not watching.
+    """
+    return sum(1 for v in viewers() if v["id"] == jid)
+
+
 def playhead(jid):
     """The furthest-along position among everyone watching this item.
 
@@ -660,6 +670,7 @@ def public(job):
             "conv_speed": job.get("conv_speed"),
             # What the finished file holds, so the player can tell whether it
             # needs to ask for the compat rendition instead.
+            "viewers": viewer_count(job["id"]),
             "play_key": job.get("play_key"),
             "compat_ready": bool(job.get("compat_ready")),
             "compat_pct": job.get("compat_pct"),
@@ -3129,6 +3140,11 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .kind{font:400 10px/1 var(--mono);letter-spacing:.1em;color:var(--faint);
     text-transform:uppercase}
   .kind.now{color:var(--brass)}
+  /* only appears when more than this device is on the item */
+  .eyes{font:400 10px/1 var(--mono);letter-spacing:.08em;color:var(--live);
+    border:1px solid rgba(127,169,138,.35);border-radius:3px;padding:3px 5px;
+    white-space:nowrap;display:none}
+  .eyes.on{display:inline-block}
   .stat{font:400 11.5px/1 var(--mono);color:var(--dim);
     font-variant-numeric:tabular-nums;text-align:right;min-width:74px}
   .stat.ready{color:var(--live)}
@@ -3421,11 +3437,13 @@ function makeRow(id) {
   li.innerHTML = '<span class="n"></span>' +
     '<span class="body"><span class="title"></span>' +
     '<span class="track"><i></i></span><span class="note"></span></span>' +
-    '<span class="flags"><span class="kind"></span><span class="stat"></span></span>' +
+    '<span class="flags"><span class="eyes"></span><span class="kind"></span>' +
+    '<span class="stat"></span></span>' +
     '<button class="kill" type="button" aria-label="Remove">&times;</button>';
   const el = {li, n: li.querySelector('.n'), title: li.querySelector('.title'),
               track: li.querySelector('.track'), fill: li.querySelector('.track i'),
               note: li.querySelector('.note'), kind: li.querySelector('.kind'),
+              eyes: li.querySelector('.eyes'),
               stat: li.querySelector('.stat'), kill: li.querySelector('.kill')};
   li.addEventListener('click', ev => {
     if (ev.target === el.kill) return;
@@ -3468,6 +3486,12 @@ function paint() {
                           : j.source === 'torrent' ? 'tor'
                           : j.kind === 'audio' ? 'aud' : 'vid';
     el.kind.classList.toggle('now', j.status === 'streaming' || !!j.live);
+    /* Only worth showing when it isn't just this device. The count includes
+       us, so 2 means one other screen is on the same thing. */
+    const others = (j.viewers || 0) - (i === cur ? 1 : 0);
+    el.eyes.textContent = others > 0
+        ? (i === cur ? '+' + others + ' watching' : others + ' watching') : '';
+    el.eyes.classList.toggle('on', others > 0);
     el.note.textContent = j.error || (j.paused ? j.note : '');
     el.note.classList.toggle('quiet', !j.error && !!j.paused);
     el.note.style.display = j.error ? 'block' : 'none';
@@ -3554,8 +3578,20 @@ function showWire() {
   // nothing to say about a file that's already local
   const seeding = j && j.complete && j.status === 'streaming';
   const converting = j && j.status === 'converting';
-  if (!j || j.status === 'done' || (!seeding && !converting && !j.health && !j.rate)) {
+  const shared = j && (j.viewers || 0) > 1;
+  // A finished item normally has nothing to report, but who else is on it is
+  // worth saying even then.
+  if (!j || (!shared && j.status === 'done')
+         || (!seeding && !converting && !shared && !j.health && !j.rate)) {
     wire.hidden = true; return;
+  }
+  if (shared && j.status === 'done') {
+    $('lamp').className = 'lamp ok';
+    $('verdict').textContent = 'Also playing on ' + (j.viewers - 1) +
+        (j.viewers - 1 === 1 ? ' other device' : ' other devices');
+    $('figures').textContent = '';
+    wire.hidden = false;
+    return;
   }
   wire.hidden = false;
   const h = j.health || 'unknown';
@@ -3590,6 +3626,7 @@ function showWire() {
     if (buf) bits.push(buf + ' buffered');
     if (j.eta) bits.push(clock(j.eta) + ' left');
   }
+  if (shared) bits.push((j.viewers - 1) + ' other watching');
   $('figures').textContent = bits.join('  \u00b7  ');
 }
 

@@ -108,9 +108,23 @@ STREAM_LOCK = threading.Lock()
 
 # ---- cache accounting --------------------------------------------------------
 
-def folder_size_bytes():
+SIZE_CACHE = {"at": 0.0, "bytes": 0}
+SIZE_TTL = 2.0
+
+
+def folder_size_bytes(max_age=SIZE_TTL):
     """Every byte under DL, including in-progress *_raw temp dirs, so the cap
-    reflects what the folder actually costs on disk."""
+    reflects what the folder actually costs on disk.
+
+    Memoised for a couple of seconds: this walks the whole cache, and it is
+    asked by the janitor every 2s *and* by /sys, which every connected device
+    polls. Three phones made it a full stat of several thousand files per
+    second, all to answer a number that changes slowly. Pass max_age=0 where the
+    answer must be current, as the evictor does between deletions.
+    """
+    now = time.time()
+    if max_age and now - SIZE_CACHE["at"] < max_age:
+        return SIZE_CACHE["bytes"]
     total = 0
     for root, _dirs, files in os.walk(DL):
         for f in files:
@@ -118,6 +132,7 @@ def folder_size_bytes():
                 total += os.path.getsize(os.path.join(root, f))
             except OSError:
                 pass
+    SIZE_CACHE["at"], SIZE_CACHE["bytes"] = now, total
     return total
 
 
@@ -145,9 +160,7 @@ def in_use(jid):
     with STREAM_LOCK:
         if STREAMING.get(jid, 0) > 0:
             return True
-    if PLAYING["id"] == jid and time.time() - PLAYING["seen"] < PLAY_GRACE:
-        return True
-    return False
+    return watching(jid)
 
 
 def cancel_status(job):
@@ -264,14 +277,57 @@ def enforce_cache_cap():
             j.update(status="evicted", path=None, received=0, total=0,
                      live_file=None, live_ready=False, wt_url=None,
                      wt_direct=False, rate=None, headroom=None, pct=None)
-        if folder_size_bytes() <= cap:
+        # Measured afresh after every deletion: a cached figure here would still
+        # show the file we just removed and we would carry on evicting past the
+        # point where the folder already fits.
+        if folder_size_bytes(0) <= cap:
             return True
-    return folder_size_bytes() <= cap
+    return folder_size_bytes(0) <= cap
 
 
 # ---- scheduling: one item warm ahead, using only spare bandwidth -------------
 
-PLAYING = {"id": None, "at": 0.0, "seen": 0.0}
+# Where each device is up to, keyed by the client id the page generates. One
+# global entry was enough while this only served localhost, but on a network two
+# people watch two different things: with a single slot the second viewer's item
+# looks unwatched, and the evictor is free to delete the file underneath them.
+PLAYING = {}
+PLAY_LOCK = threading.Lock()
+
+
+def note_playing(cid, jid, at):
+    if not cid:
+        return
+    now = time.time()
+    with PLAY_LOCK:
+        PLAYING[cid] = {"id": jid, "at": at, "seen": now}
+        for k in [k for k, v in PLAYING.items() if now - v["seen"] > 3600]:
+            del PLAYING[k]
+
+
+def viewers(ttl=15.0):
+    """Everyone still watching, most recently heard from first."""
+    now = time.time()
+    with PLAY_LOCK:
+        live = [dict(v) for v in PLAYING.values() if now - v["seen"] < ttl]
+    return sorted(live, key=lambda v: -v["seen"])
+
+
+def watching(jid, ttl=None):
+    """Is any device sitting on this item?"""
+    ttl = PLAY_GRACE if ttl is None else ttl
+    return any(v["id"] == jid for v in viewers(ttl))
+
+
+def playhead(jid):
+    """The furthest-along position among everyone watching this item.
+
+    Furthest, because that viewer has the least downloaded ahead of them, and a
+    buffer figure is only useful if it describes whoever is closest to running
+    out.
+    """
+    at = [v["at"] for v in viewers() if v["id"] == jid]
+    return max(at) if at else 0.0
 ACTIVE = ("downloading", "converting", "fetching metadata", "starting",
           "connecting", "streaming")
 
@@ -318,8 +374,7 @@ def buffered_seconds(job):
     if bps <= 0:
         return None
     have = (job.get("received") or 0) * 8 / bps
-    at = PLAYING["at"] if PLAYING["id"] == job["id"] else 0.0
-    return max(0.0, round(have - at, 1))
+    return max(0.0, round(have - playhead(job["id"]), 1))
 
 
 def scheduler():
@@ -330,12 +385,23 @@ def scheduler():
         try:
             with LOCK:
                 order = list(JOBS.values())
-            playing = next((j for j in order if j["id"] == PLAYING["id"]), None)
-            if PLAYING["id"] and time.time() - PLAYING["seen"] > 15:
-                playing = None                   # client went away
+            # Everything being watched right now, freshest viewer first. A
+            # client that has gone quiet drops out of viewers() on its own.
+            seen_ids, watched = [], []
+            for vw in viewers():
+                if vw["id"] and vw["id"] not in seen_ids:
+                    seen_ids.append(vw["id"])
+                    j = next((x for x in order if x["id"] == vw["id"]), None)
+                    if j:
+                        watched.append(j)
+            playing = watched[0] if watched else None
             active = [j for j in order if j["status"] in ACTIVE]
             queued = [j for j in order if j["status"] == "queued" and j.get("hold")]
-            health = stream_health(playing)
+            # The worst of what anyone is watching. A prefetch that would be fine
+            # for one viewer can still be what stalls the other.
+            grades = [stream_health(j) for j in watched] or ["unknown"]
+            health = next((g for g in ("behind", "tight", "ok", "unknown")
+                           if g in grades), "unknown")
 
             # 1. nothing playing and nothing running: start the first item
             if not active and queued:
@@ -2722,12 +2788,14 @@ class H(http.server.BaseHTTPRequestHandler):
 
         elif p == "/playing":
             jid = body.get("id")
-            PLAYING["id"] = jid
             try:
-                PLAYING["at"] = float(body.get("at") or 0)
+                at = float(body.get("at") or 0)
             except (TypeError, ValueError):
-                PLAYING["at"] = 0.0
-            PLAYING["seen"] = time.time()
+                at = 0.0
+            # Falls back to the peer address so a client that predates the id --
+            # or one with localStorage turned off -- still counts as a viewer
+            # rather than silently sharing a slot with everyone else.
+            note_playing(body.get("client") or self.client_address[0], jid, at)
             with LOCK:
                 job = JOBS.get(jid)
                 if job:

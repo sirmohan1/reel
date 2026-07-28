@@ -1936,7 +1936,7 @@ def probe_url(url, timeout=8):
     "Error opening input file".
     """
     try:
-        req = urllib.request.Request(url, headers={"Range": "bytes=0-4095"})
+        req = urllib.request.Request(safe_url(url), headers={"Range": "bytes=0-4095"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read(4096)
             ctype = (r.headers.get("Content-Type") or "").lower()
@@ -1948,6 +1948,28 @@ def probe_url(url, timeout=8):
     except Exception as e:
         return {"ok": False, "status": None, "ranges": False, "ctype": "",
                 "html": False, "error": str(e)[:80], "length": None}
+
+
+def safe_url(u):
+    """Percent-encode a url's path so it can actually be requested.
+
+    webtorrent's index lists files under their real names, and release names are
+    full of spaces and brackets: "Some Film (2021) [1080p] [BluRay]/file.mp4".
+    urllib refuses a url containing a raw space outright -- InvalidURL, raised
+    before a single byte goes out -- so every candidate found on the index page
+    failed for reasons that had nothing to do with the server.
+
+    Unquoted before quoting, so an href that already escaped its spaces doesn't
+    come back double-escaped as %2520.
+    """
+    try:
+        p = urllib.parse.urlsplit(u)
+        path = urllib.parse.quote(urllib.parse.unquote(p.path),
+                                  safe="/:@!$&'()*+,;=~")
+        return urllib.parse.urlunsplit((p.scheme, p.netloc, path, p.query,
+                                        p.fragment))
+    except ValueError:
+        return u
 
 
 def validate_stream_url(url):
@@ -1970,7 +1992,7 @@ def discover_links(base, timeout=5):
     url 404s. Resolve against ".../<infohash>/" instead.
     """
     try:
-        with urllib.request.urlopen(base, timeout=timeout) as r:
+        with urllib.request.urlopen(safe_url(base), timeout=timeout) as r:
             if "html" not in (r.headers.get("Content-Type") or "html"):
                 return []
             body = r.read(200000).decode("utf-8", "replace")
@@ -1982,7 +2004,10 @@ def discover_links(base, timeout=5):
         href = href.strip()
         if not href or href.startswith(("#", "?", "javascript:")) or href in ("/", "..", "./"):
             continue
-        out.append(urllib.parse.urljoin(resolve_base, href))
+        # Encoded here rather than at the point of use: this url is stored on the
+        # job and later handed to ffmpeg and to the range proxy, both of which
+        # want something requestable.
+        out.append(safe_url(urllib.parse.urljoin(resolve_base, href)))
     return out
 
 

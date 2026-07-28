@@ -1,0 +1,18 @@
+# Downloaded media and scratch dirs. reel writes its cache next to the script,
+# and a single episode is over a gigabyte, so none of this belongs in git.
+reel_downloads/
+test_dl/
+*.live.mp4
+*.compat.mp4
+*.compat.live.mp4
+
+# Other projects living in this folder, each of which wants its own repo.
+news-app/
+youtube_automation/
+
+# macOS / python noise
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/

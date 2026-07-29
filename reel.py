@@ -3592,14 +3592,15 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     letter-spacing:.1em;border-radius:4px;background:var(--raise);
     border:1px solid var(--rule);color:var(--dim)}
   .qrbtn:hover{color:var(--text);border-color:#3B434C}
-  .qrpop{margin-top:14px;padding:16px;background:var(--panel);
+  /* Compact and out of the way: it is a thing you glance at once to pair a
+     phone, not part of the interface you use. */
+  .qrpop{margin:10px 0 0 auto;padding:9px;background:var(--panel);
     border:1px solid var(--rule);border-radius:6px;display:flex;
-    flex-direction:column;align-items:center;gap:10px}
-  .qrimg{width:180px;height:180px;background:#fff;border-radius:4px;
-    padding:8px;display:flex}
-  .qrimg svg{width:100%;height:100%}
-  .qrurl{font:400 11.5px/1 var(--mono);color:var(--dim);word-break:break-all;
-    text-align:center}
+    align-items:center;gap:10px;width:max-content;max-width:100%}
+  .qrimg{width:96px;height:96px;background:#fff;border-radius:3px;
+    padding:5px;display:flex;flex:none}
+  .qrimg svg{width:100%;height:100%;display:block}
+  .qrurl{font:400 11px/1.4 var(--mono);color:var(--dim);word-break:break-all}
 
   /* intake */
   form{display:flex;gap:8px;align-items:flex-start;margin:20px 0 0}
@@ -3948,12 +3949,18 @@ async function runSearch(q) {
 
     const title = document.createElement('span');
     title.className = 'rtitle';
-    title.textContent = res.name;            // textContent: never trust a name
+    // The index truncates its own name field mid-word, so prefer the real
+    // filename when the lookup found one -- it's complete, and it carries the
+    // codec and release group the truncated version loses.
+    title.textContent = res.real_name || res.name;   // textContent, never HTML
 
     const meta = document.createElement('span');
     meta.className = 'rmeta';
     const bits = [res.seeders + ' seed', fmtSize(res.size)];
     if (res.res) bits.push(res.res);
+    // Worth saying when the title shown is one file out of several -- a
+    // trilogy pack would otherwise look like a single film.
+    if (res.files > 1) bits.push(res.files + ' files');
     // The genuinely useful hint, and the one no torrent site can give you,
     // because it depends on this machine rather than on the file.
     bits.push(res.direct ? 'plays directly' :

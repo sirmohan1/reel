@@ -77,6 +77,25 @@ VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".ts", ".flv", ".w
              ".mpg", ".mpeg", ".m2ts")
 AUDIO_EXT = (".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus")
 
+# Search. One indexer to begin with, behind a normalising layer so another can
+# be added without the caller noticing. These endpoints go dark without warning
+# -- yts.mx already refuses the requests this was first written against -- so a
+# dead source has to read as "no results", never as a broken feature.
+SEARCH_URL = "https://apibay.org/q.php"
+SEARCH_TIMEOUT = 12
+SEARCH_LIMIT = 25               # rows kept after ranking, not rows fetched
+# Appended to every magnet we build, since the indexer hands back a bare
+# infohash. DHT finds most peers on its own; these only speed up the start.
+# Tracker liveness drifts too: the dead ones in that Spider-Man magnet
+# (coppersurfer, leechers-paradise, rarbg) are why it took 150s to find
+# metadata the first time.
+SEARCH_TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+)
+
 # Seconds of history the download rate is averaged over. Long enough to ride
 # out the gap between one 64 MiB rclone chunk and the next.
 RATE_WINDOW = 8.0
@@ -477,8 +496,18 @@ def release(job):
 
 def janitor():
     """Keeps the cap honest *during* transfers, not just after them. If we're
-    over cap with nothing left to evict, the newest active job is stopped so a
-    single oversized file can't fill the disk."""
+    over cap with nothing left to evict, the newest still-growing download is
+    stopped so a single oversized file can't fill the disk.
+
+    'converting' is deliberately excluded from that last resort. A conversion
+    is actively *freeing* disk -- finalize_torrent() is about to delete a raw
+    download several times the size of what it produces -- so killing it is
+    self-defeating: it destroys completed work and delays the very space this
+    is trying to reclaim. The temporary overlap while it runs (raw + in-progress
+    output + a live copy, all at once) is exactly what pushes the folder over
+    cap in the first place, and it resolves itself within a couple of minutes
+    once the conversion finishes on its own.
+    """
     while True:
         time.sleep(2.0)
         try:
@@ -487,8 +516,7 @@ def janitor():
             if enforce_cache_cap():
                 continue
             with LOCK:
-                active = [j for j in JOBS.values()
-                          if j["status"] in ("downloading", "converting")]
+                active = [j for j in JOBS.values() if j["status"] == "downloading"]
             if active:
                 victim = active[-1]
                 victim["cancel"].set()
@@ -501,6 +529,104 @@ def janitor():
 
 MAGNET_RE = re.compile(r"magnet:\?[^\s\"'<>]+", re.I)
 BTIH_RE = re.compile(r"xt=urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})")
+
+
+def read_release(name):
+    """What a release name tells us about how this file will actually play.
+
+    Guesswork, but useful guesswork, and it is the difference between a choice
+    made blind and one made informed. An x264 release satisfies the wt_direct
+    test: webtorrent's own ranged stream goes straight to the browser, no
+    encoder involved and nothing extra written to disk. An x265 one has to be
+    remuxed once it lands, and an HDR one will look flat unless ffmpeg has
+    zscale. None of that is visible on a torrent site, because it depends on
+    this machine rather than the file.
+    """
+    n = " " + (name or "").lower().replace(".", " ").replace("_", " ") + " "
+    hevc = bool(re.search(r"\b(x265|h ?265|hevc)\b", n))
+    h264 = bool(re.search(r"\b(x264|h ?264|avc)\b", n))
+    av1 = bool(re.search(r"\bav1\b", n))
+    res = None
+    for pat, label in ((r"\b(2160p|4k|uhd)\b", "2160p"), (r"\b1080p\b", "1080p"),
+                       (r"\b720p\b", "720p"), (r"\b(480p|sd)\b", "480p")):
+        if re.search(pat, n):
+            res = label
+            break
+    hdr = bool(re.search(r"\b(hdr|hdr10|dolby ?vision|dv)\b", n))
+    # Only h264 is in BROWSER_VIDEO *and* reliably 8-bit here. AV1 is in that
+    # set too, but 10-bit AV1 is common enough that claiming "direct" would be
+    # wrong often; unknown codecs stay unclaimed rather than over-promise.
+    codec = "hevc" if hevc else "h264" if h264 else "av1" if av1 else None
+    return {"codec": codec, "res": res, "hdr": hdr,
+            "direct": codec == "h264" and not hdr}
+
+
+def build_magnet(infohash, name):
+    parts = ["magnet:?xt=urn:btih:" + infohash.lower()]
+    if name:
+        parts.append("dn=" + urllib.parse.quote_plus(name))
+    parts += ["tr=" + urllib.parse.quote(t) for t in SEARCH_TRACKERS]
+    return "&".join(parts)
+
+
+def search_torrents(query, limit=SEARCH_LIMIT):
+    """Find magnets by name. Returns (results, error).
+
+    Ranked by seeders above all else, because a dead swarm is the one failure
+    no amount of local cleverness recovers from -- the 2-peer magnet earlier
+    found its endpoint correctly and still could not stream a byte.
+    """
+    q = (query or "").strip()
+    if not q:
+        return [], "nothing to search for"
+    url = SEARCH_URL + "?" + urllib.parse.urlencode({"q": q, "cat": 200})
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
+        with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT) as r:
+            rows = _json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        # A dead or blocked indexer is an expected state, not a crash: say so
+        # plainly and leave the rest of the app alone.
+        return [], "couldn't reach the search index (%s)" % str(e)[:60]
+    if not isinstance(rows, list):
+        return [], "unexpected response from the search index"
+
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ih = (row.get("info_hash") or "").strip()
+        # The no-results sentinel: one row, id 0, an all-zero infohash. Left
+        # unfiltered it would offer a magnet that can never resolve.
+        if row.get("id") in ("0", 0) or not re.fullmatch(r"[0-9a-fA-F]{40}", ih):
+            continue
+        if set(ih) == {"0"}:
+            continue
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+
+        def num(key):
+            try:
+                return int(row.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+        info = read_release(name)
+        size = num("size")
+        # What this will actually cost on disk, which is not the same as its
+        # size. A direct stream is served from the download itself, so it costs
+        # exactly that. Anything needing a remux holds the source and the output
+        # at once while converting -- the overlap that put a 8.6 GB film 20 GB
+        # over a 15 GB cap and got its conversion killed mid-run.
+        peak = size if info["direct"] else int(size * 2.05)
+        out.append({"name": name, "infohash": ih.lower(),
+                    "magnet": build_magnet(ih, name),
+                    "seeders": num("seeders"), "leechers": num("leechers"),
+                    "size": size, "files": num("num_files"),
+                    "peak": peak, "fits": peak <= cap_bytes(),
+                    **info})
+    out.sort(key=lambda r: (-r["seeders"], r["size"]))
+    return out[:limit], None
 
 
 def split_sources(text):
@@ -2488,11 +2614,21 @@ def finalize_torrent(job, out_dir, chosen):
               *vfilter, *vargs, *acodec, "-movflags", "+faststart", out], dur)
 
     if job["cancel"].is_set():
-        # A canceller (removal or eviction) already owns this job's state.
         try:
             os.remove(out)
         except OSError:
             pass
+        # drop() and enforce_cache_cap() already update the job's status
+        # themselves before this notices. The janitor's overflow fallback does
+        # not -- it only sets this flag -- so without an explicit transition
+        # here the job is left stranded at 'converting' forever, with nothing
+        # left running to finish it. fail() gives that specific case the same
+        # message run_job() already uses for the identical situation; anything
+        # else (evicted/removed) just confirms what the canceller already set.
+        if job.get("overflow") and not job.get("evicted"):
+            fail(job, "Stopped -- cache is full. Raise the limit or remove items.")
+        else:
+            job["status"] = cancel_status(job)
         return
 
     if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
@@ -2973,6 +3109,13 @@ class H(http.server.BaseHTTPRequestHandler):
             note_caps(body.get("client"), body.get("caps"))
             return self._json(200, {"ok": True})
 
+        if p == "/search":
+            # Nothing is started here -- this only looks. The chosen magnet
+            # comes back through /add like any other, so the download path is
+            # the existing one, unchanged.
+            results, err = search_torrents(body.get("q"))
+            return self._json(200, {"results": results, "error": err})
+
         if p == "/add":
             magnets, ids, bad = split_sources(body.get("links"))
             caps = sorted(caps_of(body.get("client")))
@@ -3335,6 +3478,24 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   button:hover:not(:disabled){border-color:#3B434C;background:#22272C}
   button:disabled{color:var(--faint);cursor:default}
 
+  /* search results */
+  .results{margin-top:10px;background:var(--panel);border:1px solid var(--rule);
+    border-radius:5px;padding:6px;max-height:340px;overflow-y:auto;
+    font-size:12.5px;color:var(--dim)}
+  .rhead{font:400 10.5px/1 var(--mono);letter-spacing:.08em;color:var(--faint);
+    text-transform:uppercase;padding:8px 8px 10px}
+  .rrow{display:flex;flex-direction:column;align-items:flex-start;gap:4px;
+    width:100%;height:auto;text-align:left;padding:9px 8px;background:none;
+    border:none;border-radius:4px;border-bottom:1px solid var(--rule)}
+  .rrow:hover:not(:disabled){background:var(--raise);border-color:var(--rule)}
+  .rrow:last-child{border-bottom:none}
+  .rtitle{font-size:12.5px;color:var(--text);word-break:break-word;
+    white-space:normal;line-height:1.45}
+  .rmeta{font:400 11px/1.4 var(--mono);color:var(--faint);
+    font-variant-numeric:tabular-nums;white-space:normal}
+  .rrow.toobig .rtitle{color:var(--dim)}
+  .rrow.toobig .rmeta{color:var(--warn)}
+
   /* stage */
   .stage{margin-top:16px;position:relative;aspect-ratio:16/9;background:#000;
     border:1px solid var(--rule);border-radius:5px;overflow:hidden}
@@ -3458,9 +3619,10 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   </div>
 
   <form id="intake" autocomplete="off">
-    <textarea id="links" rows="1" placeholder="Paste Drive links or magnet URIs"></textarea>
+    <textarea id="links" rows="1" placeholder="Search by name, or paste Drive links / magnet URIs"></textarea>
     <button type="submit">Add</button>
   </form>
+  <div class="results" id="results" hidden></div>
 
   <div class="stage">
     <span class="flag" id="flag">audio only</span>
@@ -3591,10 +3753,25 @@ const ta = $('links');
 const grow = () => { ta.style.height = 'auto';
                      ta.style.height = Math.min(ta.scrollHeight, 130) + 'px'; };
 ta.addEventListener('input', grow);
+/* Anything that looks like a link or a magnet is added, as before. Anything
+   else is treated as something to search for, which is why typing a film's
+   name now finds it instead of reporting that it wasn't a Drive link. */
+const looksLikeSource = t => {
+  const s = t.trim();
+  if (/magnet:\?|drive\.google\.|docs\.google\.|[?&]id=|\/file\/d\//i.test(s)) return true;
+  if (/^[0-9a-fA-F]{40}$/.test(s)) return true;             // bare infohash
+  // A bare Drive id is 20+ characters, which a long run-together title also
+  // is: "harrypotterandthegobletoffire" would otherwise be fetched as an id
+  // and fail. Real ids always mix case or carry a digit / - / _; a title
+  // typed as one lowercase word never does.
+  return /^[a-zA-Z0-9_-]{20,}$/.test(s) && /[A-Z0-9_-]/.test(s);
+};
+
 $('intake').addEventListener('submit', async e => {
   e.preventDefault();
   const text = ta.value.trim();
   if (!text) return;
+  if (!looksLikeSource(text)) return runSearch(text);
   const r = await api('/add', {links: text, client: clientId});
   (r.added || []).forEach(id => { if (!order.includes(id)) order.push(id); });
   ta.value = ''; grow();
@@ -3604,6 +3781,63 @@ $('intake').addEventListener('submit', async e => {
   }
   refresh();
 });
+
+/* search ------------------------------------------------------------------- */
+const fmtSize = n => !n ? '?' : (n >= 1e9 ? (n/1e9).toFixed(1)+' GB' : Math.round(n/1e6)+' MB');
+
+async function runSearch(q) {
+  const box = $('results');
+  box.hidden = false;
+  box.textContent = 'Searching for ' + q + '…';
+  let r;
+  try { r = await api('/search', {q}); }
+  catch (e) { box.textContent = 'Search failed.'; return; }
+  box.textContent = '';
+  if (r.error) { box.textContent = r.error; return; }
+  const rows = r.results || [];
+  if (!rows.length) { box.textContent = 'Nothing found for ' + q + '.'; return; }
+
+  const head = document.createElement('div');
+  head.className = 'rhead';
+  head.textContent = rows.length + ' results for "' + q + '" · most seeded first';
+  box.append(head);
+
+  rows.forEach(res => {
+    const row = document.createElement('button');
+    row.className = 'rrow';
+    row.type = 'button';
+    if (!res.fits) row.classList.add('toobig');
+
+    const title = document.createElement('span');
+    title.className = 'rtitle';
+    title.textContent = res.name;            // textContent: never trust a name
+
+    const meta = document.createElement('span');
+    meta.className = 'rmeta';
+    const bits = [res.seeders + ' seed', fmtSize(res.size)];
+    if (res.res) bits.push(res.res);
+    // The genuinely useful hint, and the one no torrent site can give you,
+    // because it depends on this machine rather than on the file.
+    bits.push(res.direct ? 'plays directly' :
+              res.codec === 'hevc' ? 'needs remux' :
+              res.codec ? res.codec + ', may need remux' : 'unknown codec');
+    if (res.hdr) bits.push('HDR');
+    if (!res.fits) bits.push('≠ needs ~' + fmtSize(res.peak) + ', over your cache cap');
+    meta.textContent = bits.join('  ·  ');
+
+    row.append(title, meta);
+    row.addEventListener('click', async () => {
+      row.disabled = true;
+      title.textContent = 'Adding: ' + res.name;
+      const add = await api('/add', {links: res.magnet, client: clientId});
+      (add.added || []).forEach(id => { if (!order.includes(id)) order.push(id); });
+      box.hidden = true; box.textContent = '';
+      ta.value = ''; grow();
+      refresh();
+    });
+    box.append(row);
+  });
+}
 
 /* playback ---------------------------------------------------------------- */
 function setFlag(j) {

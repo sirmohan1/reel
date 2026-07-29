@@ -34,6 +34,8 @@ import re
 import os
 import json
 import queue
+import gzip
+import struct
 import json as _json
 import uuid
 import shutil
@@ -108,6 +110,21 @@ SEARCH_TRACKERS = (
     "udp://tracker.torrent.eu.org:451/announce",
     "udp://exodus.desync.com:6969/announce",
 )
+
+# Subtitles, from OpenSubtitles' legacy endpoint -- which needs no API key, so
+# this works out of the box rather than waiting on credentials.
+SUBS_URL = "https://rest.opensubtitles.org/search"
+SUBS_LANG = os.environ.get("REEL_SUB_LANG", "eng")   # ISO 639-2, e.g. eng/spa/fre
+SUBS_TIMEOUT = 25
+SUBS_UA = "reel/1.0"
+# The query must be lowercase. Sent with any uppercase, the API 302s to
+# "https://_/..." -- a literally unresolvable host -- so the request fails in a
+# way that looks exactly like "this film has no subtitles".
+# Lines matching this are the uploader's advertising, which OpenSubtitles files
+# routinely carry as the first cue or two.
+SUBS_SPAM = re.compile(r"osdb\.link|opensubtitles|watch online movies|"
+                       r"subtitles? by|api\.OpenSubtitles|www\.[a-z0-9.-]+\.(com|org|net)",
+                       re.I)
 
 # Seconds of history the download rate is averaged over. Long enough to ride
 # out the gap between one 64 MiB rclone chunk and the next.
@@ -544,6 +561,174 @@ MAGNET_RE = re.compile(r"magnet:\?[^\s\"'<>]+", re.I)
 BTIH_RE = re.compile(r"xt=urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})")
 
 
+def subs_path_for(jid, lang=None):
+    """Dotted, like .live. and .compat., so restore()'s three-part __ parse
+    cannot mistake a sidecar for a finished download and resurrect it as a job."""
+    return os.path.join(DL, "%s.subs.%s.vtt" % (jid, lang or SUBS_LANG))
+
+
+def osdb_hash(path):
+    """OpenSubtitles' file hash: the size, plus 64-bit little-endian sums of the
+    first and last 64 KiB. Identifies the exact release, so the subtitles come
+    back timed to this cut rather than to some other rip of the same film."""
+    CHUNK = 65536
+    try:
+        size = os.path.getsize(path)
+        if size < CHUNK * 2:
+            return None, size
+        h = size
+        with open(path, "rb") as f:
+            for offset in (0, size - CHUNK):
+                f.seek(offset)
+                buf = f.read(CHUNK)
+                if len(buf) < CHUNK:
+                    return None, size
+                for i in range(0, CHUNK, 8):
+                    h = (h + struct.unpack("<q", buf[i:i + 8])[0]) & 0xFFFFFFFFFFFFFFFF
+        return "%016x" % h, size
+    except (OSError, struct.error):
+        return None, 0
+
+
+def subs_get(url, timeout=SUBS_TIMEOUT):
+    req = urllib.request.Request(url, headers={"User-Agent": SUBS_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def subs_search(moviehash=None, size=0, name=None, lang=None):
+    """Candidates for this file, best first.
+
+    Tried by hash before name: a hash match is the same release, where a name
+    match is often a different rip whose timings drift. Ranked by download
+    count, which is the only quality signal the endpoint offers.
+    """
+    lang = lang or SUBS_LANG
+    attempts = []
+    if moviehash and size:
+        attempts.append(("moviehash", "moviehash-%s/moviebytesize-%d" % (moviehash, size)))
+    if name:
+        # Lowercased deliberately -- see SUBS_LANG notes above; uppercase gets a
+        # 302 to an unresolvable host and reads as "no subtitles found".
+        stem = os.path.splitext(os.path.basename(name))[0].lower()
+        attempts.append(("name", "query-" + urllib.parse.quote(stem)))
+    for how, sel in attempts:
+        url = "%s/%s/sublanguageid-%s" % (SUBS_URL, sel, lang)
+        try:
+            rows = _json.loads(subs_get(url).decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if not isinstance(rows, list) or not rows:
+            continue
+        rows = [r for r in rows if isinstance(r, dict) and r.get("SubDownloadLink")
+                and (r.get("SubFormat") or "srt").lower() in ("srt", "vtt", "sub")]
+        if not rows:
+            continue
+
+        def dls(r):
+            try:
+                return int(r.get("SubDownloadsCnt") or 0)
+            except (TypeError, ValueError):
+                return 0
+        rows.sort(key=dls, reverse=True)
+        return rows, how
+    return [], None
+
+
+def strip_subs_spam(text):
+    """Drop the uploader's advertising cues, keeping the actual dialogue."""
+    out, dropped = [], 0
+    for block in re.split(r"\n\s*\n", text):
+        body = "\n".join(block.strip().splitlines()[2:])   # past index + timing
+        if body and SUBS_SPAM.search(body) and len(body) < 200:
+            dropped += 1
+            continue
+        if block.strip():
+            out.append(block.strip())
+    return "\n\n".join(out) + "\n", dropped
+
+
+def install_subs(job, cand, lang=None):
+    """Fetch one candidate and leave a WebVTT sidecar. Returns True on success.
+
+    Converted with ffmpeg rather than by hand because these files arrive in
+    whatever encoding the uploader used -- CP1252 is common -- and ffmpeg is
+    already a hard requirement, so this costs nothing extra.
+    """
+    lang = lang or SUBS_LANG
+    dest = subs_path_for(job["id"], lang)
+    tmp = dest + ".srt"
+    try:
+        raw = subs_get(cand["SubDownloadLink"])
+        if raw[:2] == b"\x1f\x8b":                  # gzip, which it always is
+            raw = gzip.decompress(raw)
+        if not raw.strip():
+            return False
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        enc = (cand.get("SubEncoding") or "").strip()
+        cmd = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error"]
+        if enc and enc.upper() not in ("UTF-8", "UTF8"):
+            cmd += ["-sub_charenc", enc]
+        cmd += ["-i", tmp, dest]
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
+        if r.returncode != 0 or not os.path.exists(dest) or not os.path.getsize(dest):
+            job["subs_note"] = tail(r.stderr, 2, 160)
+            return False
+        with open(dest, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        cleaned, dropped = strip_subs_spam(text)
+        if cleaned.count("-->") > 0:
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(cleaned if cleaned.startswith("WEBVTT")
+                        else "WEBVTT\n\n" + cleaned)
+        job["subs_cues"] = cleaned.count("-->")
+        job["subs_spam_dropped"] = dropped
+        return True
+    except Exception as e:
+        job["subs_note"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def start_subs(job, src, name=None):
+    """Look for subtitles for a release, in the background.
+
+    `src` must be the release as downloaded -- not reel's remux of it, whose
+    bytes hash to nothing anyone has seen. Hashing is two 64 KiB reads and is
+    done up front, so the caller is free to delete the file immediately after.
+    """
+    if job.get("subs_status") in ("searching", "ready"):
+        return
+    if os.path.exists(subs_path_for(job["id"])):
+        job.update(subs_status="ready", subs_lang=SUBS_LANG)
+        return
+    moviehash, size = osdb_hash(src) if src and os.path.isfile(src) else (None, 0)
+    title = name or (os.path.basename(src) if src else None) or job.get("title")
+    job["subs_status"] = "searching"
+
+    def work():
+        try:
+            rows, how = subs_search(moviehash, size, title)
+            for cand in rows[:3]:            # a top pick can be a dead link
+                if job["cancel"].is_set():
+                    break
+                if install_subs(job, cand):
+                    job.update(subs_status="ready", subs_source=how,
+                               subs_lang=SUBS_LANG,
+                               subs_name=cand.get("SubFileName", "")[:120])
+                    return
+            job["subs_status"] = "unavailable"
+        except Exception as e:
+            job["subs_status"] = "unavailable"
+            job["subs_note"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+    threading.Thread(target=work, daemon=True).start()
+
+
 def read_release(name):
     """What a release name tells us about how this file will actually play.
 
@@ -921,6 +1106,8 @@ def new_job(drive_id, jid=None, **extra):
            "wt_codecs": "", "wt_files": 0, "wt_direct": False,
            "caps": None, "vcodec": None, "vpix": None, "play_key": None,
            "live_proc": None,
+           "subs_status": None, "subs_source": None, "subs_lang": None,
+           "subs_note": "", "subs_name": "", "subs_cues": None,
            "compat_file": None, "compat_path": None, "compat_proc": None,
            "compat_seekable_path": None, "compat_ready": False,
            "compat_done": False, "compat_pct": None, "compat_note": "",
@@ -969,6 +1156,14 @@ def public(job):
             # What the finished file holds, so the player can tell whether it
             # needs to ask for the compat rendition instead.
             "viewers": viewer_count(job["id"]),
+            "subs": bool(job.get("subs_status") == "ready"
+                         and os.path.exists(subs_path_for(
+                             job["id"], job.get("subs_lang")))),
+            "subs_status": job.get("subs_status"),
+            "subs_source": job.get("subs_source"),
+            "subs_lang": job.get("subs_lang"),
+            "subs_name": job.get("subs_name", ""),
+            "subs_note": job.get("subs_note", ""),
             "play_key": job.get("play_key"),
             "compat_ready": bool(job.get("compat_ready")),
             "compat_pct": job.get("compat_pct"),
@@ -1034,6 +1229,9 @@ def restore():
         if ".live." in name or ".compat." in name:
             os.remove(p)          # fragment left by a hard exit; not seekable
             continue
+        if ".subs." in name:
+            # Reattached below once its job is known; dropped if nothing owns it.
+            continue
         parts = name.split("__", 2)
         if len(parts) != 3:
             continue
@@ -1068,6 +1266,23 @@ def restore():
                             status="done", restored=True, hold=False,
                             title=title, **extra,
                             kind="audio" if name.lower().endswith(".mp3") else "video")
+
+    # Second pass for subtitle sidecars, now that every job is known. One whose
+    # job didn't come back is an orphan: it can never be reached, and leaving it
+    # would quietly count against the cache cap forever.
+    for name in os.listdir(DL):
+        if ".subs." not in name or not name.endswith(".vtt"):
+            continue
+        jid = name.split(".subs.", 1)[0]
+        lang = name.split(".subs.", 1)[1][:-4] or SUBS_LANG
+        if jid in JOBS:
+            JOBS[jid].update(subs_status="ready", subs_lang=lang,
+                             subs_source="restored")
+        else:
+            try:
+                os.remove(os.path.join(DL, name))
+            except OSError:
+                pass
 
 
 # ---- the work ----------------------------------------------------------------
@@ -1973,6 +2188,12 @@ def run_job(job):
         job["total"] = os.path.getsize(raw)
         job["received"] = job["total"]
 
+        # Hashed from the raw download, which is the release someone uploaded
+        # subtitles for. The converted file below is reel's own remux and hashes
+        # to nothing anyone has ever seen, so this has to happen here -- before
+        # cleanup() removes the raw copy.
+        start_subs(job, raw, name=real)
+
         # ---- convert, if it's actually needed --------------------------------
         if is_audio_only(raw):
             job["kind"] = "audio"
@@ -2730,6 +2951,14 @@ def run_torrent(job):
         return
     job["status"] = "streaming"
 
+    # A direct stream never finalizes, so it never reaches the hook below. Its
+    # download is the release itself and stays on disk, which makes this the
+    # only place to hash it.
+    if job.get("wt_direct"):
+        done_src = locate_downloaded_file(out_dir, chosen)
+        if done_src:
+            start_subs(job, done_src, name=os.path.basename(done_src))
+
     # ---- 5. finalize into a seekable file, if this one needed transcoding ---
     # A direct stream is already seekable -- webtorrent's own ranged proxy,
     # unmodified. Everything else only ever had the fragmented live copy,
@@ -2864,6 +3093,9 @@ def finalize_torrent(job, out_dir, chosen):
             wp.kill()
         except Exception:
             pass
+    # Same ordering point as the Drive path: hash the release before its folder
+    # goes, since the finalized file is a remux and matches nothing upstream.
+    start_subs(job, src, name=os.path.basename(src))
     shutil.rmtree(out_dir, ignore_errors=True)
     try:
         with open(os.path.join(DL, job["id"] + ".magnet"), "w") as f:
@@ -3189,7 +3421,8 @@ def drop(jid, delete_file=True):
     for d in job_dirs(jid):
         shutil.rmtree(d, ignore_errors=True)
     targets = ([job.get("live_file"), job.get("compat_file"),
-                job.get("compat_path"), os.path.join(DL, jid + ".magnet")]
+                job.get("compat_path"), os.path.join(DL, jid + ".magnet"),
+                subs_path_for(jid, job.get("subs_lang"))]
                + ([job.get("path")] if delete_file else []))
     for f in targets:
         if f:
@@ -3298,6 +3531,8 @@ class H(http.server.BaseHTTPRequestHandler):
                              "lan_url": lan_url() if has_qrcode() else None})
         elif p == "/qr":
             self._qr()
+        elif p.startswith("/subs/"):
+            self._subs(p.split("/subs/", 1)[1].split("?")[0])
         elif p.startswith("/stream/"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._stream(p.split("/stream/", 1)[1].split("?")[0],
@@ -3430,6 +3665,28 @@ class H(http.server.BaseHTTPRequestHandler):
                              "used_gb": round(folder_size_bytes() / GB, 3)})
         else:
             self._json(404, {"error": "not found"})
+
+    def _subs(self, jid):
+        """Serve the WebVTT sidecar. The id may arrive with the .vtt suffix the
+        <track> element requests, or without."""
+        jid = jid[:-4] if jid.endswith(".vtt") else jid
+        with LOCK:
+            job = JOBS.get(jid)
+        if not job:
+            return self._json(404, {"error": "unknown item"})
+        path = subs_path_for(jid, job.get("subs_lang"))
+        if not os.path.isfile(path):
+            return self._json(404, {"error": "no subtitles"})
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self._json(404, {"error": "no subtitles"})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/vtt; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _qr(self):
         """A QR for the LAN address, so a phone can scan its way in instead of
@@ -3784,6 +4041,10 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     border:1px solid rgba(127,169,138,.35);border-radius:3px;padding:3px 5px;
     white-space:nowrap;display:none}
   .eyes.on{display:inline-block}
+  .cc{font:500 9.5px/1 var(--mono);letter-spacing:.1em;color:var(--faint);
+    border:1px solid var(--rule);border-radius:3px;padding:3px 4px;display:none}
+  .cc.on{display:inline-block}
+  .cc.found{color:var(--brass);border-color:rgba(198,162,101,.4)}
   .stat{font:400 11.5px/1 var(--mono);color:var(--dim);
     font-variant-numeric:tabular-nums;text-align:right;min-width:74px}
   .stat.ready{color:var(--live)}
@@ -3888,6 +4149,7 @@ const TICKS = 48;
 const $ = id => document.getElementById(id);
 const v = $('v'), slate = $('slate'), flag = $('flag'), cue = $('cue');
 let jobs = [], order = [], cur = -1, retries = 0, live = false, wantPlay = false;
+let subsOn = false;   // whether a track is currently attached
 
 // decorative slate bars + capacity meter ticks
 (() => {
@@ -4067,6 +4329,27 @@ async function runSearch(q) {
   });
 }
 
+/* subtitles ----------------------------------------------------------------
+   v.load() discards any existing text tracks, so this is re-applied after each
+   one rather than set up once. Late arrivals need no special case: the poll
+   below calls it again, so a subtitle found after playback started simply
+   appears. */
+function applySubs(j) {
+  [...v.querySelectorAll('track')].forEach(t => t.remove());
+  if (!j || !j.subs) return;
+  const t = document.createElement('track');
+  t.kind = 'subtitles';
+  t.label = (j.subs_lang || 'en').toUpperCase();
+  t.srclang = (j.subs_lang || 'eng').slice(0, 2);
+  t.src = '/subs/' + j.id + '.vtt';
+  t.default = true;
+  v.append(t);
+  // Chrome ignores the default attribute on a track added after load, so the
+  // mode is set explicitly once the element registers it.
+  setTimeout(() => { try { if (v.textTracks[0]) v.textTracks[0].mode = 'showing'; }
+                     catch (e) {} }, 0);
+}
+
 /* playback ---------------------------------------------------------------- */
 function setFlag(j) {
   if (live) { flag.textContent = 'live \u00b7 still downloading'; flag.style.display = 'block'; }
@@ -4079,6 +4362,7 @@ function play(i) {
   const id = order[i], j = byId(id);
   if (!canPlay(j)) return;
   cur = i; retries = 0;
+  subsOn = !!j.subs;
   // 'live' means "what's playing can't be seeked yet, watch for a better copy".
   // True while downloading, and also while a fallback client is watching the
   // H264 rendition as fragments before its seekable form exists.
@@ -4087,6 +4371,7 @@ function play(i) {
   setFlag(j);
   v.src = srcOf(j);
   v.load();
+  applySubs(j);
   v.play().catch(() => {});
   cue.textContent = j.title;
   cue.classList.remove('none');
@@ -4109,6 +4394,7 @@ function swapToSeekable(j) {
   setFlag(j);
   v.src = srcOf(j);          // may be the compat rendition on this device
   v.load();
+  applySubs(j);
   const once = () => {
     v.removeEventListener('loadedmetadata', once);
     if (at > 0.25 && isFinite(at)) { try { v.currentTime = at; } catch (e) {} }
@@ -4164,13 +4450,13 @@ function makeRow(id) {
   li.innerHTML = '<span class="n"></span>' +
     '<span class="body"><span class="title"></span>' +
     '<span class="track"><i></i></span><span class="note"></span></span>' +
-    '<span class="flags"><span class="eyes"></span><span class="kind"></span>' +
-    '<span class="stat"></span></span>' +
+    '<span class="flags"><span class="cc"></span><span class="eyes"></span>' +
+    '<span class="kind"></span><span class="stat"></span></span>' +
     '<button class="kill" type="button" aria-label="Remove">&times;</button>';
   const el = {li, n: li.querySelector('.n'), title: li.querySelector('.title'),
               track: li.querySelector('.track'), fill: li.querySelector('.track i'),
               note: li.querySelector('.note'), kind: li.querySelector('.kind'),
-              eyes: li.querySelector('.eyes'),
+              eyes: li.querySelector('.eyes'), cc: li.querySelector('.cc'),
               stat: li.querySelector('.stat'), kill: li.querySelector('.kill')};
   li.addEventListener('click', ev => {
     if (ev.target === el.kill) return;
@@ -4219,6 +4505,12 @@ function paint() {
     el.eyes.textContent = others > 0
         ? (i === cur ? '+' + others + ' watching' : others + ' watching') : '';
     el.eyes.classList.toggle('on', others > 0);
+    el.cc.textContent = j.subs ? 'CC' : (j.subs_status === 'searching' ? '…' : '');
+    el.cc.classList.toggle('on', !!j.subs || j.subs_status === 'searching');
+    el.cc.classList.toggle('found', !!j.subs);
+    el.cc.title = j.subs ? ('subtitles: ' + (j.subs_name || j.subs_lang || ''))
+                : j.subs_status === 'searching' ? 'looking for subtitles'
+                : j.subs_status === 'unavailable' ? 'no subtitles found' : '';
     el.note.textContent = j.error || (j.paused ? j.note : '');
     el.note.classList.toggle('quiet', !j.error && !!j.paused);
     el.note.style.display = j.error ? 'block' : 'none';
@@ -4393,6 +4685,13 @@ async function refresh() {
       // everyone else waits for the download to finish.
       if (j && !playsHere(j)) { if (j.compat_seekable) swapToSeekable(j); }
       else if (j && (j.status === 'done' || j.seekable)) swapToSeekable(j);
+    }
+    /* Subtitles are found in the background and can land after playback began.
+       Attaching only when the count changes avoids rebuilding the track — and
+       resetting its mode — on every poll. */
+    if (cur >= 0) {
+      const j = byId(order[cur]);
+      if (j && !!j.subs !== subsOn) { subsOn = !!j.subs; applySubs(j); }
     }
     /* Nothing playing yet: start the first item that can play. canPlay() counts
        a live item, so this fires seconds after a paste rather than waiting for

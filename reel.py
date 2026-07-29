@@ -2284,15 +2284,49 @@ def safe_url(u):
         return u
 
 
-def validate_stream_url(url):
-    """The definitive test: can a decoder actually read streams from it?
+STILL_CODECS = {"mjpeg", "png", "bmp", "gif", "webp", "tiff", "jpeg2000", "apng"}
+MIN_STREAM_SECONDS = 30.0
 
-    Returns the full probe so callers never have to ask the network twice.
+
+def validate_stream_url(url, want_bytes=0):
+    """Is this really the film, or just something a decoder happens to accept?
+
+    "ffprobe read it" is a much weaker test than it looks. Torrents ship cover
+    art, and mjpeg is a genuine video codec, so a single JPEG passes it -- one
+    such torrent had reel transcoding WWW.YIFY-TORRENTS.COM.jpg to h264 at
+    3 Mbps and reporting it as The Matrix, duration 0.04 seconds.
+
+    want_bytes is the size of the file we actually chose, when it is known;
+    anything dramatically smaller is not that file whatever it decodes as.
     """
     got = probe_media(url, timeout=20)
-    if got[0] is None and got[1] is None:
+    v, a, _h, _hdr, _br, dur, _pix = got
+    if v is None and a is None:
         return None
+    if v in STILL_CODECS and a is None:
+        return None                       # cover art, not a film
+    # A real feature is minutes long. A stub, a sample, or a still frame is not,
+    # and accepting one means silently playing the wrong thing.
+    if dur is not None and dur < MIN_STREAM_SECONDS and a is None:
+        return None
+    if want_bytes:
+        length = url_length(url)
+        if length and length < want_bytes * 0.5:
+            return None                   # far too small to be the chosen file
     return got
+
+
+def url_length(url, timeout=6):
+    """Total size behind a url, from Content-Range or Content-Length."""
+    info = probe_url(url, timeout=timeout)
+    raw = info.get("length") or ""
+    m = re.search(r"/(\d+)\s*$", str(raw))          # "bytes 0-4095/1992052865"
+    if m:
+        return int(m.group(1))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def discover_links(base, timeout=5):
@@ -2350,6 +2384,11 @@ def find_wt_url(job, port, chosen):
                f"{base}/webtorrent/", base + "/"]
     media = VIDEO_EXT + AUDIO_EXT
     tried = {}
+    # The size of the file pick_file() settled on, when the .torrent gave us one.
+    # Any candidate far smaller than this is not that file, whatever it decodes
+    # as -- which is how a 100 KB cover image was accepted for a 1.99 GB film.
+    want_bytes = int((chosen or {}).get("size") or 0)
+    stalled = []                # right-looking urls with no data behind them yet
     deadline = time.time() + WT_SERVER_WAIT
     while time.time() < deadline and not job["cancel"].is_set():
         # whatever the server actually publishes beats any guess of mine
@@ -2373,13 +2412,23 @@ def find_wt_url(job, port, chosen):
                 continue
             info = probe_url(url, timeout=4)
             if not info["ok"]:
-                tried[url] = ("html/index" if info.get("html")
-                              else "http %s" % (info.get("status") or info.get("error")))
+                err = str(info.get("error") or "")
+                if "timed out" in err or "timeout" in err.lower():
+                    # The server accepted the path and then had nothing to send:
+                    # this is almost certainly the right file, waiting on pieces.
+                    # Treating it as wrong is what sent one job onto a cover
+                    # image instead. Remember it and come back.
+                    tried[url] = "timed out (likely right, no data yet)"
+                    stalled.append(url)
+                else:
+                    tried[url] = ("html/index" if info.get("html")
+                                  else "http %s" % (info.get("status") or err))
                 continue
-            # it serves bytes; now make sure a decoder can read them
-            probed = validate_stream_url(url)
+            # It serves bytes. Now check they are the *chosen* file and not, say,
+            # the cover art sitting next to it in the same folder.
+            probed = validate_stream_url(url, want_bytes=want_bytes)
             if not probed:
-                tried[url] = "not decodable"
+                tried[url] = "not the chosen file (still image, stub, or too small)"
                 continue
             tried[url] = "media"
             job["url_log"] = "; ".join(f"{u} -> {why}" for u, why in tried.items())[:1200]
@@ -2390,6 +2439,15 @@ def find_wt_url(job, port, chosen):
             return url
         time.sleep(1.0)
     job["url_log"] = "; ".join(f"{u} -> {why}" for u, why in tried.items())[:1200]
+    # Out of time, but a url that accepted the request and then stalled is the
+    # file waiting on its first pieces -- worth far more than giving up and
+    # falling back to piping, which costs seeking. Prefer one that looks like
+    # media, and let ffmpeg wait for the data the way a player would.
+    for url in ([u for u in stalled if u.lower().endswith(media)] + stalled):
+        job["wt_ranges"] = True         # it answered a ranged request to stall
+        job["note"] = (job.get("note", "") +
+                       "; endpoint found, waiting on peers").strip("; ")
+        return url
     return None
 
 

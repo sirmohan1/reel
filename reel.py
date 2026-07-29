@@ -82,8 +82,16 @@ AUDIO_EXT = (".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus")
 # -- yts.mx already refuses the requests this was first written against -- so a
 # dead source has to read as "no results", never as a broken feature.
 SEARCH_URL = "https://apibay.org/q.php"
+# The search response truncates `name` -- at 64 or 80 characters, depending on
+# the row -- and a release puts its codec at the *end*, so the one field that
+# decides whether this needs remuxing is exactly what gets cut. This endpoint
+# returns the real filenames inside the torrent, untruncated.
+SEARCH_FILES_URL = "https://apibay.org/f.php"
 SEARCH_TIMEOUT = 12
 SEARCH_LIMIT = 25               # rows kept after ranking, not rows fetched
+# How many top results to look up full filenames for. One request each, so this
+# is a straight trade of latency against how many rows can be judged properly.
+SEARCH_DETAIL = 10
 # Appended to every magnet we build, since the indexer hands back a bare
 # infohash. DHT finds most peers on its own; these only speed up the start.
 # Tracker liveness drifts too: the dead ones in that Spider-Man magnet
@@ -561,6 +569,61 @@ def read_release(name):
             "direct": codec == "h264" and not hdr}
 
 
+def search_real_name(tid, timeout=6):
+    """The largest filename inside a torrent, or None.
+
+    Worth one extra request per row because the truncated search name loses the
+    codec, and the codec is the difference between "streams as-is" and "costs a
+    remux and twice the disk". Picks the largest file, since that is the one
+    pick_file() will choose to play.
+    """
+    try:
+        url = SEARCH_FILES_URL + "?" + urllib.parse.urlencode({"id": tid})
+        req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            rows = _json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+    # Two shapes come back from the same endpoint, seemingly at random:
+    #   {"name": {"0": "a.mkv"}, "size": {"0": "123"}}   -- index-keyed maps
+    #   {"name": ["a.mkv"],      "size": [123]}          -- plain lists
+    # and either may carry several entries. Flattening both to a list keeps the
+    # pairing between a name and its size, which matters because the largest
+    # file is the one pick_file() will play -- taking the first instead picked
+    # "NEW upcoming releases by Xclusive.txt" as the name to judge a film by.
+    def values(v):
+        if isinstance(v, dict):
+            return [v[k] for k in sorted(v, key=lambda x: str(x))]
+        if isinstance(v, list):
+            return v
+        return [] if v is None else [v]
+
+    best, best_size = None, -1
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        names, sizes = values(row.get("name")), values(row.get("size"))
+        for i, nm in enumerate(names):
+            if not isinstance(nm, (str, int, float)):
+                continue
+            nm = str(nm).strip()
+            # Sentinel for torrents whose file list this index never stored.
+            if not nm or nm.lower() == "filelist not found":
+                continue
+            try:
+                size = int(sizes[i]) if i < len(sizes) else 0
+            except (TypeError, ValueError):
+                size = 0
+            if size > best_size:
+                best, best_size = nm, size
+    # A name is only worth trusting if it belongs to something big enough to be
+    # the feature: a .txt or .jpg tells us nothing about the video's codec.
+    if best and best.lower().endswith(VIDEO_EXT + AUDIO_EXT):
+        return best
+    return best if best_size > 50_000_000 else None
+
+
 def build_magnet(infohash, name):
     parts = ["magnet:?xt=urn:btih:" + infohash.lower()]
     if name:
@@ -611,22 +674,44 @@ def search_torrents(query, limit=SEARCH_LIMIT):
                 return int(row.get(key) or 0)
             except (TypeError, ValueError):
                 return 0
-        info = read_release(name)
         size = num("size")
+        out.append({"name": name, "infohash": ih.lower(), "id": str(row.get("id") or ""),
+                    "magnet": build_magnet(ih, name),
+                    "seeders": num("seeders"), "leechers": num("leechers"),
+                    "size": size, "files": num("num_files")})
+
+    out.sort(key=lambda r: (-r["seeders"], r["size"]))
+    out = out[:limit]
+
+    # Fill in the real filename for the rows most likely to be chosen, in
+    # parallel: ten sequential lookups would add ten round-trips to a search.
+    def enrich(res):
+        real = search_real_name(res["id"]) if res["id"] else None
+        if real:
+            res["real_name"] = real
+    threads = [threading.Thread(target=enrich, args=(r,), daemon=True)
+               for r in out[:SEARCH_DETAIL]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT)
+
+    cap = cap_bytes()
+    for res in out:
+        # Judge the real filename when we have it, since the search name is
+        # missing whatever fell off the end -- usually the codec.
+        info = read_release(res.get("real_name") or res["name"])
         # What this will actually cost on disk, which is not the same as its
         # size. A direct stream is served from the download itself, so it costs
         # exactly that. Anything needing a remux holds the source and the output
         # at once while converting -- the overlap that put a 8.6 GB film 20 GB
-        # over a 15 GB cap and got its conversion killed mid-run.
-        peak = size if info["direct"] else int(size * 2.05)
-        out.append({"name": name, "infohash": ih.lower(),
-                    "magnet": build_magnet(ih, name),
-                    "seeders": num("seeders"), "leechers": num("leechers"),
-                    "size": size, "files": num("num_files"),
-                    "peak": peak, "fits": peak <= cap_bytes(),
-                    **info})
-    out.sort(key=lambda r: (-r["seeders"], r["size"]))
-    return out[:limit], None
+        # over a 15 GB cap and got its conversion killed mid-run. An unknown
+        # codec is costed as if it needs one: better to warn and be wrong than
+        # to promise and stall.
+        res["peak"] = res["size"] if info["direct"] else int(res["size"] * 2.05)
+        res["fits"] = res["peak"] <= cap
+        res.update(info)
+    return out, None
 
 
 def split_sources(text):

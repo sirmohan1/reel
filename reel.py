@@ -565,8 +565,15 @@ def read_release(name):
     # set too, but 10-bit AV1 is common enough that claiming "direct" would be
     # wrong often; unknown codecs stay unclaimed rather than over-promise.
     codec = "hevc" if hevc else "h264" if h264 else "av1" if av1 else None
-    return {"codec": codec, "res": res, "hdr": hdr,
-            "direct": codec == "h264" and not hdr}
+    # The container decides as much as the codec. An h264 .mkv cannot play in a
+    # browser at all, so calling it "plays directly" would send someone to a
+    # file that just refuses. Only judged when the real filename was found --
+    # the truncated search name usually has no extension, and treating unknown
+    # as bad would mark almost everything as needing a remux.
+    ext = os.path.splitext(name or "")[1].lower()
+    container_ok = (ext in BROWSER_CONTAINERS) if ext else True
+    return {"codec": codec, "res": res, "hdr": hdr, "container": ext or None,
+            "direct": codec == "h264" and not hdr and container_ok}
 
 
 def search_real_name(tid, timeout=6):
@@ -893,6 +900,7 @@ def new_job(drive_id, jid=None, **extra):
            "wt_proc": None, "wt_done": False, "wt_ranges": False,
            "wt_codecs": "", "wt_files": 0, "wt_direct": False,
            "caps": None, "vcodec": None, "vpix": None, "play_key": None,
+           "live_proc": None,
            "compat_file": None, "compat_path": None, "compat_proc": None,
            "compat_seekable_path": None, "compat_ready": False,
            "compat_done": False, "compat_pct": None, "compat_note": "",
@@ -2568,8 +2576,17 @@ def run_torrent(job):
     v, a, vh, hdr, br, dur, pix = probed
     job["bitrate"], job["duration"] = br, dur
     job["kind"] = "audio" if (a and not v) else "video"
-    direct = (job.get("wt_ranges") and (v is None or
-              (v in BROWSER_VIDEO and pix_ok(pix)))
+    # The container matters as much as the codecs, and only the Drive path was
+    # checking it (browser_ready does; this did not). No browser can demux
+    # Matroska whatever is inside it, so an h264/AAC .mkv served straight
+    # through was marked seekable, skipped finalizing, and then simply refused
+    # to play -- silent failure, which is worse than an unnecessary remux.
+    ext = os.path.splitext(urllib.parse.unquote(
+        urllib.parse.urlparse(url).path))[1].lower()
+    if not ext:
+        ext = os.path.splitext((chosen or {}).get("name") or "")[1].lower()
+    direct = (job.get("wt_ranges") and ext in BROWSER_CONTAINERS
+              and (v is None or (v in BROWSER_VIDEO and pix_ok(pix)))
               and (a in BROWSER_AUDIO or a is None)
               and (v is not None or a is not None))
     job["wt_codecs"] = f"{v or '-'}/{a or '-'}"
@@ -2588,23 +2605,35 @@ def run_torrent(job):
         # http url, so where the index sits no longer matters.
         job["streamable"] = True
         job["status"] = "downloading"
-        start_live_from_url(job, url, job["kind"], v, vh, hdr, pix)
-        deadline = time.time() + 90
-        while time.time() < deadline and not job["cancel"].is_set():
-            lf = job.get("live_file")
-            if lf and os.path.exists(lf) and os.path.getsize(lf) >= LIVE_OPEN:
-                job["live_ready"] = True
-                job["status"] = "streaming"
-                job["timings"]["total"] = round(time.time() - t_meta, 1)
-                break
-            if job.get("live_done"):
-                break
-            time.sleep(0.4)
-        if not job.get("live_ready"):
-            cleanup()
-            return fail(job, "Couldn't convert the torrent stream from %s -- %s"
-                        % (url, tail(job.get("live_note", ""), 3, 220)
-                           or "ffmpeg produced nothing"))
+        # Nothing to preview when every byte is already here -- a restored
+        # torrent, or one that finished while the endpoint was being found.
+        # Finalizing goes straight to a seekable file and, because the video is
+        # only copied, takes seconds; the live encode it replaces re-encoded the
+        # whole film at about realtime and wrote several GB to say the same
+        # thing. This is what made a fully-downloaded film look stuck for hours.
+        already = bool(job["total"]) and tree_bytes(out_dir) >= job["total"] * 0.999
+        if already:
+            job["wt_done"] = True
+            job["note"] = (job.get("note", "") +
+                           "; already downloaded, finalizing").strip("; ")
+        else:
+            start_live_from_url(job, url, job["kind"], v, vh, hdr, pix)
+            deadline = time.time() + 90
+            while time.time() < deadline and not job["cancel"].is_set():
+                lf = job.get("live_file")
+                if lf and os.path.exists(lf) and os.path.getsize(lf) >= LIVE_OPEN:
+                    job["live_ready"] = True
+                    job["status"] = "streaming"
+                    job["timings"]["total"] = round(time.time() - t_meta, 1)
+                    break
+                if job.get("live_done"):
+                    break
+                time.sleep(0.4)
+            if not job.get("live_ready"):
+                cleanup()
+                return fail(job, "Couldn't convert the torrent stream from %s -- %s"
+                            % (url, tail(job.get("live_note", ""), 3, 220)
+                               or "ffmpeg produced nothing"))
 
     # ---- 4. follow progress -------------------------------------------------
     while not job["cancel"].is_set():
@@ -2717,20 +2746,40 @@ def finalize_torrent(job, out_dir, chosen):
         return
 
     if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
-        job["status"] = "streaming"
-        job["note"] = (job.get("note", "") +
-                       "; couldn't finalize a seekable copy, still playable "
-                       "live: " + tail(r.stderr, 2, 160)).strip("; ")
         try:
             os.remove(out)
         except OSError:
             pass
+        # Only claim it's still watchable if a live copy actually exists. When
+        # the live phase was skipped because the download was already complete,
+        # this is the only path to playback, so a failure here is a real failure
+        # and saying otherwise would leave a dead row looking fine.
+        if job.get("live_file") and job.get("live_ready"):
+            job["status"] = "streaming"
+            job["note"] = (job.get("note", "") +
+                           "; couldn't finalize a seekable copy, still playable "
+                           "live: " + tail(r.stderr, 2, 160)).strip("; ")
+        else:
+            fail(job, "Couldn't convert the downloaded file: "
+                      + (tail(r.stderr, 2, 200) or "ffmpeg produced nothing"))
         return
 
     # Stop seeding and reclaim the raw download: the seekable file replaces it
     # entirely, the same trade a Drive item makes when its _raw folder is
     # deleted post-conversion. Unlike Drive's _raw, this one was also serving
     # uploads, so it has to be stopped before it can go.
+    # The live encode is now redundant: the player will swap to this file, and
+    # left alone that process keeps re-encoding the whole film to write a
+    # preview nobody will watch. sweep_live() only ever deleted its file, and
+    # only after a delay -- it never stopped the writer.
+    lp = job.get("live_proc")
+    if lp and lp.poll() is None:
+        try:
+            lp.kill()
+        except Exception:
+            pass
+        job["live_done"] = True
+
     wp = job.get("wt_proc")
     if wp and wp.poll() is None:
         try:
@@ -2889,6 +2938,10 @@ def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
         job["live_note"] = str(e)
         return
     job["procs"].append(proc)
+    # Kept separately from procs so finalize_torrent can stop just this one.
+    # Left running, it re-encodes the entire film to produce a preview of
+    # something already superseded by the finalized file.
+    job["live_proc"] = proc
     job["live_file"] = out
     job["live_kind"] = kind
 

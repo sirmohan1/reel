@@ -75,6 +75,13 @@ WORKERS = 2
 WT_PORTS = (8801, 8899)         # range we hand out
 WT_META_TIMEOUT = 75            # seconds to wait for magnet metadata
 WT_SERVER_WAIT = 45             # seconds to wait for its http server to appear
+# How long to wait for the swarm to hand over a first few MB before deciding
+# nothing is coming. Reading an endpoint that has no data yet burns ffprobe's
+# timeout and then produces an empty encode, which used to be reported as
+# "couldn't convert the torrent stream" -- blaming the conversion for what was
+# really an empty swarm.
+WT_DATA_WAIT = 90
+WT_DATA_MIN = 2 * 1024 * 1024
 VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".ts", ".flv", ".wmv",
              ".mpg", ".mpeg", ".m2ts")
 AUDIO_EXT = (".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus")
@@ -1942,8 +1949,16 @@ def phase(job, name):
 
 
 def fail(job, msg):
+    """Mark a job failed and make sure nothing of it keeps running.
+
+    A failed job used to leave its children alive: an ffmpeg was still reading a
+    webtorrent server three minutes after the row read 'failed', with the server
+    itself long gone. Stopping them here covers every failure path rather than
+    the ones someone remembered.
+    """
     job["status"] = "error"
     job["error"] = msg[:300]
+    stop_procs(job)
 
 
 # ---- phase 1: live -----------------------------------------------------------
@@ -2975,6 +2990,31 @@ def run_torrent(job):
                          % (port, detail))
 
     job["wt_url"] = url
+
+    # Wait for the swarm to actually deliver something before asking anything to
+    # read this url. The endpoint can be correct while entirely empty -- that is
+    # what find_wt_url's stalled-url fallback returns -- and probing an empty
+    # stream wastes 20s, then encoding one wastes another 90s, and the job ends
+    # blaming ffmpeg for a swarm that never connected.
+    t_wait = time.time()
+    while time.time() - t_wait < WT_DATA_WAIT and not job["cancel"].is_set():
+        note_progress(job, tree_bytes(out_dir))
+        if job["received"] >= WT_DATA_MIN or job.get("wt_done"):
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.5)
+    job["timings"]["first_bytes"] = round(time.time() - t_wait, 1)
+    if job["received"] < WT_DATA_MIN and not job.get("wt_done"):
+        stop_procs(job)
+        if not tree_bytes(out_dir):
+            cleanup()          # nothing worth keeping, and it counts against the cap
+        peers = job.get("peers")
+        return fail(job, "No data from the swarm in %ds%s. The endpoint was found, "
+                         "so this is the torrent, not reel -- try one with more "
+                         "seeders." % (WT_DATA_WAIT,
+                                       "" if peers is None else " (%d peers)" % peers))
+
     t_probe = time.time()
 
     # ---- 3. proxy directly, or convert on the fly ---------------------------
@@ -3043,7 +3083,12 @@ def run_torrent(job):
                     break
                 time.sleep(0.4)
             if not job.get("live_ready"):
-                cleanup()
+                # Stop the encoder first. Without this it outlives the job and
+                # keeps reading a webtorrent server that has already gone, which
+                # left a stray ffmpeg running minutes after the row said failed.
+                stop_procs(job)
+                if not tree_bytes(out_dir):
+                    cleanup()      # keep any real bytes so a retry can resume
                 return fail(job, "Couldn't convert the torrent stream from %s -- %s"
                             % (url, tail(job.get("live_note", ""), 3, 220)
                                or "ffmpeg produced nothing"))

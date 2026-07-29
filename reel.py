@@ -635,6 +635,83 @@ def subs_search(moviehash=None, size=0, name=None, lang=None):
     return [], None
 
 
+def hhmmss(text):
+    """'02:08:40' -> seconds, or None."""
+    parts = str(text or "").strip().split(":")
+    if not (2 <= len(parts) <= 3):
+        return None
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return None
+    while len(vals) < 3:
+        vals.insert(0, 0.0)
+    return vals[0] * 3600 + vals[1] * 60 + vals[2]
+
+
+# Words that say which cut and which source a release is, and therefore whether
+# one set of timings will suit another.
+RELEASE_TOKENS = re.compile(
+    r"\b(2160p|1080p|720p|480p|bluray|blu-ray|bdrip|brrip|bdremux|remux|web-?dl|"
+    r"webrip|web|hdtv|hddvd|hd-dvd|dvdrip|cam|extended|theatrical|directors?|"
+    r"remastered|imax|unrated|proper|repack)\b", re.I)
+
+
+def subs_fit(cand, our_name, our_duration=None, matched_by=None):
+    """How well one candidate suits the file we actually have.
+
+    Returns (score, reasons). A hash match needs none of this -- it is the same
+    bytes, so the timings are the file's own. A name match is the risky case: a
+    search for a 1080p BrRip returns a 720p HD-DVD as its most-downloaded
+    result, which is the same film from a different source, and different
+    sources cut and frame differently.
+    """
+    score, why = 0.0, []
+    if (cand.get("SubBad") or "0") == "1":
+        return -100.0, ["flagged bad by uploaders"]
+    if matched_by == "moviehash" or (cand.get("MatchedBy") or "") == "moviehash":
+        return 100.0, ["exact file match"]
+
+    # Duration is the strongest evidence available without the hash: subtitles
+    # for a different cut stop minutes away from where this film ends. The last
+    # cue normally lands a little before the end, never after it by much.
+    last = hhmmss(cand.get("SubLastTS"))
+    if our_duration and last:
+        gap = our_duration - last
+        if -120 <= gap <= 600:
+            score += 40
+            why.append("ends %s before the film does" % clock_short(max(gap, 0)))
+        else:
+            score -= 50
+            why.append("timings end %s out" % clock_short(abs(gap)))
+
+    # Which source it was cut from. Shared words mean shared structure.
+    ours = {t.lower() for t in RELEASE_TOKENS.findall(our_name or "")}
+    theirs = {t.lower() for t in RELEASE_TOKENS.findall(
+        (cand.get("MovieReleaseName") or "") + " " + (cand.get("SubFileName") or ""))}
+    if ours and theirs:
+        shared = ours & theirs
+        score += 12 * len(shared) - 6 * len(ours ^ theirs)
+        if shared:
+            why.append("same " + "/".join(sorted(shared)))
+        diff = sorted(ours ^ theirs)
+        if diff:
+            why.append("differs on " + "/".join(diff[:3]))
+
+    if (cand.get("SubFromTrusted") or "0") == "1":
+        score += 8
+    try:
+        score += min(int(cand.get("SubDownloadsCnt") or 0) / 50000.0, 10)
+    except (TypeError, ValueError):
+        pass
+    return score, why
+
+
+def clock_short(seconds):
+    s = int(max(0, seconds or 0))
+    return "%dm%02ds" % (s // 60, s % 60) if s >= 60 else "%ds" % s
+
+
 def strip_subs_spam(text):
     """Drop the uploader's advertising cues, keeping the actual dialogue."""
     out, dropped = [], 0
@@ -714,15 +791,29 @@ def start_subs(job, src, name=None):
     def work():
         try:
             rows, how = subs_search(moviehash, size, title)
-            for cand in rows[:3]:            # a top pick can be a dead link
+            # Ranked by how well each suits *this* file, not by popularity. The
+            # most-downloaded result for a 1080p BrRip was a 720p HD-DVD rip,
+            # which is a different source and drifts.
+            scored = []
+            for cand in rows:
+                s, why = subs_fit(cand, title, job.get("duration"), how)
+                if s > -50:
+                    scored.append((s, why, cand))
+            scored.sort(key=lambda t: -t[0])
+            for s, why, cand in scored[:3]:   # a top pick can be a dead link
                 if job["cancel"].is_set():
                     break
                 if install_subs(job, cand):
                     job.update(subs_status="ready", subs_source=how,
                                subs_lang=SUBS_LANG,
+                               subs_fit=round(s, 1),
+                               subs_exact=bool(s >= 100),
+                               subs_why="; ".join(why)[:160],
                                subs_name=cand.get("SubFileName", "")[:120])
                     return
             job["subs_status"] = "unavailable"
+            if rows and not scored:
+                job["subs_note"] = "found %d, none matched this cut" % len(rows)
         except Exception as e:
             job["subs_status"] = "unavailable"
             job["subs_note"] = "%s: %s" % (type(e).__name__, str(e)[:120])
@@ -1108,6 +1199,7 @@ def new_job(drive_id, jid=None, **extra):
            "live_proc": None,
            "subs_status": None, "subs_source": None, "subs_lang": None,
            "subs_note": "", "subs_name": "", "subs_cues": None,
+           "subs_fit": None, "subs_exact": False, "subs_why": "",
            "compat_file": None, "compat_path": None, "compat_proc": None,
            "compat_seekable_path": None, "compat_ready": False,
            "compat_done": False, "compat_pct": None, "compat_note": "",
@@ -1164,6 +1256,10 @@ def public(job):
             "subs_lang": job.get("subs_lang"),
             "subs_name": job.get("subs_name", ""),
             "subs_note": job.get("subs_note", ""),
+            # exact = same bytes, so the timings are the file's own; anything
+            # else is a judged fit and may drift
+            "subs_exact": bool(job.get("subs_exact")),
+            "subs_why": job.get("subs_why", ""),
             "play_key": job.get("play_key"),
             "compat_ready": bool(job.get("compat_ready")),
             "compat_pct": job.get("compat_pct"),
@@ -4045,6 +4141,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     border:1px solid var(--rule);border-radius:3px;padding:3px 4px;display:none}
   .cc.on{display:inline-block}
   .cc.found{color:var(--brass);border-color:rgba(198,162,101,.4)}
+  .cc.rough{color:var(--warn);border-color:rgba(192,138,74,.4)}
   .stat{font:400 11.5px/1 var(--mono);color:var(--dim);
     font-variant-numeric:tabular-nums;text-align:right;min-width:74px}
   .stat.ready{color:var(--live)}
@@ -4505,12 +4602,20 @@ function paint() {
     el.eyes.textContent = others > 0
         ? (i === cur ? '+' + others + ' watching' : others + ' watching') : '';
     el.eyes.classList.toggle('on', others > 0);
-    el.cc.textContent = j.subs ? 'CC' : (j.subs_status === 'searching' ? '…' : '');
+    /* CC means an exact file match, so the timings are the file's own. CC? means
+       the best available guess for a different release -- playable, but it can
+       drift, and saying so beats letting someone wonder why it slides. */
+    el.cc.textContent = j.subs ? (j.subs_exact ? 'CC' : 'CC?')
+                      : (j.subs_status === 'searching' ? '…' : '');
     el.cc.classList.toggle('on', !!j.subs || j.subs_status === 'searching');
-    el.cc.classList.toggle('found', !!j.subs);
-    el.cc.title = j.subs ? ('subtitles: ' + (j.subs_name || j.subs_lang || ''))
-                : j.subs_status === 'searching' ? 'looking for subtitles'
-                : j.subs_status === 'unavailable' ? 'no subtitles found' : '';
+    el.cc.classList.toggle('found', !!j.subs && !!j.subs_exact);
+    el.cc.classList.toggle('rough', !!j.subs && !j.subs_exact);
+    el.cc.title = j.subs
+        ? (j.subs_exact ? 'subtitles matched to this exact file: ' + (j.subs_name || '')
+                        : 'closest match, may drift: ' + (j.subs_name || '')
+                          + (j.subs_why ? ' (' + j.subs_why + ')' : ''))
+        : j.subs_status === 'searching' ? 'looking for subtitles'
+        : j.subs_status === 'unavailable' ? (j.subs_note || 'no subtitles found') : '';
     el.note.textContent = j.error || (j.paused ? j.note : '');
     el.note.classList.toggle('quiet', !j.error && !!j.paused);
     el.note.style.display = j.error ? 'block' : 'none';

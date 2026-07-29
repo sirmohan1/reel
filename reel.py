@@ -92,6 +92,11 @@ SEARCH_LIMIT = 25               # rows kept after ranking, not rows fetched
 # How many top results to look up full filenames for. One request each, so this
 # is a straight trade of latency against how many rows can be judged properly.
 SEARCH_DETAIL = 10
+# A torrent with no seeders cannot transfer a byte, so it is dropped rather than
+# offered. Below this it can technically start and still never stream: the magnet
+# that prompted this had 2 peers, found its endpoint correctly, and sat at
+# 14 KB/s against the ~1.5 MB/s the film needed.
+SEARCH_MIN_SEEDERS = 5
 # Appended to every magnet we build, since the indexer hands back a bare
 # infohash. DHT finds most peers on its own; these only speed up the start.
 # Tracker liveness drifts too: the dead ones in that Spider-Man magnet
@@ -648,7 +653,7 @@ def search_torrents(query, limit=SEARCH_LIMIT):
     """
     q = (query or "").strip()
     if not q:
-        return [], "nothing to search for"
+        return [], "nothing to search for", 0
     url = SEARCH_URL + "?" + urllib.parse.urlencode({"q": q, "cat": 200})
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
@@ -657,11 +662,13 @@ def search_torrents(query, limit=SEARCH_LIMIT):
     except Exception as e:
         # A dead or blocked indexer is an expected state, not a crash: say so
         # plainly and leave the rest of the app alone.
-        return [], "couldn't reach the search index (%s)" % str(e)[:60]
+        return [], "couldn't reach the search index (%s)" % str(e)[:60], 0
     if not isinstance(rows, list):
-        return [], "unexpected response from the search index"
+        return [], "unexpected response from the search index", 0
 
     out = []
+    dropped = 0                 # zero-seeder rows, reported so their absence
+                                # is visible rather than silent
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -682,9 +689,17 @@ def search_torrents(query, limit=SEARCH_LIMIT):
             except (TypeError, ValueError):
                 return 0
         size = num("size")
+        seeders = num("seeders")
+        # Nothing to serve the file, so there is nothing to offer. Dropped here
+        # rather than shown greyed out, because on an obscure search these can
+        # be the entire result set -- one search returned 19 rows of which 6
+        # had exactly zero seeders, sorted indistinguishably among the rest.
+        if seeders <= 0:
+            dropped += 1
+            continue
         out.append({"name": name, "infohash": ih.lower(), "id": str(row.get("id") or ""),
                     "magnet": build_magnet(ih, name),
-                    "seeders": num("seeders"), "leechers": num("leechers"),
+                    "seeders": seeders, "leechers": num("leechers"),
                     "size": size, "files": num("num_files")})
 
     out.sort(key=lambda r: (-r["seeders"], r["size"]))
@@ -717,8 +732,13 @@ def search_torrents(query, limit=SEARCH_LIMIT):
         # to promise and stall.
         res["peak"] = res["size"] if info["direct"] else int(res["size"] * 2.05)
         res["fits"] = res["peak"] <= cap
+        # Enough of a swarm to actually stream. Kept as a flag rather than a
+        # filter: a handful of seeders may still be the only copy of something
+        # obscure, and downloading it slowly is a legitimate choice -- being
+        # surprised by it is not.
+        res["weak"] = res["seeders"] < SEARCH_MIN_SEEDERS
         res.update(info)
-    return out, None
+    return out, None, dropped
 
 
 def split_sources(text):
@@ -3251,8 +3271,9 @@ class H(http.server.BaseHTTPRequestHandler):
             # Nothing is started here -- this only looks. The chosen magnet
             # comes back through /add like any other, so the download path is
             # the existing one, unchanged.
-            results, err = search_torrents(body.get("q"))
-            return self._json(200, {"results": results, "error": err})
+            results, err, dropped = search_torrents(body.get("q"))
+            return self._json(200, {"results": results, "error": err,
+                                    "dropped": dropped})
 
         if p == "/add":
             magnets, ids, bad = split_sources(body.get("links"))
@@ -3938,14 +3959,17 @@ async function runSearch(q) {
 
   const head = document.createElement('div');
   head.className = 'rhead';
-  head.textContent = rows.length + ' results for "' + q + '" · most seeded first';
+  // Say what was withheld: silently returning 6 of 19 rows looks like a thin
+  // index rather than a deliberate filter.
+  head.textContent = rows.length + ' results for "' + q + '" · most seeded first'
+      + (r.dropped ? ' · ' + r.dropped + ' with no seeders hidden' : '');
   box.append(head);
 
   rows.forEach(res => {
     const row = document.createElement('button');
     row.className = 'rrow';
     row.type = 'button';
-    if (!res.fits) row.classList.add('toobig');
+    if (!res.fits || res.weak) row.classList.add('toobig');
 
     const title = document.createElement('span');
     title.className = 'rtitle';
@@ -3956,7 +3980,8 @@ async function runSearch(q) {
 
     const meta = document.createElement('span');
     meta.className = 'rmeta';
-    const bits = [res.seeders + ' seed', fmtSize(res.size)];
+    const bits = [res.seeders + (res.weak ? ' seed — too few to stream' : ' seed'),
+                  fmtSize(res.size)];
     if (res.res) bits.push(res.res);
     // Worth saying when the title shown is one file out of several -- a
     // trilogy pack would otherwise look like a single film.

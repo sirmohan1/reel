@@ -779,9 +779,16 @@ def start_subs(job, src, name=None):
     bytes hash to nothing anyone has seen. Hashing is two 64 KiB reads and is
     done up front, so the caller is free to delete the file immediately after.
     """
-    if job.get("subs_status") in ("searching", "ready"):
+    # An exact match cannot be improved on, and a search already running should
+    # not be duplicated. Otherwise a *later* call carrying a real file is allowed
+    # through even when something was already found: the early call can only look
+    # up by name, and a hash match beats it.
+    if job.get("subs_exact") or job.get("subs_status") == "searching":
         return
-    if os.path.exists(subs_path_for(job["id"])):
+    have = job.get("subs_status") == "ready"
+    if have and not (src and os.path.isfile(src)):
+        return
+    if not have and os.path.exists(subs_path_for(job["id"])):
         job.update(subs_status="ready", subs_lang=SUBS_LANG)
         return
     moviehash, size = osdb_hash(src) if src and os.path.isfile(src) else (None, 0)
@@ -811,11 +818,12 @@ def start_subs(job, src, name=None):
                                subs_why="; ".join(why)[:160],
                                subs_name=cand.get("SubFileName", "")[:120])
                     return
-            job["subs_status"] = "unavailable"
-            if rows and not scored:
+            # A failed upgrade attempt must not throw away what we already have.
+            job["subs_status"] = "ready" if have else "unavailable"
+            if rows and not scored and not have:
                 job["subs_note"] = "found %d, none matched this cut" % len(rows)
         except Exception as e:
-            job["subs_status"] = "unavailable"
+            job["subs_status"] = "ready" if have else "unavailable"
             job["subs_note"] = "%s: %s" % (type(e).__name__, str(e)[:120])
     threading.Thread(target=work, daemon=True).start()
 
@@ -2219,6 +2227,9 @@ def run_job(job):
             job["bitrate"], job["duration"] = br, dur
         if not verdict:
             job["live_note"] = "index at end of file; needs the full download"
+        # By name, before the download finishes -- same reasoning as the torrent
+        # path. The hook after conversion re-runs it with the file's hash.
+        start_subs(job, None, name=os.path.basename(raw))
         if verdict:
             kind = "audio" if (a and not v) else "video"
             job["kind"] = kind
@@ -2986,6 +2997,13 @@ def run_torrent(job):
               and (v is not None or a is not None))
     job["wt_codecs"] = f"{v or '-'}/{a or '-'}"
     job["timings"]["probe"] = round(time.time() - t_probe, 1)
+
+    # Look for subtitles now, by name, rather than waiting for the download to
+    # land. Nothing here reads the file, so it costs one request -- and waiting
+    # meant a two-hour film had none until it had finished arriving, which is
+    # exactly when they stop being useful. The hooks at completion still run and
+    # will upgrade this to an exact hash match if one exists.
+    start_subs(job, None, name=(chosen or {}).get("name") or job.get("title"))
     if direct:
         # Best case: hand the browser webtorrent's own ranged stream. Seeking
         # works immediately and no transcode happens at all.

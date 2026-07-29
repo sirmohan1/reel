@@ -18,7 +18,9 @@ Run:  python3 reel_local.py   then open http://localhost:8000, or the
 http://<this-machine>:8000 address printed on startup from any device on the
 same wifi. Bind to this machine only with REEL_HOST=127.0.0.1.
 Needs: an rclone remote named 'gdrive' (rclone config), plus ffmpeg + ffprobe.
-No pip installs.
+No pip installs required. Optional: `pip install qrcode` puts a QR code for the
+LAN address in the header, so a phone can scan its way in instead of typing an
+IP. Everything else runs exactly the same without it.
 """
 
 import http.server
@@ -565,6 +567,50 @@ def lan_ip():
 
 def has_webtorrent():
     return bool(shutil.which("webtorrent"))
+
+
+HAS_QRCODE = None
+
+
+def has_qrcode():
+    """The one optional pip dependency this file has. Checked lazily and cached,
+    like HAS_ZSCALE below -- so a machine without it installed never fails to
+    start, it just doesn't get the QR button in the header."""
+    global HAS_QRCODE
+    if HAS_QRCODE is None:
+        try:
+            import qrcode  # noqa: F401
+            HAS_QRCODE = True
+        except ImportError:
+            HAS_QRCODE = False
+    return HAS_QRCODE
+
+
+def lan_url():
+    """The address the QR code and startup banner both point at, or None if
+    there's nothing on the LAN worth sharing."""
+    if HOST == "127.0.0.1":
+        return None
+    ip = lan_ip()
+    return f"http://{ip}:{PORT}" if ip else None
+
+
+def qr_svg(url):
+    """A scannable SVG for `url`. Verified against an independent decoder
+    (jsQR) before this shipped, for both a plain IP and a .local hostname --
+    see 2026-07-29-qrcode-design.md.
+    """
+    import io
+    import qrcode
+    import qrcode.image.svg
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,
+                       box_size=8, border=3,
+                       image_factory=qrcode.image.svg.SvgPathImage)
+    qr.add_data(url)
+    qr.make(fit=True)
+    buf = io.BytesIO()
+    qr.make_image().save(buf)
+    return buf.getvalue()
 
 
 def extract_id(raw):
@@ -2742,7 +2788,12 @@ class H(http.server.BaseHTTPRequestHandler):
             self._json(200, {"rclone": has_rclone(), "ffmpeg": has_ffmpeg(),
                              "webtorrent": has_webtorrent(),
                              "cap_gb": CACHE_CAP_GB,
-                             "used_gb": round(folder_size_bytes() / GB, 3)})
+                             "used_gb": round(folder_size_bytes() / GB, 3),
+                             # null tells the client there's nothing to scan:
+                             # REEL_HOST=127.0.0.1, or no active network.
+                             "lan_url": lan_url() if has_qrcode() else None})
+        elif p == "/qr":
+            self._qr()
         elif p.startswith("/stream/"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._stream(p.split("/stream/", 1)[1].split("?")[0],
@@ -2867,6 +2918,25 @@ class H(http.server.BaseHTTPRequestHandler):
                              "used_gb": round(folder_size_bytes() / GB, 3)})
         else:
             self._json(404, {"error": "not found"})
+
+    def _qr(self):
+        """A QR for the LAN address, so a phone can scan its way in instead of
+        typing an IP. 404s (rather than erroring) when qrcode isn't installed
+        or there's nothing on the LAN to share -- both are normal states, not
+        failures, matching /stream and /live's use of an ordinary response code
+        for "nothing to serve yet."""
+        if not has_qrcode():
+            return self._json(404, {"error": "qrcode not installed"})
+        url = lan_url()
+        if not url:
+            return self._json(404, {"error": "no LAN address to share"})
+        svg = qr_svg(url)
+        self.send_response(200)
+        self.send_header("Content-Type", "image/svg+xml")
+        self.send_header("Content-Length", str(len(svg)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(svg)
 
     def _live(self, jid, live_file=None, ready_key="live_ready",
               done_key="live_done"):
@@ -3084,6 +3154,19 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     font:400 11.5px/1 var(--mono);color:var(--dim)}
   .led{width:6px;height:6px;border-radius:50%;background:var(--faint);flex:none}
   .led.on{background:var(--live)}
+  /* only shown once /sys confirms there's an address worth sharing */
+  .qrbtn{height:24px;padding:0 10px;font:500 10.5px/1 var(--mono);
+    letter-spacing:.1em;border-radius:4px;background:var(--raise);
+    border:1px solid var(--rule);color:var(--dim)}
+  .qrbtn:hover{color:var(--text);border-color:#3B434C}
+  .qrpop{margin-top:14px;padding:16px;background:var(--panel);
+    border:1px solid var(--rule);border-radius:6px;display:flex;
+    flex-direction:column;align-items:center;gap:10px}
+  .qrimg{width:180px;height:180px;background:#fff;border-radius:4px;
+    padding:8px;display:flex}
+  .qrimg svg{width:100%;height:100%}
+  .qrurl{font:400 11.5px/1 var(--mono);color:var(--dim);word-break:break-all;
+    text-align:center}
 
   /* intake */
   form{display:flex;gap:8px;align-items:flex-start;margin:20px 0 0}
@@ -3214,8 +3297,13 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <div class="wrap">
   <header>
     <span class="mark">reel</span>
+    <button class="qrbtn" id="qrbtn" type="button" hidden aria-label="Show QR code for this address">QR</button>
     <span class="state"><i class="led" id="led"></i><span id="statetext">checking</span></span>
   </header>
+  <div class="qrpop" id="qrpop" hidden>
+    <div class="qrimg" id="qrimg"></div>
+    <span class="qrurl" id="qrurl"></span>
+  </div>
 
   <form id="intake" autocomplete="off">
     <textarea id="links" rows="1" placeholder="Paste Drive links or magnet URIs"></textarea>
@@ -3711,11 +3799,35 @@ async function pollSys() {
     $('statetext').textContent = ok ? (s.webtorrent ? 'ready' : 'ready \u00b7 no webtorrent')
       : !s.rclone ? 'rclone remote missing' : 'ffmpeg missing';
     showCache(s);
+    // Only shown once there's an address worth sharing: qrcode installed,
+    // and this isn't a loopback-only server with nothing on the LAN to scan.
+    $('qrbtn').hidden = !s.lan_url;
+    lanUrl = s.lan_url || null;
+    if (!lanUrl) { $('qrpop').hidden = true; qrLoaded = false; }
   } catch (e) {
     $('led').classList.remove('on');
     $('statetext').textContent = 'server offline';
   }
 }
+
+/* QR pairing --------------------------------------------------------------
+   Fetched via fetch(), not <img src>: the page's CSP has no img-src, only
+   connect-src 'self', so an <img> pointed at /qr would be silently blocked --
+   fetching the SVG text and inserting it avoids that entirely. */
+let lanUrl = null, qrLoaded = false;
+$('qrbtn').addEventListener('click', async () => {
+  const pop = $('qrpop');
+  pop.hidden = !pop.hidden;
+  if (pop.hidden || qrLoaded || !lanUrl) return;
+  try {
+    const r = await fetch('/qr');
+    if (r.ok) {
+      $('qrimg').innerHTML = await r.text();   // server-generated SVG, not user input
+      $('qrurl').textContent = lanUrl;
+      qrLoaded = true;
+    }
+  } catch (e) {}
+});
 refresh(); setInterval(refresh, 1000);
 pollSys(); setInterval(pollSys, 2500);
 </script></body></html>"""

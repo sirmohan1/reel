@@ -192,10 +192,10 @@ def evictable():
 
     Three kinds, not one:
       * orphaned directories, owned by no job at all -- pure garbage
-      * finished Drive files
-      * torrent data directories, which previously were never considered, so a
-        seeding torrent held its bytes forever and the cap became impossible to
-        satisfy
+      * finished files -- Drive's, or a torrent finalized into a seekable copy
+      * torrent data directories still seeding, which previously were never
+        considered, so a seeding torrent held its bytes forever and the cap
+        became impossible to satisfy
 
     Ordered by last play, which puts never-watched items (a prefetch, say) ahead
     of something watched yesterday.
@@ -225,14 +225,18 @@ def evictable():
         if now - (j.get("started_at") or 0) < EVICT_GRACE:
             continue
         when = j.get("last_played") or 0.0
-        if j.get("source") == "torrent":
+        p = j.get("path")
+        if j["status"] == "done" and p and os.path.isfile(p):
+            # A torrent that needed transcoding ends up here too, once
+            # finalize_torrent() replaces its _wt folder with a seekable file --
+            # checked first, since that folder won't exist to find below.
+            out.append((when or _mtime(p), jid, p, "file"))
+        elif j.get("source") == "torrent":
+            if j.get("status") == "converting":
+                continue          # finalize_torrent() is reading it right now
             d = os.path.join(DL, jid + "_wt")
             if os.path.isdir(d) and tree_bytes(d) > 0:
                 out.append((when, jid, d, "dir"))
-        elif j["status"] == "done":
-            p = j.get("path")
-            if p and os.path.isfile(p):
-                out.append((when or _mtime(p), jid, p, "file"))
     out.sort(key=lambda t: t[0])
     return out
 
@@ -274,6 +278,15 @@ def enforce_cache_cap():
             if lf and os.path.exists(lf):
                 try:
                     os.remove(lf)
+                except OSError:
+                    pass
+            # A finalized torrent's magnet sidecar (see finalize_torrent) is
+            # only useful paired with the file restore() would find it next to;
+            # once that file is gone, keeping it would just orphan it.
+            mg = os.path.join(DL, jid + ".magnet")
+            if os.path.exists(mg):
+                try:
+                    os.remove(mg)
                 except OSError:
                     pass
             j.update(status="evicted", path=None, received=0, total=0,
@@ -791,16 +804,30 @@ def restore():
             os.remove(p)
             continue
         title = os.path.splitext(rest)[0]
+        # "torrent" in the id slot marks a file finalize_torrent() produced --
+        # never a real Drive id, those are always 20+ characters. The magnet
+        # needed to re-fetch it lives in a sidecar, since it doesn't fit in a
+        # filename the way a Drive id does.
+        extra = {}
+        if did == "torrent":
+            did = None
+            extra["source"] = "torrent"
+            try:
+                with open(os.path.join(DL, jid + ".magnet")) as f:
+                    extra["magnet"] = f.read().strip() or None
+            except OSError:
+                extra["magnet"] = None
         if not playable(p):
             # Cut short by a hard exit, so there is nothing to resume. Keep the
-            # row -- the Drive id is in the name -- and one click re-fetches it.
+            # row -- the Drive id (or magnet) is in hand -- and one click
+            # re-fetches it.
             os.remove(p)
             JOBS[jid] = new_job(did, jid=jid, status="evicted", restored=True,
-                                hold=False, title=title)
+                                hold=False, title=title, **extra)
             continue
         JOBS[jid] = new_job(did, jid=jid, path=p, total=size, received=size,
                             status="done", restored=True, hold=False,
-                            title=title,
+                            title=title, **extra,
                             kind="audio" if name.lower().endswith(".mp3") else "video")
 
 
@@ -2385,6 +2412,131 @@ def run_torrent(job):
         return
     job["status"] = "streaming"
 
+    # ---- 5. finalize into a seekable file, if this one needed transcoding ---
+    # A direct stream is already seekable -- webtorrent's own ranged proxy,
+    # unmodified. Everything else only ever had the fragmented live copy,
+    # which plays start to finish but can never be scrubbed, for as long as
+    # the item exists. This is what closes that gap.
+    if not job.get("wt_direct"):
+        finalize_torrent(job, out_dir, chosen)
+
+
+def locate_downloaded_file(out_dir, chosen):
+    """Where the picked file actually landed on disk.
+
+    Usually known exactly, from the .torrent's own file list. The one case it
+    isn't is the fallback where that list couldn't be parsed at all (chosen
+    ends up {"index": 0, "name": "", "size": 0} -- see run_torrent) and the
+    only way left to find the file is to look for it.
+    """
+    name = (chosen or {}).get("name")
+    if name:
+        p = os.path.join(out_dir, name)
+        if os.path.isfile(p):
+            return p
+    best, best_size = None, -1
+    media = VIDEO_EXT + AUDIO_EXT
+    for root, _dirs, files in os.walk(out_dir):
+        for f in files:
+            if not f.lower().endswith(media):
+                continue
+            p = os.path.join(root, f)
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                continue
+            if size > best_size:
+                best, best_size = p, size
+    return best
+
+
+def finalize_torrent(job, out_dir, chosen):
+    """Convert a fully-downloaded torrent into a seekable file, the same way
+    run_job() finalizes a Drive download -- reading the local copy rather than
+    the network, so ffmpeg can seek and re-read it freely instead of taking a
+    single realtime pass over a streamed URL.
+
+    Native-first, exactly like Drive's conversion: the source codec is kept
+    whenever MP4 can carry it, regardless of whether today's viewer can decode
+    it -- a device that can't asks for the compat rendition on demand (see
+    start_compat()), same as a Drive item. This is also why an HEVC/EAC3
+    torrent finalizes quickly rather than taking as long as the live encode
+    did: the video is only copied, not re-encoded -- just the audio, which no
+    browser decodes natively, needs transcoding.
+
+    Failure here is not fatal. The live fragment stream this replaces was
+    already working; a failed finalize should leave that playable, not break it.
+    """
+    src = locate_downloaded_file(out_dir, chosen)
+    if not src or not os.path.isfile(src):
+        job["note"] = (job.get("note", "") + "; no local file to finalize").strip("; ")
+        return
+
+    job["status"] = "converting"
+    v, a, h, hdr, _br, dur, pix = probe_media(src)
+    dur = job.get("duration") or dur
+    acodec = ["-c:a", "copy"] if a in BROWSER_AUDIO else ["-c:a", "aac"]
+    caps = ({codec_key(v, pix)} | MP4_VIDEO) if v in MP4_VIDEO else set()
+    vargs, vfilter, vnote = video_args(v, h, hdr, live=False, pix=pix, caps=caps)
+    if vnote:
+        job["note"] = (job.get("note", "") + "; " + vnote).strip("; ")
+    safe_title = re.sub(r"[^\w.\- ]", "_", job["title"])[:110]
+    out = os.path.join(DL, f"{job['id']}__torrent__{safe_title}.mp4")
+    r = run_with_progress(
+        job, ["ffmpeg", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
+              "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+              *vfilter, *vargs, *acodec, "-movflags", "+faststart", out], dur)
+
+    if job["cancel"].is_set():
+        # A canceller (removal or eviction) already owns this job's state.
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return
+
+    if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+        job["status"] = "streaming"
+        job["note"] = (job.get("note", "") +
+                       "; couldn't finalize a seekable copy, still playable "
+                       "live: " + tail(r.stderr, 2, 160)).strip("; ")
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return
+
+    # Stop seeding and reclaim the raw download: the seekable file replaces it
+    # entirely, the same trade a Drive item makes when its _raw folder is
+    # deleted post-conversion. Unlike Drive's _raw, this one was also serving
+    # uploads, so it has to be stopped before it can go.
+    wp = job.get("wt_proc")
+    if wp and wp.poll() is None:
+        try:
+            wp.kill()
+        except Exception:
+            pass
+    shutil.rmtree(out_dir, ignore_errors=True)
+    try:
+        with open(os.path.join(DL, job["id"] + ".magnet"), "w") as f:
+            f.write(job.get("magnet") or "")
+    except OSError:
+        pass
+
+    job["path"] = out
+    job["total"] = os.path.getsize(out)
+    job["received"] = job["total"]
+    job["status"] = "done"
+    # What the finished file actually holds, so a client can tell before it
+    # presses play whether it needs the compat rendition instead -- the same
+    # fields run_job() sets for a Drive conversion.
+    ov, _oa, _oh, _ohdr, _ob, _od, opix = probe_media(out)
+    job["vcodec"], job["vpix"] = ov, opix
+    job["play_key"] = codec_key(ov, opix)
+    if job.get("live_file"):
+        sweep_live(job)
+    enforce_cache_cap()
+
 
 def run_torrent_pipe(job, magnet, chosen, out_dir):
     """webtorrent --stdout | ffmpeg -i pipe:0 -> fragmented mp4.
@@ -2685,7 +2837,7 @@ def drop(jid, delete_file=True):
     for d in job_dirs(jid):
         shutil.rmtree(d, ignore_errors=True)
     targets = ([job.get("live_file"), job.get("compat_file"),
-                job.get("compat_path")]
+                job.get("compat_path"), os.path.join(DL, jid + ".magnet")]
                + ([job.get("path")] if delete_file else []))
     for f in targets:
         if f:

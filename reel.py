@@ -5494,11 +5494,16 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     letter-spacing:.1em;border-radius:4px;background:var(--raise);
     border:1px solid var(--rule);color:var(--dim)}
   .qrbtn:hover{color:var(--text);border-color:#3B434C}
-  /* Compact and out of the way: it is a thing you glance at once to pair a
-     phone, not part of the interface you use. */
-  .qrpop{margin:10px 0 0 auto;padding:9px;background:var(--panel);
-    border:1px solid var(--rule);border-radius:6px;display:flex;
-    align-items:center;gap:10px;width:max-content;max-width:100%}
+  /* Floats over the page rather than sitting in it. As a block in the flow it
+     shoved everything below it down on open and back up on close, which is a
+     lot of movement for something you glance at once to pair a phone. */
+  .qrpop{position:fixed;top:54px;right:20px;z-index:60;padding:12px 34px 12px 12px;
+    background:var(--panel);border:1px solid var(--rule);border-radius:8px;
+    display:flex;align-items:center;gap:12px;width:max-content;
+    max-width:calc(100vw - 40px);box-shadow:0 14px 34px rgba(0,0,0,.55)}
+  .qrclose{position:absolute;top:5px;right:7px;width:20px;height:20px;padding:0;
+    line-height:1;font-size:15px;background:none;border:none;color:var(--faint)}
+  .qrclose:hover{color:var(--text)}
   .qrimg{width:96px;height:96px;background:#fff;border-radius:3px;
     padding:5px;display:flex;flex:none}
   .qrimg svg{width:100%;height:100%;display:block}
@@ -5691,9 +5696,10 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <button class="qrbtn" id="qrbtn" type="button" hidden aria-label="Show QR code for this address">QR</button>
     <span class="state"><i class="led" id="led"></i><span id="statetext">checking</span></span>
   </header>
-  <div class="qrpop" id="qrpop" hidden>
+  <div class="qrpop" id="qrpop" hidden role="dialog" aria-label="Address for this server">
     <div class="qrimg" id="qrimg"></div>
     <span class="qrurl" id="qrurl"></span>
+    <button class="qrclose" id="qrclose" type="button" aria-label="Hide the QR code">&times;</button>
   </div>
 
   <form id="intake" autocomplete="off">
@@ -5727,6 +5733,20 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <span class="verdict" id="verdict"></span>
     <span class="figures" id="figures"></span>
   </div>
+
+  <div class="cache">
+    <div class="head">
+      <span class="eyebrow">Cache</span>
+      <span class="read" id="read">— <span>of — GB</span></span>
+    </div>
+    <div class="meter" id="meter"></div>
+    <div class="limit">
+      <label for="cap">Keep at most</label>
+      <input type="number" id="cap" min="1" max="2000" step="1" aria-label="Cache limit in gigabytes">
+      <span class="u">GB</span>
+      <button id="savecap">Update limit</button>
+    </div>
+  </div>
   </main>
 
   <aside class="side">
@@ -5742,19 +5762,6 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   </div>
   <div class="picks" id="picks" hidden></div>
 
-  <div class="cache">
-    <div class="head">
-      <span class="eyebrow">Cache</span>
-      <span class="read" id="read">— <span>of — GB</span></span>
-    </div>
-    <div class="meter" id="meter"></div>
-    <div class="limit">
-      <label for="cap">Keep at most</label>
-      <input type="number" id="cap" min="1" max="2000" step="1" aria-label="Cache limit in gigabytes">
-      <span class="u">GB</span>
-      <button id="savecap">Update limit</button>
-    </div>
-  </div>
   </aside>
   </div>
 </div>
@@ -6497,9 +6504,15 @@ async function pollSys() {
    connect-src 'self', so an <img> pointed at /qr would be silently blocked --
    fetching the SVG text and inserting it avoids that entirely. */
 let lanUrl = null, qrLoaded = false;
+function hideQr() {
+  $('qrpop').hidden = true;
+  $('qrbtn').setAttribute('aria-expanded', 'false');
+}
+
 $('qrbtn').addEventListener('click', async () => {
   const pop = $('qrpop');
   pop.hidden = !pop.hidden;
+  $('qrbtn').setAttribute('aria-expanded', pop.hidden ? 'false' : 'true');
   if (pop.hidden || qrLoaded || !lanUrl) return;
   try {
     const r = await fetch('/qr');
@@ -6509,6 +6522,13 @@ $('qrbtn').addEventListener('click', async () => {
       qrLoaded = true;
     }
   } catch (e) {}
+});
+/* Three ways out, because it now floats over the page and a floating thing with
+   no obvious way to dismiss it is worse than one that pushed the layout. */
+$('qrclose').addEventListener('click', hideQr);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideQr(); });
+document.addEventListener('click', e => {
+  if (!$('qrpop').hidden && !$('qrpop').contains(e.target) && e.target !== $('qrbtn')) hideQr();
 });
 refresh(); setInterval(refresh, 1000);
 pollSys(); setInterval(pollSys, 2500);

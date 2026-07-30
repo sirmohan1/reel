@@ -184,6 +184,16 @@ VERIFY_TRACKERS = SEARCH_TRACKERS[:5]
 # films is not a list of films.
 FEED_URL = "https://apibay.org/precompiled/data_top100_%d.json"
 FEED_CATS = (201, 207)
+# The same index also publishes what appeared in the last 48 hours, and it is
+# almost entirely disjoint from the all-time lists: 99 of its 100 rows were
+# absent from the pool built without it. Without this a "just landed" shelf has
+# fourteen candidates and fills itself with whatever was *uploaded* recently,
+# which included a 1976 film with five seeders.
+FEED_48H_URL = "https://apibay.org/precompiled/data_top100_48h_207.json"
+# Indian cinema never appears in those lists -- zero of 137 films, since they
+# rank by global swarm size -- so this shelf has to ask for it by name. Searched
+# rather than browsed, through the same three sources search already uses.
+FEED_BOLLY_QUERY = "hindi"
 # Ratings come from IMDb's own daily dump, which needs no API key -- the same
 # reason the subtitle source was chosen. 8.6 MB gzipped, and only ever scanned
 # for the ~150 ids the feed actually mentions, so it costs no resident memory:
@@ -195,7 +205,21 @@ RATINGS_TIMEOUT = 90
 # pure waste -- and every rebuild is ~10 UDP scrapes and two http fetches.
 FEED_TTL = 1800.0
 FEED_LIMIT = 24
-FEED_VERIFY = 10                 # top rows whose seeders get measured, as in search
+# Rows per shelf, and how many of each get their seeder count measured. Only the
+# top of a shelf is checked: the rest show a tilde, exactly as search does, since
+# 5 shelves fully verified would be 40 scrapes to draw one page.
+FEED_SHELF = 8
+# Candidates measured per shelf, which is more than are shown. Indexer counts
+# are inflated, and on the gems shelf -- where every row is thinly seeded by
+# definition -- rows claiming 100+ measured out at 2 and 4. Verifying only what
+# fits the shelf leaves no way to replace those, so a few spares are checked and
+# the ones that cannot stream are dropped before trimming.
+FEED_VERIFY = 12
+# When a shelf comes up short, more candidates are measured rather than the
+# shelf being left thin -- Bollywood swarms are a fraction of a global
+# release's, so nine of its first twelve were too thin to stream and it drew
+# three films. This bounds how many any one shelf may check before giving up.
+FEED_MAX_VERIFY = 36
 # A film is one film. Anything with this many files is a boxset, a season, or a
 # 400-file cartoon collection -- all of which were really in the list, and none
 # of which is something to press play on. Measured: legitimate single films top
@@ -216,6 +240,14 @@ FEED_SEED_FULL = 3000.0          # seeders at which the swarm score saturates
 # million. Pulling every score toward the global mean in proportion to how few
 # votes back it is the standard fix, and it costs one line.
 RATING_PRIOR, RATING_PRIOR_VOTES = 6.6, 2000.0
+# Shelf thresholds.
+GEM_RATING, GEM_SEEDERS = 7.2, 150   # well reviewed, barely seeded
+LANDED_DAYS = 30                     # and released this year or last
+# Films rated this badly are not recommended. Only applied where a rating
+# exists: an unrated film is an unknown, not a bad one. Without it the "just
+# landed" shelf offered a film rated 3.2, which is not a recommendation so much
+# as a warning.
+FLOOR_RATING = 5.0
 
 # Subtitles, from OpenSubtitles' legacy endpoint -- which needs no API key, so
 # this works out of the box rather than waiting on credentials.
@@ -1117,9 +1149,14 @@ def _search_json(url, timeout=SEARCH_TIMEOUT):
         return _json.loads(r.read().decode("utf-8", "replace"))
 
 
-def _row(ih, name, seeders, leechers, size, files=0, tid=""):
+def _row(ih, name, seeders, leechers, size, files=0, tid="", imdb=""):
     """One shape for every source, so the ranking never has to know which
-    indexer a result came from."""
+    indexer a result came from.
+
+    imdb is carried through even though search itself never displays it: it is
+    what lets a searched row be rated, and dropping it here left the whole
+    Bollywood shelf unrated while the id sat in the response all along.
+    """
     ih = (ih or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", ih) or set(ih) == {"0"}:
         return None
@@ -1131,9 +1168,11 @@ def _row(ih, name, seeders, leechers, size, files=0, tid=""):
             return max(0, int(float(v or 0)))
         except (TypeError, ValueError):
             return 0
+    imdb = str(imdb or "")
     return {"infohash": ih, "name": name, "id": str(tid or ""),
             "seeders": num(seeders), "leechers": num(leechers),
             "size": num(size), "files": num(files),
+            "imdb": imdb if imdb.startswith("tt") else "",
             "magnet": build_magnet(ih, name)}
 
 
@@ -1148,7 +1187,7 @@ def source_apibay(query):
             continue          # the no-results sentinel row
         out.append(_row(r.get("info_hash"), r.get("name"), r.get("seeders"),
                         r.get("leechers"), r.get("size"), r.get("num_files"),
-                        r.get("id")))
+                        r.get("id"), r.get("imdb")))
     return [x for x in out if x]
 
 
@@ -1219,6 +1258,8 @@ def search_all(query):
                     old["name"] = r["name"]
                 if r["id"] and not old["id"]:
                     old["id"] = r["id"]
+                if r.get("imdb") and not old.get("imdb"):
+                    old["imdb"] = r["imdb"]     # only apibay supplies one
 
     threads = [threading.Thread(target=fetch, args=(n, f), daemon=True)
                for n, f in SEARCH_SOURCES]
@@ -1362,6 +1403,36 @@ FEED_YEAR = re.compile(r"[\(\[\.\s_-]((?:19|20)\d{2})[\)\]\.\s_-]")
 FEED_PACK = re.compile(r"""\b(collection|boxset|box ?set|complete|seasons?|duology|
     trilogy|quadrilogy|anthology|mega ?pack|movie pack|filmography)\b""", re.I | re.X)
 FEED_EPISODE = re.compile(r"\bS\d{1,2}(E\d{1,2}|\b)", re.I)
+# Filmed off a cinema screen, or an unfinished review copy. These rank well --
+# new, heavily seeded, and too recent to have collected a rating that would drag
+# them down -- so three of the top twelve were camcorder recordings. Recommending
+# one is worse than recommending nothing, though search still finds them, which
+# is where you would go having decided you want one.
+FEED_CAM = re.compile(r"""\b(cam|camrip|hdcam|hqcam|ts|telesync|hdts|tc|hdtc|
+    telecine|scr|screener|dvdscr|bdscr|workprint|predvd)\b""", re.I | re.X)
+# A Hollywood film carrying a Hindi audio track is not Indian cinema, and it is
+# most of what a search for "hindi" returns. Both markers are needed: "dual
+# audio" and "multi" name the packaging, while a run of other language tags is
+# what a multi-language remux looks like.
+FEED_DUB = re.compile(r"\b(dual ?audio|multi|dubbed|dub)\b", re.I)
+FEED_OTHER_LANG = re.compile(r"\b(fre|ita|spa|ger|lat|rus|kor|jpn|chi|por|tur|vf2)\b",
+                             re.I)
+
+
+def _words(name):
+    """Release names separate on dots as often as spaces."""
+    return " " + (name or "").lower().replace(".", " ").replace("_", " ") + " "
+
+
+def feed_cam(name):
+    """Whether this is a camcorder recording or a screener."""
+    return bool(FEED_CAM.search(_words(name)))
+
+
+def feed_dubbed(name):
+    """Whether this looks like a foreign film carrying a Hindi track."""
+    w = _words(name)
+    return bool(FEED_DUB.search(w) or FEED_OTHER_LANG.search(w))
 
 
 def feed_title(name):
@@ -1387,8 +1458,18 @@ def feed_title(name):
 
 
 def feed_pack(name, files):
-    """Whether this is a collection rather than a film."""
-    return (files or 0) >= FEED_PACK_FILES or bool(
+    """Whether this is a collection rather than a film.
+
+    The file count arrives as an int from the precompiled lists and as a string
+    from the search endpoint -- the same field, the same api, two types -- so it
+    is coerced rather than compared. Left alone this raises TypeError on every
+    search-sourced row.
+    """
+    try:
+        count = int(files or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return count >= FEED_PACK_FILES or bool(
         FEED_PACK.search(name or "") or FEED_EPISODE.search(name or ""))
 
 
@@ -1458,28 +1539,54 @@ def ratings_for(ids):
 
 
 def feed_fetch():
-    """Raw rows from every feed category at once. Returns (rows, per_source)."""
+    """Raw rows from every feed list at once. Returns (rows, per_source)."""
     rows, per = [], {}
     lock = threading.Lock()
 
-    def grab(cat):
+    def grab(label, url):
         try:
-            got = _search_json(FEED_URL % cat)
+            got = _search_json(url)
         except Exception as e:
             with lock:
-                per[str(cat)] = "failed: " + str(e)[:40]
+                per[label] = "failed: " + str(e)[:40]
             return
         got = [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
         with lock:
-            per[str(cat)] = len(got)
+            per[label] = len(got)
             rows.extend(got)
 
-    threads = [threading.Thread(target=grab, args=(c,), daemon=True) for c in FEED_CATS]
+    lists = [(str(c), FEED_URL % c) for c in FEED_CATS] + [("48h", FEED_48H_URL)]
+    threads = [threading.Thread(target=grab, args=(n, u), daemon=True)
+               for n, u in lists]
     for t in threads:
         t.start()
     for t in threads:
         t.join(SEARCH_TIMEOUT + 4)
     return rows, per
+
+
+def bolly_fetch():
+    """Indian cinema, which the browse lists never carry. Returns (rows, per).
+
+    Reuses search rather than adding a source: the three indexers already behind
+    search_all between them list far more of this than any one of them does.
+    Shaped to look like a browse row so the rest of the pipeline cannot tell the
+    difference -- the browse lists carry an imdb id and an upload time that a
+    search result does not, so both are supplied as blanks.
+    """
+    try:
+        found, per = search_all(FEED_BOLLY_QUERY)
+    except Exception as e:
+        return [], {"hindi": "failed: " + str(e)[:40]}
+    rows = []
+    for r in found:
+        if feed_dubbed(r["name"]):
+            continue
+        rows.append({"info_hash": r["infohash"], "name": r["name"],
+                     "seeders": r["seeders"], "leechers": r["leechers"],
+                     "size": r["size"], "num_files": r.get("files") or 1,
+                     "added": 0, "status": "", "imdb": r.get("imdb") or ""})
+    return rows, {("hindi/" + k): v for k, v in per.items()}
 
 
 def rating_score(rating, votes):
@@ -1516,14 +1623,23 @@ def feed_score(item, now=None):
     else:
         why.append("rated %.1f from %s votes" % (item["rating"], f"{item['votes']:,}"))
 
-    age_days = max(0.0, (now - (item.get("added") or now)) / 86400.0)
-    torrent_rec = math.exp(-age_days / FEED_HALFLIFE)
+    added = item.get("added") or 0
     year = item.get("year")
     this_year = time.gmtime(now).tm_year
     year_rec = 1.0 if not year else max(0.0, min(1.0, 1.0 - (this_year - year) / 6.0))
-    rec = RECENT_TORRENT * torrent_rec + RECENT_YEAR * year_rec
-    if age_days <= 14:
-        why.append("posted %d days ago" % round(age_days))
+    age_days = max(0.0, (now - added) / 86400.0) if added else None
+    if age_days is None:
+        # A search result carries no upload time. Guessing "just now" hands every
+        # one of them the full bonus; guessing "long ago" denies it; and falling
+        # back to the film's year turns the shelf into a list of this year's
+        # releases, which buried 3 Idiots and Gangs of Wasseypur under four
+        # unrated 2026 obscurities. Unknown scores as neutral, so the ranking
+        # falls to what we do know -- the rating and the swarm.
+        rec = 0.5
+    else:
+        rec = RECENT_TORRENT * math.exp(-age_days / FEED_HALFLIFE) + RECENT_YEAR * year_rec
+        if age_days <= 14:
+            why.append("posted %d days ago" % round(age_days))
 
     seeders = max(0, item.get("seeders") or 0)
     seed = min(1.0, math.log10(max(1, seeders)) / math.log10(FEED_SEED_FULL))
@@ -1544,15 +1660,12 @@ FEED_CACHE = {"at": 0.0, "rows": [], "sources": {}, "error": None}
 FEED_LOCK = threading.Lock()
 
 
-def build_feed(limit=FEED_LIMIT):
-    """The recommendation list. Returns (rows, error, sources)."""
-    raw, per = feed_fetch()
-    if not raw:
-        alive = [n for n, v in per.items() if isinstance(v, int)]
-        if not alive:
-            return [], "could not reach the recommendation source", per
-        return [], None, per
+def feed_pool(raw):
+    """Raw index rows -> one scored, deduplicated entry per film.
 
+    Shared by every shelf, including the Bollywood one, so a film is judged the
+    same way regardless of which list it arrived on.
+    """
     items = []
     for r in raw:
         name = (r.get("name") or "").strip()
@@ -1560,7 +1673,7 @@ def build_feed(limit=FEED_LIMIT):
         if not name or not re.fullmatch(r"[0-9a-f]{40}", ih):
             continue
         files = r.get("num_files") or 1
-        if feed_pack(name, files):
+        if feed_pack(name, files) or feed_cam(name):
             continue
         title, year = feed_title(name)
         if not title:
@@ -1615,33 +1728,14 @@ def build_feed(limit=FEED_LIMIT):
     rows = list(merged.values())
     for r in rows:
         r["score"], r["why"] = feed_score(r, now)
-    rows.sort(key=lambda r: -r["score"])
-    rows = rows[:limit]
-
-    # Same treatment search gives its top rows: the indexer's seeder count is a
-    # cache and overstates by roughly 2x, so measure the ones being offered.
-    def verify(res):
-        live = live_seeders(res["infohash"])
-        if live is not None:
-            res["reported"] = res["seeders"]
-            res["seeders"] = live
-            res["verified"] = True
-    threads = [threading.Thread(target=verify, args=(r,), daemon=True)
-               for r in rows[:FEED_VERIFY]]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(SEARCH_TIMEOUT)
-
-    # A measured-dead swarm cannot serve a byte, so it is not a recommendation.
-    rows = [r for r in rows if not (r.get("verified") and r["seeders"] <= 0)]
-    for r in rows:
         r.setdefault("verified", False)
         r.setdefault("reported", None)
-        if r.get("verified"):
-            r["score"], r["why"] = feed_score(r, now)
     rows.sort(key=lambda r: -r["score"])
+    return rows
 
+
+def feed_dress(rows):
+    """What each row costs and whether it can be served, once it is on a shelf."""
     cap = cap_bytes()
     for r in rows:
         info = read_release(r["name"])
@@ -1649,7 +1743,130 @@ def build_feed(limit=FEED_LIMIT):
         r["fits"] = r["peak"] <= cap
         r["weak"] = r["seeders"] < SEARCH_MIN_SEEDERS
         r.update(info)
-    return rows, None, per
+    return rows
+
+
+def feed_verify(rows, now=None):
+    """Measure the seeder counts of rows about to be shown.
+
+    The indexer's figure is a cache and overstates by roughly 2x, so the ones
+    being offered are checked against the trackers. Only the top of each shelf:
+    the rest keep their tilde, as in search.
+    """
+    now = now or time.time()
+
+    def check(res):
+        live = live_seeders(res["infohash"])
+        if live is not None:
+            res["reported"] = res["seeders"]
+            res["seeders"] = live
+            res["verified"] = True
+    threads = [threading.Thread(target=check, args=(r,), daemon=True) for r in rows]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT)
+    for r in rows:
+        if r.get("verified"):
+            r["score"], r["why"] = feed_score(r, now)
+    # A measured-dead swarm cannot serve a byte, so it is not a recommendation.
+    return [r for r in rows if not (r.get("verified") and r["seeders"] <= 0)]
+
+
+def gem(r):
+    """Well reviewed and barely seeded: the films no index will ever surface,
+    because they rank by exactly the quantity these are short of."""
+    return bool(r["rating"] and rating_score(r["rating"], r["votes"])
+                and r["rating"] >= GEM_RATING and r["seeders"] < GEM_SEEDERS)
+
+
+def landed(r, now=None):
+    """Out recently *and* uploaded recently.
+
+    Upload time alone is not newness: it put a 1976 film with five seeders at
+    the top of the shelf, because someone had posted it that morning.
+    """
+    now = now or time.time()
+    if not r.get("added"):
+        return False
+    fresh = (now - r["added"]) / 86400.0 <= LANDED_DAYS
+    return fresh and (r.get("year") or 0) >= time.gmtime(now).tm_year - 1
+
+
+# Order matters: a film lands on the first shelf that wants it, so the ones
+# earlier in this list get first pick. Hidden gems sits above "plays instantly"
+# because a well-reviewed obscurity is a better thing to be told about than a
+# convenient one.
+SHELVES = (
+    ("Tonight", "the best of everything on offer", lambda r, now: True),
+    ("Just landed", "out now, and new to the index", landed),
+    ("Hidden gems", "well reviewed, barely seeded", lambda r, now: gem(r)),
+    ("Plays instantly", "no conversion, starts immediately",
+     lambda r, now: bool(r.get("direct"))),
+)
+
+
+def build_shelves():
+    """Every shelf, filled in order. Returns (shelves, error, sources)."""
+    raw, per = feed_fetch()
+    bolly_raw, bolly_per = bolly_fetch()
+    per.update(bolly_per)
+    if not raw and not bolly_raw:
+        alive = [n for n, v in per.items() if isinstance(v, int)]
+        if not alive:
+            return [], "could not reach the recommendation source", per
+        return [], None, per
+
+    now = time.time()
+
+    def watchable(rows):
+        return [r for r in rows
+                if not (r["rating"] and r["rating"] < FLOOR_RATING)]
+
+    pool = watchable(feed_pool(raw))
+    # Built separately so the browse lists cannot crowd it out: these films have
+    # a fraction of the seeders of a global release, so on one combined ranking
+    # not one of them would ever place.
+    bolly = watchable(feed_pool(bolly_raw))
+
+    built, used = {}, set()
+
+    def fill(name, note, rows):
+        queue = [r for r in rows if r["infohash"] not in used]
+        kept, checked = [], 0
+        # Measured in batches, refilling only while the shelf is short. A shelf
+        # whose first twelve all survive costs one batch; one whose candidates
+        # keep measuring dead pays for the extra rounds it actually needs.
+        while queue and len(kept) < FEED_SHELF and checked < FEED_MAX_VERIFY:
+            batch = queue[:FEED_VERIFY]
+            del queue[:FEED_VERIFY]
+            checked += len(batch)
+            for r in batch:
+                used.add(r["infohash"])
+            # Too thin to stream. Search keeps these behind a warning, because
+            # there you asked for that specific film; a recommendation has no
+            # such excuse, and offering a 2-seeder swarm as something to watch
+            # tonight is worse than offering one film fewer.
+            kept += [r for r in feed_verify(batch, now)
+                     if not (r.get("verified") and r["seeders"] < SEARCH_MIN_SEEDERS)]
+        if not kept:
+            return
+        kept.sort(key=lambda r: -r["score"])
+        built[name] = {"name": name, "note": note,
+                       "films": feed_dress(kept[:FEED_SHELF])}
+
+    # Filled before the general shelves so they cannot take the few films it
+    # has. A Hindi release rarely wins a general ranking, but that is a fact
+    # about swarm size rather than about the film.
+    fill("Bollywood", "Hindi-language cinema", bolly)
+    for name, note, want in SHELVES:
+        fill(name, note, [r for r in pool if want(r, now)])
+
+    # Shown headline-first, which is not the order they were filled in: what
+    # needed protecting and what deserves the top of the page are different
+    # questions. A shelf that came up empty is omitted rather than shown bare.
+    order = [n for n, _, _ in SHELVES] + ["Bollywood"]
+    return [built[n] for n in order if n in built], None, per
 
 
 def recommendations(force=False):
@@ -1659,7 +1876,7 @@ def recommendations(force=False):
         if fresh and FEED_CACHE["rows"] and not force:
             return FEED_CACHE["rows"], FEED_CACHE["error"], FEED_CACHE["sources"]
         try:
-            rows, err, per = build_feed()
+            rows, err, per = build_shelves()
         except Exception as e:
             # Never a broken page: a dead source reads as an empty shelf.
             rows, err, per = [], "%s: %s" % (type(e).__name__, str(e)[:120]), {}
@@ -4455,14 +4672,15 @@ class H(http.server.BaseHTTPRequestHandler):
         if p == "/feed":
             # Nothing starts here either -- this only suggests. Chosen rows go
             # through /add exactly like a search result or a pasted magnet.
-            rows, err, per = recommendations(force=bool(body.get("force")))
+            shelves, err, per = recommendations(force=bool(body.get("force")))
             with LOCK:
                 have = {infohash(j["magnet"]) for j in JOBS.values() if j.get("magnet")}
             # Shown as "already queued" rather than hidden: a familiar film
             # missing from the list looks like a bad recommendation engine,
             # where a greyed-out one explains itself.
-            out = [dict(r, queued=r["infohash"] in have) for r in rows]
-            return self._json(200, {"results": out, "error": err, "sources": per})
+            out = [dict(s, films=[dict(f, queued=f["infohash"] in have)
+                                  for f in s["films"]]) for s in shelves]
+            return self._json(200, {"shelves": out, "error": err, "sources": per})
 
         if p == "/add":
             magnets, ids, bad = split_sources(body.get("links"))
@@ -4876,6 +5094,11 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .picks{margin-top:8px;background:var(--panel);border:1px solid var(--rule);
     border-radius:5px;padding:6px;max-height:420px;overflow-y:auto;
     font-size:12.5px;color:var(--dim)}
+  /* every shelf but the first gets a rule above it, so the sections read as
+     sections rather than as one long list with headings in it */
+  .picks .rhead:not(:first-child){border-top:1px solid var(--rule);
+    margin-top:8px;padding-top:16px}
+  .picks .rhead{color:var(--brass)}
   .rrank{font:500 11px/1 var(--mono);color:var(--faint);letter-spacing:.06em}
   .rwhy{font:400 10.5px/1.4 var(--mono);color:var(--dim);white-space:normal}
   .rrow .rscore{color:var(--live)}
@@ -5320,15 +5543,20 @@ async function loadPicks(force) {
   box.textContent = '';
   picksLoaded = true;
   if (r.error) { box.textContent = r.error; return; }
-  const rows = r.results || [];
-  $('pcount').textContent = rows.length ? rows.length + ' films' : '';
-  if (!rows.length) { box.textContent = 'Nothing to suggest right now.'; return; }
+  const shelves = r.shelves || [];
+  const total = shelves.reduce((n, s) => n + s.films.length, 0);
+  $('pcount').textContent = total ? total + ' films' : '';
+  if (!total) { box.textContent = 'Nothing to suggest right now.'; return; }
 
-  const head = document.createElement('div');
-  head.className = 'rhead';
-  head.textContent = 'Ranked by rating, how new it is, and swarm health';
-  box.append(head);
-  rows.forEach(res => box.append(pickRow(res)));
+  // A film sits on exactly one shelf, so these read as sections of a list
+  // rather than as four rankings of the same few titles.
+  shelves.forEach(shelf => {
+    const head = document.createElement('div');
+    head.className = 'rhead';
+    head.textContent = shelf.name + ' — ' + shelf.note;
+    box.append(head);
+    shelf.films.forEach(res => box.append(pickRow(res)));
+  });
 }
 
 $('picktog').addEventListener('click', () => {

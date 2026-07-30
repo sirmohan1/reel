@@ -713,17 +713,24 @@ class TestFeedScoring(Base):
 
 # --------------------------------------------------------------------------
 class TestFeedBuild(Base):
-    """build_feed with stand-in sources: no network, no trackers."""
+    """Shelf building with stand-in sources: no network, no trackers."""
 
     def setUp(self):
         super().setUp()
         self.m.live_seeders = lambda *a, **k: None      # never scrape a tracker
         self.m.ratings_for = lambda ids: self.ratings
+        self.m.bolly_fetch = lambda: ([], {})          # its own source, tested apart
         self.ratings = {}
 
-    def rows(self, *raw):
+    def shelves(self, *raw):
         self.m.feed_fetch = lambda: (list(raw), {"201": len(raw)})
-        return self.m.build_feed()
+        return self.m.build_shelves()
+
+    def rows(self, *raw):
+        """Every film across every shelf. Each appears on exactly one, so this
+        is the whole recommendation set with the shelving flattened away."""
+        shelves, err, per = self.shelves(*raw)
+        return [f for s in shelves for f in s["films"]], err, per
 
     def raw(self, ih, name, **kw):
         r = {"info_hash": ih, "name": name, "seeders": 100, "leechers": 1,
@@ -789,7 +796,7 @@ class TestFeedBuild(Base):
 
     def test_a_dead_source_reads_as_an_empty_shelf(self):
         self.m.feed_fetch = lambda: ([], {"201": "failed: timeout"})
-        rows, err, _ = self.m.build_feed()
+        rows, err, _ = self.m.build_shelves()
         self.assertEqual(rows, [])
         self.assertIn("could not reach", err)
 
@@ -812,6 +819,144 @@ class TestFeedBuild(Base):
         self.m.recommendations()
         self.m.recommendations()
         self.assertEqual(len(calls), 1)
+
+
+# --------------------------------------------------------------------------
+class TestShelves(Base):
+    """Shelf assignment: which films land where, and what never lands at all."""
+
+    def setUp(self):
+        super().setUp()
+        self.m.live_seeders = lambda *a, **k: None
+        self.m.ratings_for = lambda ids: self.ratings
+        self.m.bolly_fetch = lambda: (list(self.bolly), {})
+        self.ratings, self.bolly = {}, []
+
+    def raw(self, ih, name, **kw):
+        r = {"info_hash": ih, "name": name, "seeders": 100, "leechers": 1,
+             "size": 2_000_000_000, "num_files": 1, "added": time.time(),
+             "status": "vip", "imdb": ""}
+        r.update(kw)
+        return r
+
+    def build(self, *raw):
+        self.m.feed_fetch = lambda: (list(raw), {"201": len(raw)})
+        shelves, err, _ = self.m.build_shelves()
+        return {s["name"]: [f["title"] for f in s["films"]] for s in shelves}, err
+
+    def test_a_film_appears_on_exactly_one_shelf(self):
+        # The whole point of filling in priority order. With ~200 films to fill
+        # five shelves, letting each rank independently shows the same handful
+        # of titles over and over.
+        old = time.time() - 900 * 86400
+        got, _ = self.build(
+            self.raw("a" * 40, "New.Film.2026.1080p.WEB-DL.H264-GRP"),
+            self.raw("b" * 40, "Old.Gem.2001.1080p.BluRay.H264-GRP", added=old,
+                     seeders=40, imdb="tt9"),
+            self.raw("c" * 40, "Another.2026.1080p.WEB-DL.x265-HEVC", seeders=700))
+        self.ratings = {"tt9": (8.4, 300000)}
+        placed = [t for titles in got.values() for t in titles]
+        self.assertEqual(len(placed), len(set(placed)))
+
+    def test_a_camcorder_rip_is_never_recommended(self):
+        # Three of the top twelve were cinema recordings: new, well seeded, and
+        # too recent to have a rating that would have pushed them down.
+        got, _ = self.build(
+            self.raw("a" * 40, "Some.Film.2026.1080p.TELESYNC.x264-DKS", seeders=6000),
+            self.raw("b" * 40, "Other.Film.2026.1080p.CAM.H264-X", seeders=5000),
+            self.raw("c" * 40, "Third.Film.2026.1080p.HDTC.X264-RAMA", seeders=4000),
+            self.raw("d" * 40, "Real.Film.2026.1080p.WEB-DL.H264-GRP", seeders=10))
+        placed = [t for titles in got.values() for t in titles]
+        self.assertEqual(set(placed), {"Real Film"})
+
+    def test_the_same_film_survives_as_a_better_release(self):
+        # Dropping cam rips must not drop the *film* when a real release of it
+        # exists -- Supergirl was in the list twice, once as a TELESYNC.
+        got, _ = self.build(
+            self.raw("a" * 40, "Supergirl.2026.1080p.TELESYNC.x264-DKS", seeders=6000),
+            self.raw("b" * 40, "Supergirl.2026.1080p.WEB-DL.H264-GRP", seeders=50))
+        placed = [t for titles in got.values() for t in titles]
+        self.assertEqual(placed, ["Supergirl"])
+
+    def test_a_badly_rated_film_is_not_a_recommendation(self):
+        self.ratings = {"tt1": (3.2, 40000), "tt2": (7.4, 40000)}
+        got, _ = self.build(
+            self.raw("a" * 40, "Bad.Film.2026.1080p.WEB-DL.H264-GRP", imdb="tt1"),
+            self.raw("b" * 40, "Good.Film.2026.1080p.WEB-DL.H264-GRP", imdb="tt2"))
+        placed = [t for titles in got.values() for t in titles]
+        self.assertEqual(set(placed), {"Good Film"})
+
+    def test_an_unrated_film_is_not_treated_as_a_bad_one(self):
+        got, _ = self.build(
+            self.raw("a" * 40, "Unknown.Film.2026.1080p.WEB-DL.H264-GRP"))
+        placed = [t for titles in got.values() for t in titles]
+        self.assertEqual(placed, ["Unknown Film"])
+
+    def test_recently_uploaded_is_not_the_same_as_recently_released(self):
+        # A 1976 film posted this morning is not "just landed", and one with
+        # five seeders was topping that shelf because it had been.
+        now = time.time()
+        self.assertFalse(self.m.landed({"added": now, "year": 1976}, now))
+        self.assertTrue(self.m.landed({"added": now, "year": 2026}, now))
+        # nor is an old upload of a new film
+        self.assertFalse(self.m.landed({"added": now - 200 * 86400, "year": 2026}, now))
+        # a searched row carries no upload time at all
+        self.assertFalse(self.m.landed({"added": 0, "year": 2026}, now))
+
+    def test_a_gem_is_well_reviewed_and_thinly_seeded(self):
+        self.assertTrue(self.m.gem({"rating": 8.6, "votes": 800000, "seeders": 57}))
+        self.assertFalse(self.m.gem({"rating": 8.6, "votes": 800000, "seeders": 5000}))
+        self.assertFalse(self.m.gem({"rating": 5.1, "votes": 800000, "seeders": 57}))
+        self.assertFalse(self.m.gem({"rating": None, "votes": 0, "seeders": 57}))
+
+    def test_a_swarm_measured_too_thin_to_stream_is_dropped(self):
+        # Gems are thinly seeded by definition, so the indexer's inflation bites
+        # hardest there: rows claiming 100+ measured out at 2 and 4.
+        self.m.live_seeders = lambda ih, **k: 2
+        got, _ = self.build(
+            self.raw("a" * 40, "Some.Film.2026.1080p.WEB-DL.H264-GRP"))
+        self.assertEqual(got, {})
+
+    def test_an_empty_shelf_is_left_out_rather_than_shown_bare(self):
+        got, _ = self.build(
+            self.raw("a" * 40, "Some.Film.2026.1080p.WEB-DL.x265-HEVC"))
+        self.assertNotIn("Plays instantly", got)      # nothing qualifies
+        self.assertIn("Tonight", got)
+
+    def test_bollywood_is_filled_before_the_shelves_that_could_empty_it(self):
+        # A Hindi release rarely wins a general ranking -- these swarms are a
+        # fraction of a global release's -- so on a shared pool the general
+        # shelves would take the few films this one has.
+        self.bolly = [self.raw("f" * 40, "3.Idiots.2009.1080p.BluRay.H264-GRP",
+                               seeders=44, imdb="tt5")]
+        self.ratings = {"tt5": (8.4, 400000)}
+        got, _ = self.build(
+            self.raw("a" * 40, "Blockbuster.2026.1080p.WEB-DL.H264-GRP", seeders=9000))
+        self.assertEqual(got.get("Bollywood"), ["3 Idiots"])
+
+    def test_a_hindi_dub_of_a_foreign_film_is_not_indian_cinema(self):
+        for name in ("War Machine 2026 2160p WEB-DL Dual Audio [Hindi + English]",
+                     "Michael.2026.2160p.WEB-DL.MULTi.FRE.ITA.HINDI.LAT",
+                     "Some.Film.2024.1080p.Hindi.Dubbed.x264"):
+            self.assertTrue(self.m.feed_dubbed(name), name)
+        for name in ("3 Idiots 2009 1080p BluRay x264 Hindi AAC - Ozlem",
+                     "Gangs of Wasseypur 2012 Hindi 1080p Blu-Ray x264 DD 5.1"):
+            self.assertFalse(self.m.feed_dubbed(name), name)
+
+    def test_a_searched_row_keeps_its_imdb_id(self):
+        # search_all drops through _row, which discarded the id -- leaving the
+        # whole Bollywood shelf unrated while the id sat in the response.
+        r = self.m._row("a" * 40, "3 Idiots 2009", 44, 1, 100, 1, "77", "tt1187043")
+        self.assertEqual(r["imdb"], "tt1187043")
+        self.assertEqual(self.m._row("a" * 40, "x", 1, 1, 1, 1, "", "garbage")["imdb"], "")
+
+    def test_a_file_count_that_arrives_as_a_string_is_still_a_count(self):
+        # The precompiled lists send an int, the search endpoint a string. The
+        # same field, the same api, and comparing raised TypeError on every
+        # search-sourced row.
+        self.assertTrue(self.m.feed_pack("Some Boxset", "40"))
+        self.assertFalse(self.m.feed_pack("Some.Film.2026", "1"))
+        self.assertFalse(self.m.feed_pack("Some.Film.2026", None))
 
 
 # --------------------------------------------------------------------------

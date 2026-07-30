@@ -82,6 +82,14 @@ WT_SERVER_WAIT = 45             # seconds to wait for its http server to appear
 # really an empty swarm.
 WT_DATA_WAIT = 90
 WT_DATA_MIN = 2 * 1024 * 1024
+# When the first probe learns nothing, how long to keep waiting and how much of
+# the file to want before asking again. Not a format threshold -- the first 4 MB
+# of that mp4 identifies itself perfectly once those bytes exist. The problem is
+# a starved swarm: the pieces holding the header had not arrived and could not be
+# fetched inside ffprobe's timeout, so waiting for the download to be genuinely
+# moving is what makes the second attempt succeed.
+WT_REPROBE_WAIT = 60
+WT_REPROBE_MIN = 24 * 1024 * 1024
 VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".ts", ".flv", ".wmv",
              ".mpg", ".mpeg", ".m2ts")
 AUDIO_EXT = (".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus")
@@ -3020,6 +3028,29 @@ def run_torrent(job):
     # ---- 3. proxy directly, or convert on the fly ---------------------------
     probed = job.get("wt_probe") or probe_media(url, timeout=20)
     v, a, vh, hdr, br, dur, pix = probed
+    # A probe run while the swarm is still starved comes back empty -- not because
+    # the file is unreadable, but because the pieces holding its header have not
+    # arrived yet. That answer used to be final: the file was declared un-direct
+    # and transcoded for its whole length. Seen on an h264/aac mp4 that needed no
+    # conversion at all -- 871 MB of live encode beside 864 MB of download, with
+    # ffmpeg at 61%, producing what the browser would have played as it arrived.
+    # So when the probe learns nothing, wait for the download to be moving and ask
+    # again before committing to an encode that cannot be undone.
+    if v is None and a is None and not job["cancel"].is_set():
+        for _ in range(int(WT_REPROBE_WAIT / 2)):
+            if job["cancel"].is_set():
+                break
+            note_progress(job, tree_bytes(out_dir))
+            if job["received"] >= WT_REPROBE_MIN or job.get("wt_done"):
+                break
+            time.sleep(2.0)
+        again = probe_media(url, timeout=25)
+        if again[0] is not None or again[1] is not None:
+            probed = again
+            v, a, vh, hdr, br, dur, pix = probed
+            job["wt_probe"] = probed
+            job["note"] = (job.get("note", "") + "; codecs identified on a "
+                           "second look").strip("; ")
     job["bitrate"], job["duration"] = br, dur
     job["kind"] = "audio" if (a and not v) else "video"
     # The container matters as much as the codecs, and only the Drive path was

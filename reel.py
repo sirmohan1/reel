@@ -5754,8 +5754,18 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .n{font:400 11px/1 var(--mono);color:var(--faint);text-align:right;
     font-variant-numeric:tabular-nums}
   .body{min-width:0}
-  .title{font-size:13px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;
-    white-space:nowrap}
+  /* A span is inline, and an inline box ignores overflow and text-overflow
+     outright -- so this never clipped. It overflowed its grid track instead and
+     painted over the flags and the status beside it, which only became obvious
+     once the sidebar made the column narrower. Given a block box it clips, and
+     two lines of a release name is worth more than one line of it plus an
+     ellipsis. */
+  .title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+    font-size:13px;color:var(--dim);overflow:hidden;white-space:normal;
+    overflow-wrap:anywhere;line-height:1.4}
+  /* The status column must keep its width rather than be squeezed by a long
+     title: it is the one part of the row that has to stay readable. */
+  .flags{flex:none}
   .track{height:2px;margin-top:7px;background:var(--rule);border-radius:1px;
     overflow:hidden;display:none}
   .track.show{display:block}

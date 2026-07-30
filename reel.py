@@ -1312,21 +1312,54 @@ def free_port_excluding(skip):
     return None
 
 
-def lan_ip():
-    """This machine's address on the local network, for the startup banner.
+# Interfaces that are not the local network however they are addressed: VPN and
+# other tunnels. An address on one of these is reachable from inside the tunnel
+# and nowhere else, which is no use to a phone on the same wifi.
+TUNNEL_IFACES = ("utun", "ipsec", "ppp", "tun", "tap", "wg", "gpd", "zt")
 
-    Nothing is sent: a connected UDP socket only makes the OS pick the route it
-    would use, which is how you learn which interface faces the wifi.
+
+def lan_ip():
+    """This machine's address on the local network, for the QR code and banner.
+
+    Read from the interfaces rather than inferred from a route. The inference --
+    connect a UDP socket somewhere and see which local address the OS picks --
+    is what a VPN quietly breaks: with one up it returned the tunnel address
+    (10.5.1.147) while the wifi was on 192.168.0.193, so the QR code and the
+    printed url pointed somewhere no phone could reach. It also assumed the
+    gateway was 192.168.1.1, which stops being true the moment the router hands
+    out a different subnet.
     """
+    try:
+        out = subprocess.run(["ifconfig", "-a"], capture_output=True, text=True,
+                             timeout=6).stdout
+    except Exception:
+        out = ""
+    iface, best = None, []
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            iface = line.split(":", 1)[0]
+            continue
+        m = re.match(r"\s+inet (\d+\.\d+\.\d+\.\d+)", line)
+        if not m or not iface:
+            continue
+        ip = m.group(1)
+        if ip.startswith("127.") or iface.startswith(TUNNEL_IFACES):
+            continue
+        # Ordinary private ranges first, since that is what a home network hands
+        # out; anything else only if there is nothing better.
+        rank = 0 if ip.startswith(("192.168.", "10.", "172.")) else 1
+        best.append((rank, iface, ip))
+    if best:
+        best.sort()
+        return best[0][2]
+    # Last resort: the old inference, better than nothing on a platform where
+    # ifconfig is absent.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("192.168.1.1", 9))
             return s.getsockname()[0]
     except OSError:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except OSError:
-            return None
+        return None
 
 
 def has_webtorrent():

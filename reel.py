@@ -6712,7 +6712,57 @@ class Server(socketserver.ThreadingTCPServer):
         super().handle_error(request, client_address)
 
 
+def already_serving(host, port, timeout=0.5):
+    """Is something already listening here?
+
+    allow_reuse_address is what makes a restart work while the old socket is
+    still in TIME_WAIT, and it is worth keeping -- but it also lets a second
+    instance bind 0.0.0.0:PORT while the first holds 127.0.0.1:PORT, because
+    those are different pairs. Both binds succeed, and the more specific one
+    wins every connection, so the *older* server answers and the new one sits
+    there serving nobody. Which is how forty minutes of work went to a page
+    that never received it.
+
+    Connecting is the reliable test rather than trying to bind: bind succeeds
+    in exactly the case being guarded against. A refused connection means
+    nothing is there, so a genuine restart is unaffected.
+    """
+    for addr in (["127.0.0.1"] if host in ("0.0.0.0", "", "::") else [host]):
+        try:
+            with socket.create_connection((addr, port), timeout):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def port_owner(port):
+    """The pid holding a port, so the message can name it. Best effort."""
+    try:
+        out = subprocess.run(["lsof", "-ti", "tcp:%d" % port, "-sTCP:LISTEN"],
+                             capture_output=True, text=True, timeout=4).stdout
+        pids = [p for p in out.split() if p.isdigit()]
+        return pids[0] if pids else None
+    except Exception:
+        return None
+
+
+def refuse_to_shadow():
+    """Stop with an explanation rather than starting a server nobody reaches."""
+    pid = port_owner(PORT)
+    print("\n  reel is already running on port %d.\n" % PORT)
+    if pid:
+        print("  Stop it first:   kill %s\n" % pid)
+    else:
+        print("  Something else is using that port.\n")
+    print("  Starting anyway would appear to work and then serve nobody: both")
+    print("  sockets bind, and the one already running wins every request.\n")
+
+
 def main():
+    if already_serving(HOST, PORT):
+        refuse_to_shadow()
+        return 1
     load_resume()
     try:
         signal.signal(signal.SIGTERM, _flush_and_exit)
@@ -6738,5 +6788,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)     # non-zero when it refused to start
 

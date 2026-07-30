@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -1090,6 +1091,62 @@ class TestPacks(Base):
         self.m.PACK_MAX = 1
         files = [self.f(i, "Show.S01E%02d.mkv" % i, 2.0) for i in range(3)]
         self.assertEqual(len(self.m.pack_files(files)), 1)
+
+
+# --------------------------------------------------------------------------
+class TestSecondInstance(Base):
+    def free_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def test_an_empty_port_is_not_in_use(self):
+        # A genuine restart must be unaffected: the old socket may still be in
+        # TIME_WAIT, but nothing is listening, so this has to say so.
+        self.assertFalse(self.m.already_serving("127.0.0.1", self.free_port()))
+
+    def test_a_live_server_is_detected(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        try:
+            self.assertTrue(self.m.already_serving("127.0.0.1", s.getsockname()[1]))
+        finally:
+            s.close()
+
+    def test_the_shadowing_case_is_caught(self):
+        # The one that actually happened: an instance holds 127.0.0.1:PORT and
+        # a second binds 0.0.0.0:PORT. Both binds succeed -- they are different
+        # pairs -- and the more specific one wins every request, so the older
+        # server answers while the newer serves nobody. Probing from the
+        # wildcard server's point of view has to find the loopback one.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        try:
+            self.assertTrue(self.m.already_serving("0.0.0.0", s.getsockname()[1]))
+        finally:
+            s.close()
+
+    def test_binding_would_not_have_caught_it(self):
+        # Why this probes by connecting rather than by trying to bind: with
+        # allow_reuse_address the bind succeeds in exactly the case being
+        # guarded against, so it can never be the test.
+        held = socket.socket()
+        held.bind(("127.0.0.1", 0))
+        held.listen(1)
+        port = held.getsockname()[1]
+        second = socket.socket()
+        second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            second.bind(("0.0.0.0", port))     # succeeds, which is the problem
+        except OSError:
+            self.skipTest("this platform refuses the overlapping bind")
+        finally:
+            second.close()
+            held.close()
 
 
 # --------------------------------------------------------------------------

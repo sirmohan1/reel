@@ -1229,6 +1229,15 @@ def search_torrents(query, limit=SEARCH_LIMIT):
     out.sort(key=lambda r: (-(r["seeders"] if r.get("verified")
                               else r["seeders"] // 2), r["size"]))
 
+    # The zero-seeder filter above ran on what the indexers claimed, which is the
+    # only figure available at that point. Verification then contradicts some of
+    # them: a search for one film left three rows sitting in the list showing
+    # "0 seed" because they claimed more before being checked. Drop them now that
+    # the truth is known, rather than offering a torrent measured to be dead.
+    before = len(out)
+    out = [r for r in out if not (r.get("verified") and r["seeders"] <= 0)]
+    dropped += before - len(out)
+
     cap = cap_bytes()
     for res in out:
         # Judge the real filename when we have it, since the search name is

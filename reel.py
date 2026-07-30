@@ -106,10 +106,12 @@ AUDIO_EXT = (".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus")
 # A torrent holding several films or episodes becomes several queue items, one
 # per file, rather than one item and a pile of bytes nothing can reach.
 # REEL_PACK=1 restores the old behaviour of taking only the largest file.
+# 50 covers a full season of most things, and two of some. Files past the limit
+# are dropped silently today -- see fan_out.
 try:
-    PACK_MAX = max(1, int(os.environ.get("REEL_PACK", "20")))
+    PACK_MAX = max(1, int(os.environ.get("REEL_PACK", "50")))
 except ValueError:
-    PACK_MAX = 20
+    PACK_MAX = 50
 # What counts as a feature rather than an extra. A sample, a trailer or a
 # "please seed" clip is always a small fraction of the real thing, so a file has
 # to be both absolutely and relatively substantial to earn its own row --

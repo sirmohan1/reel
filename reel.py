@@ -3471,6 +3471,60 @@ def locate_downloaded_file(out_dir, chosen):
     return best
 
 
+def adopt_finalized(job, out_dir, src, out):
+    """Make `out` the item's finished file and clear away everything it replaces.
+
+    Shared by both finalize paths so they cannot drift: the one that converts,
+    and the one that discovers no conversion was needed.
+    """
+    # The live encode is now redundant: the player will swap to this file, and
+    # left alone that process keeps re-encoding the whole film to write a
+    # preview nobody will watch. sweep_live() only ever deleted its file, and
+    # only after a delay -- it never stopped the writer.
+    lp = job.get("live_proc")
+    if lp and lp.poll() is None:
+        try:
+            lp.kill()
+        except Exception:
+            pass
+        job["live_done"] = True
+
+    # Stop seeding and reclaim the raw download: the finished file replaces it
+    # entirely, the same trade a Drive item makes when its _raw folder goes.
+    # Unlike Drive's _raw, this one was also serving uploads, so it has to be
+    # stopped before it can be removed.
+    wp = job.get("wt_proc")
+    if wp and wp.poll() is None:
+        try:
+            wp.kill()
+        except Exception:
+            pass
+    # Hashed before the folder goes: subtitles are matched against the release
+    # as downloaded, and once this is a remux it matches nothing upstream.
+    start_subs(job, src if os.path.isfile(src) else out,
+               name=os.path.basename(src))
+    shutil.rmtree(out_dir, ignore_errors=True)
+    try:
+        with open(os.path.join(DL, job["id"] + ".magnet"), "w") as f:
+            f.write(job.get("magnet") or "")
+    except OSError:
+        pass
+
+    job["path"] = out
+    job["total"] = os.path.getsize(out)
+    job["received"] = job["total"]
+    job["status"] = "done"
+    # What the finished file actually holds, so a client can tell before it
+    # presses play whether it needs the compat rendition instead -- the same
+    # fields run_job() sets for a Drive conversion.
+    ov, _oa, _oh, _ohdr, _ob, _od, opix = probe_media(out)
+    job["vcodec"], job["vpix"] = ov, opix
+    job["play_key"] = codec_key(ov, opix)
+    if job.get("live_file"):
+        sweep_live(job)
+    enforce_cache_cap()
+
+
 def finalize_torrent(job, out_dir, chosen):
     """Convert a fully-downloaded torrent into a seekable file, the same way
     run_job() finalizes a Drive download -- reading the local copy rather than
@@ -3491,6 +3545,29 @@ def finalize_torrent(job, out_dir, chosen):
     src = locate_downloaded_file(out_dir, chosen)
     if not src or not os.path.isfile(src):
         job["note"] = (job.get("note", "") + "; no local file to finalize").strip("; ")
+        return
+
+    # Ask again before converting anything. The verdict that this file needed
+    # converting was reached when wt_direct came out False, and that can be a
+    # probe which learned nothing because the swarm had not delivered the header
+    # yet -- not a real judgement about the file. The whole thing is here now,
+    # so the question is finally answerable.
+    #
+    # Worth the check even beyond the wasted pass: a remux holds the source and
+    # its output at once, and that doubling is what pushed the folder over the
+    # cache cap and got a conversion killed mid-run. A move needs neither.
+    if browser_ready(src):
+        ext = os.path.splitext(src)[1].lower() or ".mp4"
+        stem = re.sub(r"[^\w.\- ]", "_", job["title"])[:110]
+        out = os.path.join(DL, f"{job['id']}__torrent__{stem}{ext}")
+        job["note"] = (job.get("note", "") +
+                       "; played as downloaded, no conversion needed").strip("; ")
+        try:
+            shutil.move(src, out)
+        except OSError as e:
+            fail(job, "Couldn't keep the downloaded file: %s" % e)
+            return
+        adopt_finalized(job, out_dir, src, out)
         return
 
     job["status"] = "converting"
@@ -3545,51 +3622,7 @@ def finalize_torrent(job, out_dir, chosen):
                       + (tail(r.stderr, 2, 200) or "ffmpeg produced nothing"))
         return
 
-    # Stop seeding and reclaim the raw download: the seekable file replaces it
-    # entirely, the same trade a Drive item makes when its _raw folder is
-    # deleted post-conversion. Unlike Drive's _raw, this one was also serving
-    # uploads, so it has to be stopped before it can go.
-    # The live encode is now redundant: the player will swap to this file, and
-    # left alone that process keeps re-encoding the whole film to write a
-    # preview nobody will watch. sweep_live() only ever deleted its file, and
-    # only after a delay -- it never stopped the writer.
-    lp = job.get("live_proc")
-    if lp and lp.poll() is None:
-        try:
-            lp.kill()
-        except Exception:
-            pass
-        job["live_done"] = True
-
-    wp = job.get("wt_proc")
-    if wp and wp.poll() is None:
-        try:
-            wp.kill()
-        except Exception:
-            pass
-    # Same ordering point as the Drive path: hash the release before its folder
-    # goes, since the finalized file is a remux and matches nothing upstream.
-    start_subs(job, src, name=os.path.basename(src))
-    shutil.rmtree(out_dir, ignore_errors=True)
-    try:
-        with open(os.path.join(DL, job["id"] + ".magnet"), "w") as f:
-            f.write(job.get("magnet") or "")
-    except OSError:
-        pass
-
-    job["path"] = out
-    job["total"] = os.path.getsize(out)
-    job["received"] = job["total"]
-    job["status"] = "done"
-    # What the finished file actually holds, so a client can tell before it
-    # presses play whether it needs the compat rendition instead -- the same
-    # fields run_job() sets for a Drive conversion.
-    ov, _oa, _oh, _ohdr, _ob, _od, opix = probe_media(out)
-    job["vcodec"], job["vpix"] = ov, opix
-    job["play_key"] = codec_key(ov, opix)
-    if job.get("live_file"):
-        sweep_live(job)
-    enforce_cache_cap()
+    adopt_finalized(job, out_dir, src, out)
 
 
 def run_torrent_pipe(job, magnet, chosen, out_dir):

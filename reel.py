@@ -967,25 +967,25 @@ def strip_subs_spam(text):
     return "\n\n".join(out) + "\n", dropped
 
 
-def install_subs(job, cand, lang=None):
-    """Fetch one candidate and leave a WebVTT sidecar. Returns True on success.
+def write_subs(job, raw, lang=None, enc=None, suffix=".srt"):
+    """Turn subtitle bytes into a WebVTT sidecar. Returns True on success.
 
     Converted with ffmpeg rather than by hand because these files arrive in
-    whatever encoding the uploader used -- CP1252 is common -- and ffmpeg is
-    already a hard requirement, so this costs nothing extra.
+    whatever encoding whoever made them used -- CP1252 is common -- and ffmpeg
+    is already a hard requirement, so this costs nothing extra.
+
+    Shared by both sources: one downloaded from OpenSubtitles, and one lifted
+    out of the torrent itself. Only where the bytes came from differs.
     """
     lang = lang or SUBS_LANG
     dest = subs_path_for(job["id"], lang)
-    tmp = dest + ".srt"
+    tmp = dest + suffix
     try:
-        raw = subs_get(cand["SubDownloadLink"])
-        if raw[:2] == b"\x1f\x8b":                  # gzip, which it always is
-            raw = gzip.decompress(raw)
-        if not raw.strip():
+        if not raw or not raw.strip():
             return False
         with open(tmp, "wb") as f:
             f.write(raw)
-        enc = (cand.get("SubEncoding") or "").strip()
+        enc = (enc or "").strip()
         cmd = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error"]
         if enc and enc.upper() not in ("UTF-8", "UTF8"):
             cmd += ["-sub_charenc", enc]
@@ -1012,6 +1012,142 @@ def install_subs(job, cand, lang=None):
             os.remove(tmp)
         except OSError:
             pass
+
+
+def install_subs(job, cand, lang=None):
+    """Fetch one OpenSubtitles candidate and leave a WebVTT sidecar."""
+    try:
+        raw = subs_get(cand["SubDownloadLink"])
+        if raw[:2] == b"\x1f\x8b":                  # gzip, which it always is
+            raw = gzip.decompress(raw)
+    except Exception as e:
+        job["subs_note"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+        return False
+    return write_subs(job, raw, lang, (cand.get("SubEncoding") or "").strip())
+
+
+SUB_EXT = (".srt", ".ass", ".ssa", ".sub", ".vtt")
+# Packers name subtitle files after the language, not after its code -- a real
+# season pack ships "2_English.srt" beside "17_French.srt" -- so the configured
+# ISO code has to be translated into the words that actually appear.
+SUB_LANG_NAMES = {
+    "eng": ("english", "eng", "en"), "spa": ("spanish", "spa", "es"),
+    "fre": ("french", "french", "fra", "fre", "fr"),
+    "ger": ("german", "deu", "ger", "de"), "ita": ("italian", "ita", "it"),
+    "por": ("portuguese", "por", "pt"), "rus": ("russian", "rus", "ru"),
+    "hin": ("hindi", "hin", "hi"), "ara": ("arabic", "ara", "ar"),
+    "chi": ("chinese", "chi", "zho", "zh"), "jpn": ("japanese", "jpn", "ja"),
+    "kor": ("korean", "kor", "ko"), "dut": ("dutch", "nld", "dut", "nl"),
+    "pol": ("polish", "pol", "pl"), "tur": ("turkish", "tur", "tr"),
+    "swe": ("swedish", "swe", "sv"), "dan": ("danish", "dan", "da"),
+    "fin": ("finnish", "fin", "fi"), "nor": ("norwegian", "nor", "no"),
+    "cze": ("czech", "ces", "cze", "cs"), "gre": ("greek", "ell", "gre", "el"),
+    "heb": ("hebrew", "heb", "he"), "tha": ("thai", "tha", "th"),
+    "vie": ("vietnamese", "vie", "vi"), "ind": ("indonesian", "ind", "id"),
+}
+
+
+def sub_speaks(name, lang):
+    """Whether a subtitle filename claims to be in this language."""
+    words = SUB_LANG_NAMES.get(lang, (lang,))
+    low = os.path.basename(name or "").lower()
+    return any(re.search(r"(?:^|[^a-z])%s(?:[^a-z]|$)" % re.escape(w), low)
+               for w in words)
+
+
+def torrent_subs(files, chosen, lang=None):
+    """Subtitle files inside the torrent that belong to the chosen video.
+
+    Best first. A subtitle shipped with a release is timed to that exact file,
+    which is a stronger guarantee than anything a search can offer -- and for
+    television it is often the only option, since OpenSubtitles is thin on
+    individual episodes where it is rich on films.
+
+    Association is by the video's own filename appearing in the subtitle's path,
+    which is how packs lay them out: Subs/<the video's name>/2_English.srt.
+    """
+    lang = lang or SUBS_LANG
+    subs = [f for f in (files or [])
+            if (f.get("name") or "").lower().endswith(SUB_EXT)]
+    if not subs:
+        return []
+    stem = os.path.splitext(os.path.basename((chosen or {}).get("name") or ""))[0]
+    mine = [f for f in subs if stem and stem.lower() in (f.get("name") or "").lower()]
+    if not mine:
+        # A single-video torrent needs no association: everything in it is for
+        # the one film. With several videos and no name to go on, guessing which
+        # subtitle belongs to which would be worse than offering none.
+        vids = [f for f in files if (f.get("name") or "").lower().endswith(VIDEO_EXT)]
+        if len(vids) > 1:
+            return []
+        mine = subs
+
+    def rank(f):
+        base = os.path.basename(f.get("name") or "")
+        lead = re.match(r"(\d+)", base)
+        return (not sub_speaks(base, lang),           # wanted language first
+                bool(re.search(r"forced", base, re.I)),  # forced covers only
+                                                         # foreign dialogue
+                int(lead.group(1)) if lead else 999,  # the packer's own order
+                f.get("size") or 0)
+    mine.sort(key=rank)
+    return [f for f in mine if sub_speaks(os.path.basename(f["name"]), lang)] or []
+
+
+def wt_fetch(port, ih, relpath, timeout=45):
+    """Read one file out of a running webtorrent server.
+
+    Reading is what makes this work: webtorrent selects the pieces behind a file
+    the moment something iterates it, so a file excluded from the download
+    arrives on demand. That is the whole trick -- no second torrent run, and no
+    changing what the main download selected.
+    """
+    base = "http://127.0.0.1:%d" % port
+    for url in ("%s/webtorrent/%s/%s" % (base, ih, urllib.parse.quote(relpath)),
+                safe_url("%s/webtorrent/%s/%s" % (base, ih, relpath))):
+        try:
+            with urllib.request.urlopen(safe_url(url), timeout=timeout) as r:
+                data = r.read()
+            if data:
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def subs_from_torrent(job, port, files, chosen, lang=None):
+    """Lift subtitles out of the torrent, falling back to searching for them.
+
+    Runs on a thread: the file has to arrive over BitTorrent like anything else,
+    and nothing about playback should wait for it.
+    """
+    lang = lang or SUBS_LANG
+    name = (chosen or {}).get("name") or job.get("title")
+
+    def work():
+        cands = torrent_subs(files, chosen, lang)
+        ih = job.get("wt_ih") or infohash(job.get("magnet", "") or "")
+        for cand in cands[:3]:          # a chosen one can simply never arrive
+            if job["cancel"].is_set():
+                return
+            raw = wt_fetch(port, ih, cand["name"])
+            if not raw:
+                continue
+            if write_subs(job, raw, lang,
+                          suffix=os.path.splitext(cand["name"])[1] or ".srt"):
+                job.update(subs_status="ready", subs_source="torrent",
+                           subs_lang=lang, subs_exact=True,
+                           subs_name=os.path.basename(cand["name"])[:120],
+                           subs_why="shipped with this release")
+                record(job, "subtitles: took %s from the torrent itself"
+                       % os.path.basename(cand["name"])[:80])
+                return
+        if cands:
+            record(job, "subtitles: %d in the torrent, none could be fetched"
+                   % len(cands))
+        # Nothing usable inside it, so ask the internet after all.
+        start_subs(job, None, name=name)
+    threading.Thread(target=work, daemon=True).start()
 
 
 def start_subs(job, src, name=None):
@@ -4231,7 +4367,10 @@ def run_torrent(job):
     # meant a two-hour film had none until it had finished arriving, which is
     # exactly when they stop being useful. The hooks at completion still run and
     # will upgrade this to an exact hash match if one exists.
-    start_subs(job, None, name=(chosen or {}).get("name") or job.get("title"))
+    # The torrent's own subtitles first: they were made for this exact file, so
+    # they cannot drift, and for television they are usually the only ones that
+    # exist. Falls back to searching when the torrent carries none.
+    subs_from_torrent(job, port, files, chosen)
     if direct:
         # Best case: hand the browser webtorrent's own ranged stream. Seeking
         # works immediately and no transcode happens at all.

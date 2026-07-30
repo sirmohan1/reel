@@ -831,6 +831,104 @@ class TestFeedBuild(Base):
 
 
 # --------------------------------------------------------------------------
+class TestTorrentSubtitles(Base):
+    """Subtitles lifted out of the torrent, modelled on a real season pack:
+    387 files, 9 episodes, 378 subtitle files under Subs/<video name>/."""
+
+    def pack(self, episodes=3, langs=("2_English", "17_French", "9_Danish")):
+        files, i = [], 0
+        root = "Severance.S01.1080p.WEBRip.x265[eztv.re]"
+        vids = []
+        for e in range(1, episodes + 1):
+            stem = "Severance.S01E%02d.1080p.WEBRip.x265-RARBG[eztv.re]" % e
+            vids.append({"index": i, "name": "%s/%s.mp4" % (root, stem),
+                         "size": 900_000_000})
+            i += 1
+        files += vids
+        for e in range(1, episodes + 1):
+            stem = "Severance.S01E%02d.1080p.WEBRip.x265-RARBG[eztv.re]" % e
+            for L in langs:
+                files.append({"index": i, "size": 40_000,
+                              "name": "%s/Subs/%s/%s.srt" % (root, stem, L)})
+                i += 1
+        return files, vids
+
+    def test_each_episode_gets_its_own_subtitle(self):
+        # The association is the video's filename appearing in the subtitle's
+        # path, which is how packs lay them out.
+        files, vids = self.pack()
+        for n, v in enumerate(vids, 1):
+            got = self.m.torrent_subs(files, v, "eng")
+            self.assertTrue(got, "episode %d" % n)
+            self.assertIn("S01E%02d" % n, got[0]["name"])
+            self.assertTrue(got[0]["name"].endswith("2_English.srt"))
+
+    def test_the_configured_language_is_the_one_taken(self):
+        files, vids = self.pack()
+        self.assertIn("French", self.m.torrent_subs(files, vids[0], "fre")[0]["name"])
+        self.assertIn("Danish", self.m.torrent_subs(files, vids[0], "dan")[0]["name"])
+        # a language the pack does not carry yields nothing rather than a guess
+        self.assertEqual(self.m.torrent_subs(files, vids[0], "swa"), [])
+
+    def test_language_is_matched_by_name_not_by_code(self):
+        # Packers write "2_English.srt", never "2_eng.srt", so the ISO code has
+        # to be translated into the word that actually appears.
+        self.assertTrue(self.m.sub_speaks("2_English.srt", "eng"))
+        self.assertTrue(self.m.sub_speaks("29_nor.srt", "nor"))
+        self.assertFalse(self.m.sub_speaks("17_French.srt", "eng"))
+        # and must not match a word that merely contains the code
+        self.assertFalse(self.m.sub_speaks("13_Spanish.srt", "pan"))
+
+    def test_the_packers_own_numbering_breaks_ties(self):
+        files, vids = self.pack(episodes=1, langs=("3_English", "2_English"))
+        got = self.m.torrent_subs(files, vids[0], "eng")
+        self.assertTrue(got[0]["name"].endswith("2_English.srt"))
+
+    def test_forced_subtitles_rank_below_full_ones(self):
+        # Forced tracks caption only foreign dialogue, so they are not what
+        # someone turning subtitles on is asking for.
+        files, vids = self.pack(episodes=1, langs=("2_English_forced", "4_English"))
+        got = self.m.torrent_subs(files, vids[0], "eng")
+        self.assertTrue(got[0]["name"].endswith("4_English.srt"))
+
+    def test_a_single_film_needs_no_association(self):
+        files = [{"index": 0, "name": "Film.2026.1080p.mkv", "size": 6_000_000_000},
+                 {"index": 1, "name": "Subs/English.srt", "size": 40_000}]
+        got = self.m.torrent_subs(files, files[0], "eng")
+        self.assertEqual(len(got), 1)
+
+    def test_unattributable_subtitles_are_refused_not_guessed(self):
+        # Several videos and nothing tying the subtitles to any of them:
+        # handing one the wrong track is worse than handing it none.
+        files = [{"index": 0, "name": "A.mkv", "size": 6_000_000_000},
+                 {"index": 1, "name": "B.mkv", "size": 6_000_000_000},
+                 {"index": 2, "name": "Subs/English.srt", "size": 40_000}]
+        self.assertEqual(self.m.torrent_subs(files, files[0], "eng"), [])
+
+    def test_a_torrent_with_no_subtitles_yields_none(self):
+        files = [{"index": 0, "name": "Film.2026.mkv", "size": 6_000_000_000}]
+        self.assertEqual(self.m.torrent_subs(files, files[0], "eng"), [])
+
+    @needs_ffmpeg
+    def test_srt_bytes_become_a_vtt_sidecar(self):
+        j = self.job()
+        srt = ("1\n00:00:14,139 --> 00:00:15,307\nFirst line.\n\n"
+               "2\n00:00:16,000 --> 00:00:18,000\nSecond line.\n")
+        self.assertTrue(self.m.write_subs(j, srt.encode()))
+        path = self.m.subs_path_for(j["id"], self.m.SUBS_LANG)
+        with open(path, encoding="utf-8") as f:
+            out = f.read()
+        self.assertTrue(out.startswith("WEBVTT"))
+        self.assertEqual(out.count("-->"), 2)
+        self.assertEqual(j["subs_cues"], 2)
+
+    def test_empty_bytes_are_not_a_subtitle(self):
+        j = self.job()
+        self.assertFalse(self.m.write_subs(j, b""))
+        self.assertFalse(self.m.write_subs(j, b"   \n "))
+
+
+# --------------------------------------------------------------------------
 class TestPacks(Base):
     def f(self, i, name, gb):
         return {"index": i, "name": name, "size": int(gb * 1_000_000_000)}

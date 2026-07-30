@@ -885,6 +885,32 @@ class TestPacks(Base):
                  self.f(1, "Godfather.Part.II.1974.mkv", 4.0)]
         self.assertEqual([f["index"] for f in self.m.pack_files(files)], [0, 1])
 
+    def test_episode_order_beats_file_order(self):
+        # From a real Severance pack: the torrent listed E01 at index 0, E03 at
+        # index 1 and E02 at index 8, so ordering by index put episode 2 last
+        # in the queue.
+        files = [self.f(0, "Severance.S01E01.1080p.WEBRip.x265.mkv", 0.96),
+                 self.f(1, "Severance.S01E03.1080p.WEBRip.x265.mkv", 0.95),
+                 self.f(2, "Severance.S01E04.1080p.WEBRip.x265.mkv", 0.78),
+                 self.f(8, "Severance.S01E02.1080p.WEBRip.x265.mkv", 0.89)]
+        got = self.m.pack_files(files)
+        self.assertEqual([f["name"].split(".")[1] for f in got],
+                         ["S01E01", "S01E02", "S01E03", "S01E04"])
+
+    def test_seasons_sort_before_episodes(self):
+        files = [self.f(0, "Show.S02E01.mkv", 2.0), self.f(1, "Show.S01E09.mkv", 2.0),
+                 self.f(2, "Show.S01E10.mkv", 2.0)]
+        got = self.m.pack_files(files)
+        self.assertEqual([f["name"].split(".")[1] for f in got],
+                         ["S01E09", "S01E10", "S02E01"])
+
+    def test_films_without_episode_numbers_keep_file_order(self):
+        # A trilogy has nothing to parse, so index remains the best guess.
+        files = [self.f(0, "Godfather.1972.mkv", 14.0),
+                 self.f(1, "Godfather.Part.II.1974.mkv", 16.0),
+                 self.f(2, "Godfather.Part.III.1990.mkv", 13.0)]
+        self.assertEqual([f["index"] for f in self.m.pack_files(files)], [0, 1, 2])
+
     def test_only_video_files_count(self):
         files = [self.f(0, "Film.mkv", 4.0), self.f(1, "soundtrack.mp3", 2.0),
                  self.f(2, "cover.jpg", 1.0)]

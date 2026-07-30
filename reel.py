@@ -130,6 +130,9 @@ PACK_EXTRAS = re.compile(r"""(sample|trailer|teaser|extras?|bonus|featurette|
     behind[ ._-]?the[ ._-]?scenes|deleted[ ._-]?scenes?|making[ ._-]?of|
     interview|blooper|outtake|gag[ ._-]?reel|commentary|proof|screener)""",
     re.I | re.X)
+# Season and episode out of a filename, used to order a pack the way it is meant
+# to be watched rather than the way the torrent happens to list it.
+SEASON_EP = re.compile(r"\bs(\d{1,2})[ ._-]?e(\d{1,3})\b", re.I)
 
 # Search. One indexer to begin with, behind a normalising layer so another can
 # be added without the caller noticing. These endpoints go dark without warning
@@ -3645,7 +3648,17 @@ def pack_files(files):
     keep = [f for f in vids if (f.get("size") or 0) >= bar]
     if len(keep) < 2:
         return []
-    keep.sort(key=lambda f: f["index"])
+    # File order is not episode order. A real Severance season pack listed E01
+    # at index 0, E03 at index 1 and E02 at index 8, so sorting by index put
+    # episode 2 last in the queue. When every file names its episode, that is
+    # the ordering to trust; otherwise index is still the best guess available.
+    marks = [SEASON_EP.search(f.get("name") or "") for f in keep]
+    if all(marks):
+        keep = [f for _k, f in sorted(
+            zip([(int(m.group(1)), int(m.group(2))) for m in marks], keep),
+            key=lambda p: p[0])]
+    else:
+        keep.sort(key=lambda f: f["index"])
     return keep[:PACK_MAX]
 
 

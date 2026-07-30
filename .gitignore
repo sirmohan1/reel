@@ -1,6 +1,7 @@
 # Downloaded media and scratch dirs. reel writes its cache next to the script,
 # and a single episode is over a gigabyte, so none of this belongs in git.
 reel_downloads/
+reel_cache/
 test_dl/
 *.live.mp4
 *.compat.mp4

@@ -45,6 +45,7 @@ import hashlib
 import threading
 import subprocess
 import time
+import math
 
 # A client vanishing is normal, not an error. Media elements abort constantly:
 # seeking, swapping source, closing a tab. socket.timeout is only an alias of
@@ -59,6 +60,11 @@ PORT = 8000
 HOST = os.environ.get("REEL_HOST", "0.0.0.0")
 DL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reel_downloads")
 os.makedirs(DL, exist_ok=True)
+# Deliberately not inside DL: everything in there is either a video or something
+# restore() tries to reattach to a job, and it all counts against the cache cap.
+# A ratings dump is neither, and should not be able to evict a film.
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reel_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 GB = 1_000_000_000  # decimal GB, matching what Finder displays
 
@@ -167,6 +173,49 @@ SEARCH_TRACKERS = (
 
 # The subset asked when checking a seeder count: biggest and quickest to reply.
 VERIFY_TRACKERS = SEARCH_TRACKERS[:5]
+
+# Recommendations. Search answers "do you have this?"; this answers "what should
+# I watch?", which needs a source that is browsable rather than queryable.
+# apibay publishes precompiled top-100 lists per category as static json -- no
+# query, no rate limit, and they carry the three fields the ranking needs that a
+# search result does not: an imdb id, an upload timestamp, and an uploader
+# status. 201 is Movies and 207 HD Movies; the television categories are
+# deliberately absent, since a feed mixing episode 4 of something into a list of
+# films is not a list of films.
+FEED_URL = "https://apibay.org/precompiled/data_top100_%d.json"
+FEED_CATS = (201, 207)
+# Ratings come from IMDb's own daily dump, which needs no API key -- the same
+# reason the subtitle source was chosen. 8.6 MB gzipped, and only ever scanned
+# for the ~150 ids the feed actually mentions, so it costs no resident memory:
+# holding all 1.7M rows would cost about 20 MB to answer 150 questions.
+RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
+RATINGS_MAX_AGE = 86400.0        # the dump is rebuilt daily; no point refetching sooner
+RATINGS_TIMEOUT = 90
+# The feed changes on the order of hours, so rebuilding it per page load would be
+# pure waste -- and every rebuild is ~10 UDP scrapes and two http fetches.
+FEED_TTL = 1800.0
+FEED_LIMIT = 24
+FEED_VERIFY = 10                 # top rows whose seeders get measured, as in search
+# A film is one film. Anything with this many files is a boxset, a season, or a
+# 400-file cartoon collection -- all of which were really in the list, and none
+# of which is something to press play on. Measured: legitimate single films top
+# out around 6 files (video, subtitles, sample, nfo), collections start at 16.
+FEED_PACK_FILES = 12
+# Ranking weights. Rating dominates because it is the only factor about the film
+# rather than about the torrent; without it the list is just "what is popular
+# right now", which is what every other index already shows.
+W_RATING, W_RECENT, W_SEEDERS = 0.42, 0.24, 0.22
+B_DIRECT, B_TRUSTED = 0.12, 0.04
+# Recency blends two different things: when the torrent appeared, and when the
+# film came out. Torrent age alone puts a fresh re-upload of a 1998 film above a
+# genuinely new release, which is not what "recent" means to someone browsing.
+RECENT_TORRENT, RECENT_YEAR = 0.7, 0.3
+FEED_HALFLIFE = 60.0             # days; torrent recency decays on this scale
+FEED_SEED_FULL = 3000.0          # seeders at which the swarm score saturates
+# A bare average is not a rating: 9.2 from 300 votes is noise next to 8.1 from a
+# million. Pulling every score toward the global mean in proportion to how few
+# votes back it is the standard fix, and it costs one line.
+RATING_PRIOR, RATING_PRIOR_VOTES = 6.6, 2000.0
 
 # Subtitles, from OpenSubtitles' legacy endpoint -- which needs no API key, so
 # this works out of the box rather than waiting on credentials.
@@ -919,8 +968,14 @@ def read_release(name):
     # file that just refuses. Only judged when the real filename was found --
     # the truncated search name usually has no extension, and treating unknown
     # as bad would mark almost everything as needing a remux.
+    # Only a *recognised* media extension says anything about the container.
+    # Release names are dotted, so splitext happily returns ".h264-kyogo" or
+    # ".hevc" as the extension -- neither is a container, and treating them as
+    # unplayable ones marked every dotted h264 release as needing a remux when
+    # the real-filename lookup came back empty.
     ext = os.path.splitext(name or "")[1].lower()
-    container_ok = (ext in BROWSER_CONTAINERS) if ext else True
+    known = ext in VIDEO_EXT + AUDIO_EXT
+    container_ok = (ext in BROWSER_CONTAINERS) if known else True
     return {"codec": codec, "res": res, "hdr": hdr, "container": ext or None,
             "direct": codec == "h264" and not hdr and container_ok}
 
@@ -1292,6 +1347,325 @@ def search_torrents(query, limit=SEARCH_LIMIT):
         res.setdefault("reported", None)
         res.update(info)
     return out, None, dropped, per_source
+
+
+# Release names carry the title, but buried in the encoding vocabulary. Cutting
+# at the first of these tokens is what separates "Toy Story 5" from
+# "Toy.Story.5.2026.1080p.WEB-DL.DDP5.1.H264-GROUP".
+FEED_STOP = re.compile(r"""\b(1080p|720p|2160p|480p|576p|4k|uhd|web[- ]?dl|webrip|
+    webscr|bluray|brrip|bdrip|hdrip|dvdrip|dvdscr|hdts|hdcam|camrip|cam|telesync|
+    hdtv|x264|x265|h ?264|h ?265|hevc|avc|av1|xvid|divx|aac|ac3|dd5|ddp5|dts|
+    truehd|atmos|10bit|8bit|sdr|hdr10?|dolby|vision|remux|extended|unrated|proper|
+    repack|internal|amzn|nf|dsnp|hmax|atvp|imax|multi|dual|subs?)\b""",
+    re.I | re.X)
+FEED_YEAR = re.compile(r"[\(\[\.\s_-]((?:19|20)\d{2})[\)\]\.\s_-]")
+FEED_PACK = re.compile(r"""\b(collection|boxset|box ?set|complete|seasons?|duology|
+    trilogy|quadrilogy|anthology|mega ?pack|movie pack|filmography)\b""", re.I | re.X)
+FEED_EPISODE = re.compile(r"\bS\d{1,2}(E\d{1,2}|\b)", re.I)
+
+
+def feed_title(name):
+    """A film's title and year, dug out of a release name. Returns (title, year).
+
+    The year is taken as the *last* plausible one, not the first, because a title
+    can contain a number that looks like one -- "Blade Runner 2049.HDRip.XviD"
+    parsed left to right gives the title "Blade Runner" and the year 2049. Any
+    year past next year is a title, not a date, which is the rule that fixes it.
+    """
+    n = (name or "").replace("_", " ")
+    limit = time.gmtime().tm_year + 1
+    m = None
+    for hit in FEED_YEAR.finditer(" " + n + " "):
+        if int(hit.group(1)) <= limit:
+            m = hit
+    year = int(m.group(1)) if m else None
+    head = (" " + n + " ")[:m.start()] if m else n
+    head = FEED_STOP.split(head.replace(".", " "))[0]
+    head = re.sub(r"[\(\[\{].*", " ", head)          # "(2026) [1080p]" and friends
+    head = re.sub(r"[^0-9A-Za-z':&!,\- ]+", " ", head)
+    return re.sub(r"\s+", " ", head).strip(" -:"), year
+
+
+def feed_pack(name, files):
+    """Whether this is a collection rather than a film."""
+    return (files or 0) >= FEED_PACK_FILES or bool(
+        FEED_PACK.search(name or "") or FEED_EPISODE.search(name or ""))
+
+
+def _norm_title(t):
+    return re.sub(r"[^a-z0-9]", "", (t or "").lower())
+
+
+def ratings_file():
+    """The IMDb ratings dump on disk, refetched only when stale.
+
+    A failed refresh keeps yesterday's copy rather than discarding it: a rating
+    a day old is worth far more than no rating, and this is the only part of the
+    feed that depends on a host we do not otherwise talk to.
+    """
+    path = os.path.join(CACHE_DIR, "imdb-ratings.tsv.gz")
+    try:
+        fresh = os.path.exists(path) and (time.time() - os.path.getmtime(path)) < RATINGS_MAX_AGE
+    except OSError:
+        fresh = False
+    if fresh:
+        return path
+    tmp = path + ".part"
+    try:
+        req = urllib.request.Request(RATINGS_URL, headers={"User-Agent": "reel/1.0"})
+        with urllib.request.urlopen(req, timeout=RATINGS_TIMEOUT) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(tmp, path)                 # never a half-written file in place
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return path if os.path.exists(path) else None
+    return path
+
+
+def ratings_for(ids):
+    """{tconst: (rating, votes)} for just the ids asked about.
+
+    Streamed and matched against a set rather than loaded into a dict, because
+    the dump holds 1.7M titles and the feed asks about ~150 of them.
+    """
+    want = {i for i in ids if i}
+    if not want:
+        return {}
+    path = ratings_file()
+    if not path:
+        return {}
+    out = {}
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            f.readline()                      # header
+            for line in f:
+                tid = line.split("\t", 1)[0]
+                if tid in want:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 3:
+                        try:
+                            out[tid] = (float(parts[1]), int(parts[2]))
+                        except ValueError:
+                            pass
+                    if len(out) == len(want):
+                        break                 # nothing left to find
+    except (OSError, EOFError, gzip.BadGzipFile):
+        return out                            # truncated dump: partial beats none
+    return out
+
+
+def feed_fetch():
+    """Raw rows from every feed category at once. Returns (rows, per_source)."""
+    rows, per = [], {}
+    lock = threading.Lock()
+
+    def grab(cat):
+        try:
+            got = _search_json(FEED_URL % cat)
+        except Exception as e:
+            with lock:
+                per[str(cat)] = "failed: " + str(e)[:40]
+            return
+        got = [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
+        with lock:
+            per[str(cat)] = len(got)
+            rows.extend(got)
+
+    threads = [threading.Thread(target=grab, args=(c,), daemon=True) for c in FEED_CATS]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT + 4)
+    return rows, per
+
+
+def rating_score(rating, votes):
+    """A vote-weighted rating in 0..1, or None when there is no rating.
+
+    None rather than a default, because a missing rating is a thing we do not
+    know, and substituting the average would let an unrated film pass itself off
+    as an average one.
+    """
+    if not rating:
+        return None
+    v = max(0, votes or 0)
+    weighted = ((v / (v + RATING_PRIOR_VOTES)) * rating
+                + (RATING_PRIOR_VOTES / (v + RATING_PRIOR_VOTES)) * RATING_PRIOR)
+    return max(0.0, min(1.0, weighted / 10.0))
+
+
+def feed_score(item, now=None):
+    """How strongly to recommend this. Returns (score, why).
+
+    An unrated film scores as exactly average, which is what the vote-weighting
+    already does with zero votes -- it falls back to the prior. Dropping the
+    factor and averaging the rest was tried first and is subtly wrong: it scores
+    an unknown film on its *best* remaining signals, so two films nobody has
+    rated took the top two places over one rated 8.2. Not knowing something is
+    not evidence in its favour.
+    """
+    now = now or time.time()
+    why = []
+    q = rating_score(item.get("rating"), item.get("votes"))
+    if q is None:
+        q = RATING_PRIOR / 10.0
+        why.append("no rating found")
+    else:
+        why.append("rated %.1f from %s votes" % (item["rating"], f"{item['votes']:,}"))
+
+    age_days = max(0.0, (now - (item.get("added") or now)) / 86400.0)
+    torrent_rec = math.exp(-age_days / FEED_HALFLIFE)
+    year = item.get("year")
+    this_year = time.gmtime(now).tm_year
+    year_rec = 1.0 if not year else max(0.0, min(1.0, 1.0 - (this_year - year) / 6.0))
+    rec = RECENT_TORRENT * torrent_rec + RECENT_YEAR * year_rec
+    if age_days <= 14:
+        why.append("posted %d days ago" % round(age_days))
+
+    seeders = max(0, item.get("seeders") or 0)
+    seed = min(1.0, math.log10(max(1, seeders)) / math.log10(FEED_SEED_FULL))
+    if seeders >= 500:
+        why.append("%d seeders" % seeders)
+
+    score = W_RATING * q + W_RECENT * rec + W_SEEDERS * seed
+
+    if item.get("direct"):
+        score += B_DIRECT
+        why.append("plays without converting")
+    if item.get("status") in ("vip", "trusted"):
+        score += B_TRUSTED
+    return score, why
+
+
+FEED_CACHE = {"at": 0.0, "rows": [], "sources": {}, "error": None}
+FEED_LOCK = threading.Lock()
+
+
+def build_feed(limit=FEED_LIMIT):
+    """The recommendation list. Returns (rows, error, sources)."""
+    raw, per = feed_fetch()
+    if not raw:
+        alive = [n for n, v in per.items() if isinstance(v, int)]
+        if not alive:
+            return [], "could not reach the recommendation source", per
+        return [], None, per
+
+    items = []
+    for r in raw:
+        name = (r.get("name") or "").strip()
+        ih = (r.get("info_hash") or "").strip().lower()
+        if not name or not re.fullmatch(r"[0-9a-f]{40}", ih):
+            continue
+        files = r.get("num_files") or 1
+        if feed_pack(name, files):
+            continue
+        title, year = feed_title(name)
+        if not title:
+            continue
+        try:
+            added = int(r.get("added") or 0)
+        except (TypeError, ValueError):
+            added = 0
+        imdb = r.get("imdb") or ""
+        items.append({"infohash": ih, "name": name, "title": title, "year": year,
+                      "imdb": imdb if imdb.startswith("tt") else "",
+                      "seeders": max(0, int(r.get("seeders") or 0)),
+                      "leechers": max(0, int(r.get("leechers") or 0)),
+                      "size": max(0, int(r.get("size") or 0)),
+                      "files": files, "added": added,
+                      "status": r.get("status") or "",
+                      "magnet": build_magnet(ih, name)})
+
+    rated = ratings_for({i["imdb"] for i in items})
+    for i in items:
+        i["rating"], i["votes"] = rated.get(i["imdb"], (None, 0))
+        i["direct"] = read_release(i["name"])["direct"]
+
+    def better(a, b):
+        # One release per film, and the one worth offering is the one that will
+        # actually play: a direct 1080p beats a marginally better-seeded x265
+        # that costs a remux and twice the disk.
+        return (a["direct"], a["seeders"]) > (b["direct"], b["seeders"])
+
+    # Two passes. An imdb id is the reliable key, but 30 of 200 rows carry none,
+    # so a second pass on title+year collapses what the first could not see --
+    # otherwise the same film appears twice, once with a rating and once without.
+    best = {}
+    for i in items:
+        key = i["imdb"] or ("t:" + _norm_title(i["title"]) + str(i["year"]))
+        if key not in best or better(i, best[key]):
+            best[key] = i
+    merged = {}
+    for i in best.values():
+        key = _norm_title(i["title"]) + str(i["year"] or "")
+        prev = merged.get(key)
+        if prev is None:
+            merged[key] = i
+            continue
+        keep, drop = (i, prev) if better(i, prev) else (prev, i)
+        if keep["rating"] is None and drop["rating"] is not None:
+            keep = dict(keep, rating=drop["rating"], votes=drop["votes"],
+                        imdb=drop["imdb"])
+        merged[key] = keep
+
+    now = time.time()
+    rows = list(merged.values())
+    for r in rows:
+        r["score"], r["why"] = feed_score(r, now)
+    rows.sort(key=lambda r: -r["score"])
+    rows = rows[:limit]
+
+    # Same treatment search gives its top rows: the indexer's seeder count is a
+    # cache and overstates by roughly 2x, so measure the ones being offered.
+    def verify(res):
+        live = live_seeders(res["infohash"])
+        if live is not None:
+            res["reported"] = res["seeders"]
+            res["seeders"] = live
+            res["verified"] = True
+    threads = [threading.Thread(target=verify, args=(r,), daemon=True)
+               for r in rows[:FEED_VERIFY]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT)
+
+    # A measured-dead swarm cannot serve a byte, so it is not a recommendation.
+    rows = [r for r in rows if not (r.get("verified") and r["seeders"] <= 0)]
+    for r in rows:
+        r.setdefault("verified", False)
+        r.setdefault("reported", None)
+        if r.get("verified"):
+            r["score"], r["why"] = feed_score(r, now)
+    rows.sort(key=lambda r: -r["score"])
+
+    cap = cap_bytes()
+    for r in rows:
+        info = read_release(r["name"])
+        r["peak"] = r["size"] if info["direct"] else int(r["size"] * 2.05)
+        r["fits"] = r["peak"] <= cap
+        r["weak"] = r["seeders"] < SEARCH_MIN_SEEDERS
+        r.update(info)
+    return rows, None, per
+
+
+def recommendations(force=False):
+    """Cached feed. Rebuilt at most every FEED_TTL, since it moves in hours."""
+    with FEED_LOCK:
+        fresh = (time.time() - FEED_CACHE["at"]) < FEED_TTL
+        if fresh and FEED_CACHE["rows"] and not force:
+            return FEED_CACHE["rows"], FEED_CACHE["error"], FEED_CACHE["sources"]
+        try:
+            rows, err, per = build_feed()
+        except Exception as e:
+            # Never a broken page: a dead source reads as an empty shelf.
+            rows, err, per = [], "%s: %s" % (type(e).__name__, str(e)[:120]), {}
+        if rows or not FEED_CACHE["rows"]:
+            FEED_CACHE.update(at=time.time(), rows=rows, error=err, sources=per)
+        return FEED_CACHE["rows"], FEED_CACHE["error"], FEED_CACHE["sources"]
 
 
 def split_sources(text):
@@ -4078,6 +4452,18 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"results": results, "error": err,
                                     "dropped": dropped, "sources": per})
 
+        if p == "/feed":
+            # Nothing starts here either -- this only suggests. Chosen rows go
+            # through /add exactly like a search result or a pasted magnet.
+            rows, err, per = recommendations(force=bool(body.get("force")))
+            with LOCK:
+                have = {infohash(j["magnet"]) for j in JOBS.values() if j.get("magnet")}
+            # Shown as "already queued" rather than hidden: a familiar film
+            # missing from the list looks like a bad recommendation engine,
+            # where a greyed-out one explains itself.
+            out = [dict(r, queued=r["infohash"] in have) for r in rows]
+            return self._json(200, {"results": out, "error": err, "sources": per})
+
         if p == "/add":
             magnets, ids, bad = split_sources(body.get("links"))
             caps = sorted(caps_of(body.get("client")))
@@ -4480,6 +4866,19 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     font-variant-numeric:tabular-nums;white-space:normal}
   .rrow.toobig .rtitle{color:var(--dim)}
   .rrow.toobig .rmeta{color:var(--warn)}
+  .rrow:disabled{opacity:.5}
+
+  /* picks */
+  .pickbtn{font:500 10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+    color:var(--faint);background:none;border:1px solid var(--rule);border-radius:4px;
+    padding:4px 8px}
+  .pickbtn:hover{color:var(--text);border-color:var(--dim)}
+  .picks{margin-top:8px;background:var(--panel);border:1px solid var(--rule);
+    border-radius:5px;padding:6px;max-height:420px;overflow-y:auto;
+    font-size:12.5px;color:var(--dim)}
+  .rrank{font:500 11px/1 var(--mono);color:var(--faint);letter-spacing:.06em}
+  .rwhy{font:400 10.5px/1.4 var(--mono);color:var(--dim);white-space:normal}
+  .rrow .rscore{color:var(--live)}
 
   /* stage */
   .stage{margin-top:16px;position:relative;aspect-ratio:16/9;background:#000;
@@ -4640,6 +5039,13 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <span class="eyebrow">Queue</span><span class="count" id="qcount"></span>
   </div>
   <ul id="list"><li class="blank">Paste a Drive link above to get started.</li></ul>
+
+  <div class="section">
+    <span class="eyebrow">Picks</span><span class="count" id="pcount"></span>
+    <button class="pickbtn" id="picktog" type="button" aria-expanded="false">Show</button>
+    <button class="pickbtn" id="pickref" type="button" hidden>Refresh</button>
+  </div>
+  <div class="picks" id="picks" hidden></div>
 
   <div class="cache">
     <div class="head">
@@ -4846,6 +5252,94 @@ async function runSearch(q) {
     box.append(row);
   });
 }
+
+/* picks --------------------------------------------------------------------
+   A shelf rather than a search: what to watch, when you don't already know.
+   Collapsed by default and only fetched when opened, so the page costs nothing
+   extra to load and nothing is requested on your behalf until you ask. */
+let picksLoaded = false;
+
+function pickRow(res) {
+  const row = document.createElement('button');
+  row.className = 'rrow';
+  row.type = 'button';
+  if (!res.fits || res.weak || res.queued) row.classList.add('toobig');
+  if (res.queued) row.disabled = true;
+
+  const title = document.createElement('span');
+  title.className = 'rtitle';
+  title.textContent = res.title + (res.year ? ' (' + res.year + ')' : '');
+
+  const meta = document.createElement('span');
+  meta.className = 'rmeta';
+  const bits = [];
+  // The rating is the reason this is a recommendation rather than a listing,
+  // so it leads -- and says outright when there isn't one, since an absent
+  // rating and a bad one should never look the same.
+  bits.push(res.rating ? '★ ' + res.rating.toFixed(1)
+                       + (res.votes ? ' (' + res.votes.toLocaleString() + ')' : '')
+                       : 'no rating');
+  bits.push((res.verified ? '' : '~') + res.seeders + ' seed'
+            + (res.weak ? ' — too few to stream' : ''));
+  bits.push(fmtSize(res.size));
+  if (res.res) bits.push(res.res);
+  bits.push(res.direct ? 'plays directly' :
+            res.codec === 'hevc' ? 'needs remux' :
+            res.codec ? res.codec + ', may need remux' : 'unknown codec');
+  if (res.hdr) bits.push('HDR');
+  if (!res.fits) bits.push('needs ~' + fmtSize(res.peak) + ', over your cache cap');
+  if (res.queued) bits.push('already in your queue');
+  meta.textContent = bits.join('  ·  ');
+
+  // Why this one was picked, in the same words the ranking used -- a list of
+  // suggestions with no stated reason is just an ordering you have to trust.
+  const why = document.createElement('span');
+  why.className = 'rwhy';
+  why.textContent = (res.why || []).join(' · ');
+
+  row.append(title, meta);
+  if (why.textContent) row.append(why);
+  if (!res.queued) row.addEventListener('click', async () => {
+    row.disabled = true;
+    title.textContent = 'Adding: ' + res.title;
+    const add = await api('/add', {links: res.magnet, client: clientId});
+    (add.added || []).forEach(id => { if (!order.includes(id)) order.push(id); });
+    meta.textContent = 'added to your queue';
+    row.classList.add('toobig');
+    refresh();
+  });
+  return row;
+}
+
+async function loadPicks(force) {
+  const box = $('picks');
+  box.textContent = force ? 'Refreshing…' : 'Finding something worth watching…';
+  let r;
+  try { r = await api('/feed', force ? {force: true} : {}); }
+  catch (e) { box.textContent = 'Could not load picks.'; return; }
+  box.textContent = '';
+  picksLoaded = true;
+  if (r.error) { box.textContent = r.error; return; }
+  const rows = r.results || [];
+  $('pcount').textContent = rows.length ? rows.length + ' films' : '';
+  if (!rows.length) { box.textContent = 'Nothing to suggest right now.'; return; }
+
+  const head = document.createElement('div');
+  head.className = 'rhead';
+  head.textContent = 'Ranked by rating, how new it is, and swarm health';
+  box.append(head);
+  rows.forEach(res => box.append(pickRow(res)));
+}
+
+$('picktog').addEventListener('click', () => {
+  const box = $('picks'), open = box.hidden;
+  box.hidden = !open;
+  $('pickref').hidden = !open;
+  $('picktog').textContent = open ? 'Hide' : 'Show';
+  $('picktog').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open && !picksLoaded) loadPicks(false);
+});
+$('pickref').addEventListener('click', () => loadPicks(true));
 
 /* subtitles ----------------------------------------------------------------
    v.load() discards any existing text tracks, so this is re-applied after each

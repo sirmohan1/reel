@@ -11,6 +11,7 @@ those skip themselves rather than fail when it is missing.
 Run:  python3 test_reel.py          (or -v for the list)
 """
 
+import gzip
 import importlib.util
 import os
 import shutil
@@ -20,7 +21,10 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
+import urllib.parse
+import urllib.request
 
 
 def load_reel(dl=None):
@@ -35,6 +39,10 @@ def load_reel(dl=None):
     spec.loader.exec_module(m)
     if dl:
         m.DL = dl
+        # Otherwise the ratings dump lands in the repo, and a test run leaves
+        # 8 MB of IMDb behind it.
+        m.CACHE_DIR = os.path.join(dl, "cache")
+        os.makedirs(m.CACHE_DIR, exist_ok=True)
     return m
 
 
@@ -114,6 +122,19 @@ class TestReleaseNames(Base):
 
     def test_unknown_codec_is_not_claimed_as_direct(self):
         self.assertFalse(self.m.read_release("Some.Film.2024.1080p.mkv")["direct"])
+
+    def test_a_release_group_is_not_a_container(self):
+        # Release names are dotted, so splitext returns ".h264-kyogo" as the
+        # extension. Judged as a container that browsers cannot play, it marked
+        # every dotted h264 release "needs remux" whenever the real-filename
+        # lookup came back empty -- which is most of the recommendation feed,
+        # since it never does that lookup at all.
+        for name in ("The.Furious.2026.1080p.AMZN.WEB-DL.DDP5.1.H264-KyoGo",
+                     "Film.2026.1080p.WEB-DL.H264-GRP",
+                     "Film.2026.1080p.WEB-DL.H264"):
+            self.assertTrue(self.m.read_release(name)["direct"], name)
+        # and a real container still decides
+        self.assertFalse(self.m.read_release("Film.2026.1080p.x264-GRP.mkv")["direct"])
 
 
 # --------------------------------------------------------------------------
@@ -606,6 +627,247 @@ class TestWithFfmpeg(Base):
         v, a, _h, _hdr, _br, _dur, pix = self.m.probe_media(p)
         self.assertEqual(v, "hevc")
         self.assertEqual(self.m.codec_key(v, pix), "hevc10")
+
+
+# --------------------------------------------------------------------------
+class TestFeedParsing(Base):
+    def test_pulls_title_and_year_out_of_a_release_name(self):
+        for name, want in (
+                ("Toy.Story.5.2026.1080p.WEB-DL.DDP5.1.H264-GROUP", ("Toy Story 5", 2026)),
+                ("Supergirl (2026) [1080p] [WEBRip] [5.1]", ("Supergirl", 2026)),
+                ("The.Incredibles.2.2018.HDRip.XviD.AC3-EVO", ("The Incredibles 2", 2018)),
+                ("Magellan 2025 WEBSCR H264-II", ("Magellan", 2025))):
+            self.assertEqual(self.m.feed_title(name), want, name)
+
+    def test_a_number_in_the_title_is_not_the_year(self):
+        # Parsed left to right, "Blade Runner 2049" gives the title "Blade
+        # Runner" released in 2049. Any year past next year is part of a name.
+        title, year = self.m.feed_title("Blade Runner 2049.HDRip.XviD.AC3-EVO")
+        self.assertEqual(title, "Blade Runner 2049")
+        self.assertIsNone(year)
+
+    def test_survives_a_name_with_no_year_at_all(self):
+        title, year = self.m.feed_title("Some Obscure Film")
+        self.assertEqual(title, "Some Obscure Film")
+        self.assertIsNone(year)
+
+    def test_collections_are_not_films(self):
+        # All of these were really in the list, and none is something to press
+        # play on: a 127-file boxset has no single thing to stream.
+        self.assertTrue(self.m.feed_pack("BAFTA Best Pictures (1947 - 2021)", 127))
+        self.assertTrue(self.m.feed_pack("Akira Kurosawa Boxset", 159))
+        self.assertTrue(self.m.feed_pack("Rome - Seasons 1 and 2 - HBO", 33))
+        self.assertTrue(self.m.feed_pack("Some.Show.S02E04.1080p", 1))
+        # A film with subtitles, a sample and an nfo is still a film.
+        self.assertFalse(self.m.feed_pack("Beautiful.Boy.2018.HDRip.AC3.X264-CMRG", 3))
+
+
+# --------------------------------------------------------------------------
+class TestFeedScoring(Base):
+    def test_votes_temper_the_rating(self):
+        # A 9.2 from 300 people is noise beside an 8.1 from a million.
+        few = self.m.rating_score(9.2, 300)
+        many = self.m.rating_score(8.1, 1_000_000)
+        self.assertLess(few, many)
+
+    def test_no_rating_is_not_evidence_in_its_favour(self):
+        # The first version dropped the rating factor and averaged the rest,
+        # which scored an unknown film on its *best* remaining signals: two
+        # films nobody had rated took the top two places over one rated 8.2.
+        common = {"added": time.time(), "seeders": 800, "year": 2026, "direct": True}
+        rated = dict(common, rating=8.2, votes=467897)
+        unrated = dict(common, rating=None, votes=0)
+        self.assertGreater(self.m.feed_score(rated)[0], self.m.feed_score(unrated)[0])
+
+    def test_an_unrated_film_scores_as_average_not_as_bad(self):
+        common = {"added": time.time(), "seeders": 800, "year": 2026, "direct": True}
+        unrated = self.m.feed_score(dict(common, rating=None, votes=0))[0]
+        poor = self.m.feed_score(dict(common, rating=3.0, votes=50000))[0]
+        good = self.m.feed_score(dict(common, rating=8.5, votes=50000))[0]
+        self.assertLess(poor, unrated)
+        self.assertLess(unrated, good)
+
+    def test_something_that_plays_without_converting_ranks_higher(self):
+        common = {"added": time.time(), "seeders": 500, "year": 2026,
+                  "rating": 7.0, "votes": 50000}
+        direct = self.m.feed_score(dict(common, direct=True))[0]
+        remux = self.m.feed_score(dict(common, direct=False))[0]
+        self.assertGreater(direct, remux)
+
+    def test_a_fresh_upload_outranks_an_old_one(self):
+        now = time.time()
+        common = {"seeders": 500, "year": 2026, "rating": 7.0, "votes": 50000,
+                  "direct": True}
+        new = self.m.feed_score(dict(common, added=now - 86400), now)[0]
+        old = self.m.feed_score(dict(common, added=now - 400 * 86400), now)[0]
+        self.assertGreater(new, old)
+
+    def test_the_reasons_given_match_the_score(self):
+        s, why = self.m.feed_score({"added": time.time(), "seeders": 900,
+                                    "year": 2026, "rating": 7.4, "votes": 86158,
+                                    "direct": True})
+        self.assertTrue(any("7.4" in w for w in why))
+        self.assertTrue(any("plays without converting" in w for w in why))
+        self.assertGreater(s, 0)
+
+
+# --------------------------------------------------------------------------
+class TestFeedBuild(Base):
+    """build_feed with stand-in sources: no network, no trackers."""
+
+    def setUp(self):
+        super().setUp()
+        self.m.live_seeders = lambda *a, **k: None      # never scrape a tracker
+        self.m.ratings_for = lambda ids: self.ratings
+        self.ratings = {}
+
+    def rows(self, *raw):
+        self.m.feed_fetch = lambda: (list(raw), {"201": len(raw)})
+        return self.m.build_feed()
+
+    def raw(self, ih, name, **kw):
+        r = {"info_hash": ih, "name": name, "seeders": 100, "leechers": 1,
+             "size": 2_000_000_000, "num_files": 1, "added": time.time(),
+             "status": "vip", "imdb": ""}
+        r.update(kw)
+        return r
+
+    def test_one_row_per_film_even_across_release_names(self):
+        # The same film, twice, under names that share no imdb id -- which is
+        # real: 30 of 200 rows carry none, so title+year is the only key left.
+        rows, err, _ = self.rows(
+            self.raw("a" * 40, "Some.Film.2026.1080p.WEB-DL.H264-ONE"),
+            self.raw("b" * 40, "Some Film (2026) [1080p] [WEBRip]"))
+        self.assertIsNone(err)
+        self.assertEqual(len(rows), 1)
+
+    def test_keeps_the_copy_that_will_actually_play(self):
+        # An x265 release with more seeders still costs a remux and twice the
+        # disk, so the h264 one is the better thing to offer.
+        rows, _, _ = self.rows(
+            self.raw("a" * 40, "Some.Film.2026.1080p.WEB-DL.x265-HEVC", seeders=900),
+            self.raw("b" * 40, "Some.Film.2026.1080p.WEB-DL.H264-GRP", seeders=100))
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["direct"])
+
+    def test_a_rating_found_on_one_release_covers_the_film(self):
+        # Only one of the two rows carries the imdb id; collapsing them must
+        # keep the rating rather than losing it with the row it came on.
+        self.ratings = {"tt1": (8.2, 400000)}
+        rows, _, _ = self.rows(
+            self.raw("a" * 40, "Some.Film.2026.1080p.WEB-DL.H264-ONE", imdb="tt1",
+                     seeders=100),
+            self.raw("b" * 40, "Some Film (2026) [1080p] [WEBRip] [5.1]", seeders=900))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rating"], 8.2)
+
+    def test_collections_never_reach_the_list(self):
+        rows, _, _ = self.rows(
+            self.raw("a" * 40, "Disney MEGA Collection 1937-2008", num_files=127),
+            self.raw("b" * 40, "Some.Film.2026.1080p.WEB-DL.H264-GRP"))
+        self.assertEqual([r["title"] for r in rows], ["Some Film"])
+
+    def test_a_measured_dead_swarm_is_dropped(self):
+        # The indexer claims 100; the tracker says nobody is there. It cannot
+        # serve a byte, so it is not a recommendation.
+        self.m.live_seeders = lambda *a, **k: 0
+        rows, _, _ = self.rows(self.raw("a" * 40, "Some.Film.2026.1080p.H264-GRP"))
+        self.assertEqual(rows, [])
+
+    def test_cost_on_disk_accounts_for_the_remux(self):
+        # A remux holds the source and the output at once -- the overlap that
+        # put an 8.6 GB film 20 GB over a 15 GB cap.
+        rows, _, _ = self.rows(
+            self.raw("a" * 40, "Some.Film.2026.1080p.WEB-DL.x265-HEVC",
+                     size=10_000_000_000))
+        self.assertGreater(rows[0]["peak"], rows[0]["size"])
+        self.m.CACHE_CAP_GB = 5.0
+        rows, _, _ = self.rows(
+            self.raw("b" * 40, "Other.Film.2026.1080p.WEB-DL.x265-HEVC",
+                     size=10_000_000_000))
+        self.assertFalse(rows[0]["fits"])
+
+    def test_a_dead_source_reads_as_an_empty_shelf(self):
+        self.m.feed_fetch = lambda: ([], {"201": "failed: timeout"})
+        rows, err, _ = self.m.build_feed()
+        self.assertEqual(rows, [])
+        self.assertIn("could not reach", err)
+
+    def test_a_source_that_throws_never_breaks_the_page(self):
+        def boom():
+            raise RuntimeError("indexer on fire")
+        self.m.feed_fetch = boom
+        rows, err, _ = self.m.recommendations(force=True)
+        self.assertEqual(rows, [])
+        self.assertIn("indexer on fire", err)
+
+    def test_the_feed_is_not_rebuilt_on_every_request(self):
+        calls = []
+
+        def once():
+            calls.append(1)
+            return [self.raw("a" * 40, "Some.Film.2026.1080p.H264-GRP")], {"201": 1}
+        self.m.feed_fetch = once
+        self.m.recommendations(force=True)
+        self.m.recommendations()
+        self.m.recommendations()
+        self.assertEqual(len(calls), 1)
+
+
+# --------------------------------------------------------------------------
+class TestRatingsCache(Base):
+    def offline(self):
+        """Cut this copy of the module off from the network.
+
+        Rebinds the whole urllib stand-in rather than assigning to
+        urllib.request.urlopen, which would patch the *shared* module and take
+        every later test's http fixture down with it.
+        """
+        def refuse(*a, **k):
+            raise OSError("imdb unreachable")
+        self.m.urllib = types.SimpleNamespace(
+            request=types.SimpleNamespace(urlopen=refuse,
+                                          Request=urllib.request.Request),
+            parse=urllib.parse)
+
+    def dump(self, rows):
+        path = os.path.join(self.m.CACHE_DIR, "imdb-ratings.tsv.gz")
+        with gzip.open(path, "wt") as f:
+            f.write("tconst\taverageRating\tnumVotes\n")
+            for t, r, v in rows:
+                f.write("%s\t%s\t%s\n" % (t, r, v))
+        return path
+
+    def test_reads_only_the_ids_asked_about(self):
+        self.dump([("tt1", 8.2, 400000), ("tt2", 5.1, 900), ("tt3", 7.0, 12)])
+        got = self.m.ratings_for({"tt1", "tt3"})
+        self.assertEqual(got, {"tt1": (8.2, 400000), "tt3": (7.0, 12)})
+
+    def test_asking_about_nothing_costs_nothing(self):
+        self.m.ratings_file = lambda: self.fail("should not have fetched")
+        self.assertEqual(self.m.ratings_for(set()), {})
+
+    def test_a_truncated_dump_yields_what_it_can(self):
+        # Half a file beats no ratings at all, and must not raise.
+        path = self.dump([("tt1", 8.2, 400000), ("tt2", 5.1, 900)])
+        with open(path, "rb") as f:
+            data = f.read()
+        with open(path, "wb") as f:
+            f.write(data[:len(data) // 2])
+        self.assertIsInstance(self.m.ratings_for({"tt1", "tt2"}), dict)
+
+    def test_a_failed_refresh_keeps_yesterdays_copy(self):
+        # A rating a day old is worth far more than no rating.
+        path = self.dump([("tt1", 8.2, 400000)])
+        os.utime(path, (0, 0))                      # long stale
+        self.offline()
+        self.assertEqual(self.m.ratings_file(), path)
+        self.assertEqual(self.m.ratings_for({"tt1"}), {"tt1": (8.2, 400000)})
+
+    def test_no_dump_and_no_network_is_survivable(self):
+        self.offline()
+        self.assertIsNone(self.m.ratings_file())
+        self.assertEqual(self.m.ratings_for({"tt1"}), {})
 
 
 if __name__ == "__main__":

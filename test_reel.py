@@ -1093,6 +1093,96 @@ class TestPacks(Base):
 
 
 # --------------------------------------------------------------------------
+class TestResume(Base):
+    def test_a_position_comes_back(self):
+        self.m.note_resume("job1", 1830.0, 7200.0)
+        self.assertEqual(self.m.resume_at("job1"), 1830.0)
+
+    def test_the_first_half_minute_is_not_progress(self):
+        # Starting over is what you wanted anyway, and jumping 12 seconds in is
+        # more annoying than starting clean.
+        self.m.note_resume("job1", 12.0, 7200.0)
+        self.assertIsNone(self.m.resume_at("job1"))
+
+    def test_something_watched_to_the_end_is_finished(self):
+        # Offering to resume the closing credits is worse than not offering.
+        self.m.note_resume("job1", 7150.0, 7200.0)
+        self.assertIsNone(self.m.resume_at("job1"))
+        # but a minute earlier is a real place to come back to
+        self.m.note_resume("job2", 7000.0, 7200.0)
+        self.assertEqual(self.m.resume_at("job2"), 7000.0)
+
+    def test_an_unknown_length_still_resumes(self):
+        # Live items report no duration; the tail rule simply cannot apply.
+        self.m.note_resume("job1", 900.0, 0)
+        self.assertEqual(self.m.resume_at("job1"), 900.0)
+
+    def test_the_latest_report_wins(self):
+        # Two devices on one film should leave it where it was last actually
+        # watched, not wherever the one that got ahead stopped.
+        self.m.note_resume("job1", 3000.0, 7200.0)
+        self.m.note_resume("job1", 600.0, 7200.0)
+        self.assertEqual(self.m.resume_at("job1"), 600.0)
+
+    def test_finishing_clears_the_position(self):
+        # What the client sends on 'ended'.
+        self.m.note_resume("job1", 3000.0, 7200.0)
+        self.m.note_resume("job1", 0, 0)
+        self.assertIsNone(self.m.resume_at("job1"))
+
+    def test_an_item_never_watched_has_no_position(self):
+        self.assertIsNone(self.m.resume_at("never-seen"))
+
+    def test_positions_survive_a_restart(self):
+        self.m.note_resume("job1", 1830.0, 7200.0)
+        self.m.save_resume(force=True)
+        fresh = load_reel(self.dl)
+        fresh.RESUME_PATH = self.m.RESUME_PATH
+        fresh.load_resume()
+        self.assertEqual(fresh.resume_at("job1"), 1830.0)
+
+    def test_a_corrupt_store_is_not_a_reason_not_to_start(self):
+        with open(self.m.RESUME_PATH, "w") as f:
+            f.write("{ this is not json")
+        self.m.load_resume()                      # must not raise
+        self.assertIsNone(self.m.resume_at("job1"))
+
+    def test_removing_an_item_forgets_where_it_was(self):
+        j = self.job()
+        self.m.note_resume(j["id"], 1830.0, 7200.0)
+        self.m.drop(j["id"])
+        self.assertIsNone(self.m.resume_at(j["id"]))
+
+    def test_the_position_reaches_the_client(self):
+        j = self.job()
+        self.m.note_resume(j["id"], 1830.0, 7200.0)
+        self.assertEqual(self.m.public(j)["resume_at"], 1830.0)
+
+    def test_writes_are_not_one_per_report(self):
+        # The page reports every three seconds per viewer, and none of those is
+        # worth a write of its own.
+        self.m.save_resume(force=True)
+        before = os.path.getmtime(self.m.RESUME_PATH)
+        for i in range(20):
+            self.m.note_resume("job1", 100.0 + i, 7200.0)
+        self.assertEqual(os.path.getmtime(self.m.RESUME_PATH), before)
+        # the position is still current in memory, just not yet on disk
+        self.assertEqual(self.m.resume_at("job1"), 119.0)
+
+    def test_the_last_position_is_not_lost_on_the_way_out(self):
+        # The throttle above means the newest position is only in memory when
+        # the process ends, and the loss is not "a few seconds": a session
+        # shorter than one flush interval wrote its *first* position and
+        # nothing after, so 40 minutes of watching landed on disk as 12
+        # seconds. atexit and the SIGTERM handler both force this.
+        for at in (12.0, 600.0, 1830.0, 2400.0):
+            self.m.note_resume("job1", at, 7200.0)
+        self.m.save_resume(force=True)
+        with open(self.m.RESUME_PATH, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["job1"]["at"], 2400.0)
+
+
+# --------------------------------------------------------------------------
 class TestJobLog(Base):
     def test_events_are_kept_in_order_with_timestamps(self):
         j = self.job()

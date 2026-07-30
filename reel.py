@@ -27,6 +27,7 @@ import http.server
 import socketserver
 import socket
 import signal
+import atexit
 import sys
 import urllib.request
 import urllib.parse
@@ -641,6 +642,116 @@ def playhead(jid):
     """
     at = [v["at"] for v in viewers() if v["id"] == jid]
     return max(at) if at else 0.0
+
+
+# Where playback got to, per item, so a film resumes where it stopped. Kept
+# beside the ratings dump rather than in DL, because it is not media and must
+# not count against the cache cap -- and because it should outlive the file it
+# refers to: an item evicted and fetched again should come back at the right
+# minute rather than at the beginning.
+RESUME_PATH = os.path.join(CACHE_DIR, "resume.json")
+RESUME_MIN = 30.0       # below this, starting over is what you wanted anyway
+RESUME_TAIL = 90.0      # this close to the end it is finished, not paused
+RESUME_FLUSH = 20.0     # seconds between disk writes
+RESUME_KEEP = 90 * 86400
+RESUME = {}
+RESUME_LOCK = threading.Lock()
+RESUME_WROTE = [0.0]
+# The throttle below means the last position reported is still only in memory
+# when the process ends. That window is short but it is not "a few seconds" of
+# loss: a session shorter than one flush interval writes its *first* position
+# and nothing after, so forty minutes of watching can end up on disk as twelve
+# seconds. Flushed on the way out instead.
+atexit.register(lambda: save_resume(force=True))
+
+
+def _flush_and_exit(signum, _frame):
+    """SIGTERM does not run atexit handlers -- the default action terminates
+    the process outright -- and that is how anything other than a person at a
+    terminal stops this. Turned into a clean exit so the flush above runs."""
+    save_resume(force=True)
+    sys.exit(0)
+
+
+def load_resume():
+    """Read the saved positions. A missing or corrupt file is simply no
+    positions, never a reason not to start."""
+    try:
+        with open(RESUME_PATH, encoding="utf-8") as f:
+            data = _json.load(f)
+        if isinstance(data, dict):
+            with RESUME_LOCK:
+                RESUME.clear()
+                RESUME.update({k: v for k, v in data.items() if isinstance(v, dict)})
+    except (OSError, ValueError):
+        pass
+
+
+def save_resume(force=False):
+    """Flush to disk, at most every RESUME_FLUSH seconds.
+
+    The page reports its position every three seconds per viewer, and none of
+    those are worth a write on their own -- losing the last few seconds of
+    progress to a hard exit costs nothing anyone would notice.
+    """
+    now = time.time()
+    if not force and now - RESUME_WROTE[0] < RESUME_FLUSH:
+        return
+    RESUME_WROTE[0] = now
+    with RESUME_LOCK:
+        cut = now - RESUME_KEEP
+        for k in [k for k, v in RESUME.items() if (v.get("t") or 0) < cut]:
+            del RESUME[k]
+        data = dict(RESUME)
+    tmp = RESUME_PATH + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(data, f)
+        os.replace(tmp, RESUME_PATH)     # never a half-written file in place
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def note_resume(jid, at, dur=0.0):
+    """Remember where this item is being watched.
+
+    The most recent report wins rather than the furthest: two devices on one
+    film should leave it where it was last actually watched, not at whichever
+    got ahead and stopped.
+    """
+    if not jid or at is None:
+        return
+    with RESUME_LOCK:
+        RESUME[jid] = {"at": round(float(at), 1),
+                       "dur": round(float(dur or 0), 1), "t": time.time()}
+    save_resume()
+
+
+def forget_resume(jid):
+    with RESUME_LOCK:
+        RESUME.pop(jid, None)
+    save_resume(force=True)
+
+
+def resume_at(jid):
+    """Where to pick this item up, or None to start at the beginning.
+
+    Two ends are excluded deliberately. The first half-minute is not progress
+    worth restoring, and something watched to its last minute and a half is
+    finished -- offering to resume the closing credits is worse than not
+    offering at all.
+    """
+    with RESUME_LOCK:
+        row = dict(RESUME.get(jid) or {})
+    at, dur = row.get("at") or 0.0, row.get("dur") or 0.0
+    if at < RESUME_MIN:
+        return None
+    if dur and at > dur - RESUME_TAIL:
+        return None
+    return at
 ACTIVE = ("downloading", "converting", "fetching metadata", "starting",
           "connecting", "streaming")
 
@@ -779,6 +890,9 @@ def janitor():
     """
     while True:
         time.sleep(2.0)
+        # Before the cap checks below, all of which bail out early. Throttled
+        # internally, so this is a no-op most times round.
+        save_resume()
         try:
             if folder_size_bytes() <= cap_bytes():
                 continue
@@ -2461,6 +2575,8 @@ def public(job):
                            job.get("streamable") is False),
             "restored": bool(job.get("restored")),
             "note": job.get("note", ""),
+            # Where to pick this up, or null to start at the beginning.
+            "resume_at": resume_at(job["id"]),
             # Only the count here. /jobs is polled every second, and shipping a
             # few hundred events per job on every poll to render a panel that
             # is usually closed would be the most expensive thing on the wire.
@@ -4940,6 +5056,9 @@ def drop(jid, delete_file=True):
         return
     job["cancel"].set()
     stop_procs(job)
+    # Removing an item is deliberate in a way eviction is not, so its position
+    # goes with it. An evicted one keeps its place, since it may well come back.
+    forget_resume(jid)
     for d in job_dirs(jid):
         shutil.rmtree(d, ignore_errors=True)
     targets = ([job.get("live_file"), job.get("compat_file"),
@@ -5178,6 +5297,11 @@ class H(http.server.BaseHTTPRequestHandler):
             # or one with localStorage turned off -- still counts as a viewer
             # rather than silently sharing a slot with everyone else.
             note_playing(body.get("client") or self.client_address[0], jid, at)
+            try:
+                dur = float(body.get("dur") or 0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            note_resume(jid, at, dur)
             with LOCK:
                 job = JOBS.get(jid)
                 if job:
@@ -5777,6 +5901,7 @@ const TICKS = 48;
 const $ = id => document.getElementById(id);
 const v = $('v'), slate = $('slate'), flag = $('flag'), cue = $('cue');
 let jobs = [], order = [], cur = -1, retries = 0, live = false, wantPlay = false;
+let wantSeek = 0;     // where to pick the current item up, once it can be sought
 let subsOn = false;   // whether a track is currently attached
 
 // decorative slate bars + capacity meter ticks
@@ -5804,7 +5929,10 @@ function reportPlaying(force) {
   const now = Date.now();
   if (!force && now - reported < 3000) return;
   reported = now;
+  // Duration goes with it so the server can tell "paused near the start" from
+  // "watched to the end", which is what decides whether to offer a resume.
   api('/playing', {id: order[cur], at: v.currentTime || 0,
+                   dur: (isFinite(v.duration) ? v.duration : 0) || 0,
                    client: clientId}).catch(() => {});
 }
 v.addEventListener('timeupdate', () => reportPlaying(false));
@@ -6097,6 +6225,7 @@ function play(i) {
   live = j.status !== 'done' || onCompatFragments(j);
   v.hidden = false; slate.style.display = 'none';
   setFlag(j);
+  wantSeek = j.resume_at || 0;      // applied once the file knows its length
   v.src = srcOf(j);
   v.load();
   applySubs(j);
@@ -6106,6 +6235,30 @@ function play(i) {
   reportPlaying(true);
   paint();
 }
+
+/* Resume ------------------------------------------------------------------
+   The position comes back from the server, so it survives a restart, another
+   device, and the file being evicted and fetched again. Applied on metadata
+   rather than on play, because currentTime does nothing until the media knows
+   how long it is. */
+function applySeek() {
+  const want = wantSeek;
+  wantSeek = 0;
+  if (!want) return;
+  // Ask the browser rather than assume: a still-downloading item may not be
+  // seekable that far yet, and a refused seek would silently start from zero.
+  let ok = false;
+  for (let i = 0; i < v.seekable.length; i++) {
+    if (want >= v.seekable.start(i) && want <= v.seekable.end(i)) { ok = true; break; }
+  }
+  if (!ok) return;
+  v.currentTime = want;
+  const m = Math.floor(want / 60), s = Math.floor(want % 60);
+  cue.textContent = (byId(order[cur]) || {}).title +
+    '  ·  resumed at ' + m + ':' + String(s).padStart(2, '0');
+  cue.classList.remove('none');
+}
+v.addEventListener('loadedmetadata', applySeek);
 
 v.addEventListener('play', () => { wantPlay = true; });
 v.addEventListener('pause', () => { if (!v.ended) wantPlay = false; });
@@ -6141,6 +6294,10 @@ v.addEventListener('error', () => {
 });
 v.addEventListener('ended', () => {
   if (live) return;              // reached the end of what's downloaded so far
+  // Watched to the end, so there is nothing to come back to. Reported as
+  // position zero rather than with a call of its own.
+  if (order[cur]) api('/playing', {id: order[cur], at: 0, dur: 0,
+                                   client: clientId}).catch(() => {});
   if (!$('auto').checked) return;
   for (let i = cur + 1; i < order.length; i++) {
     if (canPlay(byId(order[i]))) return play(i);
@@ -6556,6 +6713,11 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 def main():
+    load_resume()
+    try:
+        signal.signal(signal.SIGTERM, _flush_and_exit)
+    except (ValueError, OSError):
+        pass                     # not the main thread, or no such signal here
     restore()
     for _ in range(WORKERS):
         threading.Thread(target=worker, daemon=True).start()
@@ -6571,6 +6733,7 @@ def main():
         try:
             s.serve_forever()
         except KeyboardInterrupt:
+            save_resume(force=True)
             print("\n  stopped\n")
 
 

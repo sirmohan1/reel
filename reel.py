@@ -133,11 +133,18 @@ SEARCH_VERIFY = 8
 # Tracker liveness drifts too: the dead ones in that Spider-Man magnet
 # (coppersurfer, leechers-paradise, rarbg) are why it took 150s to find
 # metadata the first time.
+# Chosen by scraping each one rather than by reputation. Three of the four
+# previously listed here -- opentrackr, open.stealth.si, exodus.desync -- never
+# answered at all, so reel was effectively announcing to a single tracker while
+# waiting out three that would never reply. These five all responded, and each
+# knows a different slice of a swarm: the same torrent came back as 477, 294,
+# 111, 38 and 16 from them in turn, so asking several is how you see the whole.
 SEARCH_TRACKERS = (
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
-    "udp://exodus.desync.com:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://explodie.org:6969/announce",
 )
 
 # Subtitles, from OpenSubtitles' legacy endpoint -- which needs no API key, so

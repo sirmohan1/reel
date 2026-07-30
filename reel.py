@@ -133,19 +133,40 @@ SEARCH_VERIFY = 8
 # Tracker liveness drifts too: the dead ones in that Spider-Man magnet
 # (coppersurfer, leechers-paradise, rarbg) are why it took 150s to find
 # metadata the first time.
-# Chosen by scraping each one rather than by reputation. Three of the four
-# previously listed here -- opentrackr, open.stealth.si, exodus.desync -- never
-# answered at all, so reel was effectively announcing to a single tracker while
-# waiting out three that would never reply. These five all responded, and each
-# knows a different slice of a swarm: the same torrent came back as 477, 294,
-# 111, 38 and 16 from them in turn, so asking several is how you see the whole.
+# Every tracker here was scraped and confirmed to answer, rather than trusted
+# because it appears on a list: of 47 in the maintained public list, 31 replied
+# and 16 did not, and three of the four originally hardcoded here were among the
+# dead. Refresh occasionally from github.com/ngosang/trackerslist, testing before
+# adopting -- trackers go dark quietly and a dead one costs a timeout every time.
+#
+# Two lists, because they are used for two different things. Announcing wants
+# breadth: each tracker knows only its own slice of a swarm, so the peers found
+# are the union, and one reporting six seeders may still hold the six nobody else
+# has. Measuring wants the few big ones that answer fastest, since the number we
+# want is the largest and a slow tracker just delays the search.
 SEARCH_TRACKERS = (
     "udp://tracker.torrent.eu.org:451/announce",
     "udp://open.demonii.com:1337/announce",
-    "udp://tracker.bittor.pw:1337/announce",
+    "udp://leet-tracker.moe:1337/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://tracker.auctor.tv:6969/announce",
     "udp://tracker.dler.org:6969/announce",
+    "udp://bittorrent-tracker.e-n-c-r-y-p-t.net:1337/announce",
     "udp://explodie.org:6969/announce",
+    "udp://tracker.0x7c0.com:6969/announce",
+    "udp://open.demonoid.ch:6969/announce",
+    "udp://evan.im:6969/announce",
+    "udp://tracker.peerfect.org:6969/announce",
+    "udp://tracker.opentrackr.com:6969/announce",
+    "udp://tracker.filemail.com:6969/announce",
+    "udp://t.overflow.biz:6969/announce",
+    "udp://mail.segso.net:6969/announce",
+    "udp://ipv4announce.sktorrent.eu:6969/announce",
+    "udp://tracker.gmi.gd:6969/announce",
 )
+
+# The subset asked when checking a seeder count: biggest and quickest to reply.
+VERIFY_TRACKERS = SEARCH_TRACKERS[:5]
 
 # Subtitles, from OpenSubtitles' legacy endpoint -- which needs no API key, so
 # this works out of the box rather than waiting on credentials.
@@ -1017,7 +1038,7 @@ def live_seeders(infohash, timeout=3.0):
         got = udp_scrape(infohash, tr, timeout)
         if got is not None:
             found.append(got)
-    for tr in SEARCH_TRACKERS:
+    for tr in VERIFY_TRACKERS:
         threading.Thread(target=ask, args=(tr,), daemon=True).start()
     # Returns shortly after the first answer instead of waiting out the ones that
     # never reply. Those took the full timeout every time, which made a search of

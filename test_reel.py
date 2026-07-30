@@ -911,6 +911,48 @@ class TestPacks(Base):
                  self.f(2, "Godfather.Part.III.1990.mkv", 13.0)]
         self.assertEqual([f["index"] for f in self.m.pack_files(files)], [0, 1, 2])
 
+    def test_every_common_numbering_scheme_orders_correctly(self):
+        # Releases number themselves in a handful of conventional ways, and the
+        # torrent's own file order matches none of them reliably.
+        cases = [
+            ("season/episode", ["X.S01E01.mkv", "X.S01E03.mkv", "X.S01E02.mkv"],
+             ["X.S01E01.mkv", "X.S01E02.mkv", "X.S01E03.mkv"]),
+            ("1x02 form", ["X 1x03.mkv", "X 1x01.mkv", "X 1x02.mkv"],
+             ["X 1x01.mkv", "X 1x02.mkv", "X 1x03.mkv"]),
+            ("episode word", ["A - Episode 10.mkv", "A - Episode 2.mkv"],
+             ["A - Episode 2.mkv", "A - Episode 10.mkv"]),
+            ("two seasons", ["X.S02E01.mkv", "X.S01E09.mkv", "X.S01E10.mkv"],
+             ["X.S01E09.mkv", "X.S01E10.mkv", "X.S02E01.mkv"]),
+            ("part digits", ["F.Part.2.mkv", "F.Part.1.mkv"],
+             ["F.Part.1.mkv", "F.Part.2.mkv"]),
+            ("part numerals", ["G.Part.III.mkv", "G.Part.I.mkv", "G.Part.II.mkv"],
+             ["G.Part.I.mkv", "G.Part.II.mkv", "G.Part.III.mkv"]),
+            ("disc split", ["M.CD2.avi", "M.CD1.avi"], ["M.CD1.avi", "M.CD2.avi"]),
+            ("films by year", ["G.1990.mkv", "G.1972.mkv", "G.1974.mkv"],
+             ["G.1972.mkv", "G.1974.mkv", "G.1990.mkv"]),
+            ("leading number", ["03 - c.mkv", "01 - a.mkv", "02 - b.mkv"],
+             ["01 - a.mkv", "02 - b.mkv", "03 - c.mkv"]),
+        ]
+        for label, names, want in cases:
+            files = [{"index": i, "name": n, "size": 2_000_000_000}
+                     for i, n in enumerate(names)]
+            got = [f["name"] for f in self.m.pack_order(files)]
+            self.assertEqual(got, want, label)
+
+    def test_a_scheme_every_file_shares_is_not_a_position(self):
+        # Nearly every release name carries a year, and in a season they all
+        # carry the same one. A scheme that cannot tell the files apart must be
+        # rejected rather than used to produce an arbitrary order.
+        files = [{"index": i, "name": n, "size": 2_000_000_000} for i, n in
+                 enumerate(["X.2024.S01E02.mkv", "X.2024.S01E01.mkv"])]
+        self.assertEqual([f["name"] for f in self.m.pack_order(files)],
+                         ["X.2024.S01E01.mkv", "X.2024.S01E02.mkv"])
+
+    def test_unparseable_names_keep_the_torrents_own_order(self):
+        files = [{"index": i, "name": n, "size": 2_000_000_000}
+                 for i, n in enumerate(["zzz.mkv", "aaa.mkv", "mmm.mkv"])]
+        self.assertEqual([f["index"] for f in self.m.pack_order(files)], [0, 1, 2])
+
     def test_only_video_files_count(self):
         files = [self.f(0, "Film.mkv", 4.0), self.f(1, "soundtrack.mp3", 2.0),
                  self.f(2, "cover.jpg", 1.0)]

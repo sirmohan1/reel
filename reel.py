@@ -130,9 +130,67 @@ PACK_EXTRAS = re.compile(r"""(sample|trailer|teaser|extras?|bonus|featurette|
     behind[ ._-]?the[ ._-]?scenes|deleted[ ._-]?scenes?|making[ ._-]?of|
     interview|blooper|outtake|gag[ ._-]?reel|commentary|proof|screener)""",
     re.I | re.X)
-# Season and episode out of a filename, used to order a pack the way it is meant
-# to be watched rather than the way the torrent happens to list it.
-SEASON_EP = re.compile(r"\bs(\d{1,2})[ ._-]?e(\d{1,3})\b", re.I)
+# How a pack is ordered. File order is not watch order -- a real Severance pack
+# listed E01 at index 0, E03 at index 1 and E02 at index 8 -- so the position is
+# read out of the filenames instead, and releases number themselves in a handful
+# of conventional ways.
+#
+# Tried in order, and a scheme is only adopted when *every* file matches it and
+# the positions it yields are all different. That rule is what keeps schemes
+# from mixing: nearly every release name contains a year, but in a season they
+# all contain the same one, so the year scheme fails the distinctness test and
+# the episode scheme wins -- while for a trilogy the year is exactly right.
+ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6,
+         "vii": 7, "viii": 8, "ix": 9, "x": 10}
+
+
+def _roman(m):
+    return (0, ROMAN.get(m.group(1).lower(), 0))
+
+
+SEQ_SCHEMES = (
+    # season + episode, the common television forms
+    (re.compile(r"\bs(\d{1,2})[ ._-]?e(\d{1,3})\b", re.I),
+     lambda m: (int(m.group(1)), int(m.group(2)))),
+    (re.compile(r"\b(\d{1,2})x(\d{1,3})\b", re.I),
+     lambda m: (int(m.group(1)), int(m.group(2)))),
+    (re.compile(r"\bep(?:isode)?[ ._-]?(\d{1,3})\b", re.I),
+     lambda m: (0, int(m.group(1)))),
+    # multi-part films, in digits and in numerals
+    (re.compile(r"\b(?:part|pt)[ ._-]?(\d{1,2})\b", re.I),
+     lambda m: (0, int(m.group(1)))),
+    (re.compile(r"\b(?:part|pt)[ ._-]?([ivx]{1,5})\b", re.I), _roman),
+    # a film split across discs
+    (re.compile(r"\b(?:cd|disc|disk)[ ._-]?(\d{1,2})\b", re.I),
+     lambda m: (0, int(m.group(1)))),
+    # a series of films is watched oldest first
+    (re.compile(r"\b(19|20)(\d{2})\b"),
+     lambda m: (0, int(m.group(1) + m.group(2)))),
+    # "01 - Title.mkv"
+    (re.compile(r"^\s*(\d{1,3})\b"), lambda m: (0, int(m.group(1)))),
+)
+
+
+def pack_order(files):
+    """Sort a pack the way it is meant to be watched.
+
+    Falls back to the torrent's own file order, which is the best guess left
+    when nothing in the names says anything about position.
+    """
+    for pattern, read in SEQ_SCHEMES:
+        keys = []
+        for f in files:
+            m = pattern.search(os.path.basename(f.get("name") or ""))
+            if not m:
+                break
+            try:
+                keys.append(read(m))
+            except (ValueError, KeyError):
+                break
+        if len(keys) != len(files) or len(set(keys)) != len(files):
+            continue                      # incomplete or ambiguous: not this one
+        return [f for _k, f in sorted(zip(keys, files), key=lambda p: p[0])]
+    return sorted(files, key=lambda f: f["index"])
 
 # Search. One indexer to begin with, behind a normalising layer so another can
 # be added without the caller noticing. These endpoints go dark without warning
@@ -3648,18 +3706,7 @@ def pack_files(files):
     keep = [f for f in vids if (f.get("size") or 0) >= bar]
     if len(keep) < 2:
         return []
-    # File order is not episode order. A real Severance season pack listed E01
-    # at index 0, E03 at index 1 and E02 at index 8, so sorting by index put
-    # episode 2 last in the queue. When every file names its episode, that is
-    # the ordering to trust; otherwise index is still the best guess available.
-    marks = [SEASON_EP.search(f.get("name") or "") for f in keep]
-    if all(marks):
-        keep = [f for _k, f in sorted(
-            zip([(int(m.group(1)), int(m.group(2))) for m in marks], keep),
-            key=lambda p: p[0])]
-    else:
-        keep.sort(key=lambda f: f["index"])
-    return keep[:PACK_MAX]
+    return pack_order(keep)[:PACK_MAX]
 
 
 def pick_file(files):

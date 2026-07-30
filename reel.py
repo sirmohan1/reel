@@ -46,6 +46,7 @@ import threading
 import subprocess
 import time
 import math
+import html
 
 # A client vanishing is normal, not an error. Media elements abort constantly:
 # seeking, swapping source, closing a tab. socket.timeout is only an alias of
@@ -190,6 +191,13 @@ FEED_CATS = (201, 207)
 # fourteen candidates and fills itself with whatever was *uploaded* recently,
 # which included a 1976 film with five seeders.
 FEED_48H_URL = "https://apibay.org/precompiled/data_top100_48h_207.json"
+# therarbg lists as well as searches, 50 rows a page and 1250 available. Every
+# row is under two days old, so this deepens what is new rather than what is
+# old -- the back catalogue still comes from the all-time lists above. Only
+# about 40% carry an imdb id, but the title+year merge lends them one when
+# another source listed the same film.
+FEED_RARBG_URL = "https://therarbg.to/get-posts/category:Movies:format:json/"
+FEED_RARBG_PAGES = 6
 # Indian cinema never appears in those lists -- zero of 137 films, since they
 # rank by global swarm size -- so this shelf has to ask for it by name. Searched
 # rather than browsed, through the same three sources search already uses.
@@ -208,7 +216,10 @@ FEED_LIMIT = 24
 # Rows per shelf, and how many of each get their seeder count measured. Only the
 # top of a shelf is checked: the rest show a tilde, exactly as search does, since
 # 5 shelves fully verified would be 40 scrapes to draw one page.
-FEED_SHELF = 8
+try:
+    FEED_SHELF = max(1, int(os.environ.get("REEL_SHELF", "12")))
+except ValueError:
+    FEED_SHELF = 12              # a typo in an env var must not stop the server
 # Candidates measured per shelf, which is more than are shown. Indexer counts
 # are inflated, and on the gems shelf -- where every row is thinly seeded by
 # definition -- rows claiming 100+ measured out at 2 and 4. Verifying only what
@@ -1443,7 +1454,10 @@ def feed_title(name):
     parsed left to right gives the title "Blade Runner" and the year 2049. Any
     year past next year is a title, not a date, which is the rule that fixes it.
     """
-    n = (name or "").replace("_", " ")
+    # Some listings hand back html-escaped names, and the entity survives just
+    # far enough to be visible: "Shake Rattle &amp; Roll" reached the shelf as
+    # "Shake Rattle&amp Roll", the semicolon having been stripped as punctuation.
+    n = html.unescape(name or "").replace("_", " ")
     limit = time.gmtime().tm_year + 1
     m = None
     for hit in FEED_YEAR.finditer(" " + n + " "):
@@ -1555,14 +1569,65 @@ def feed_fetch():
             per[label] = len(got)
             rows.extend(got)
 
+    def grab_rarbg():
+        try:
+            got = rarbg_browse()
+        except Exception as e:
+            with lock:
+                per["therarbg"] = "failed: " + str(e)[:40]
+            return
+        with lock:
+            per["therarbg"] = len(got)
+            rows.extend(got)
+
     lists = [(str(c), FEED_URL % c) for c in FEED_CATS] + [("48h", FEED_48H_URL)]
     threads = [threading.Thread(target=grab, args=(n, u), daemon=True)
                for n, u in lists]
+    threads.append(threading.Thread(target=grab_rarbg, daemon=True))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT + 8)
+    return rows, per
+
+
+def rarbg_browse(pages=FEED_RARBG_PAGES):
+    """therarbg's movie listing, reshaped to look like a precompiled row.
+
+    Its keys are abbreviated the same way its search is -- h hash, n name, se
+    seeders, s size, a added, i imdb -- and it pages rather than returning
+    everything, so the pages are fetched together and flattened.
+    """
+    rows, lock = [], threading.Lock()
+
+    def page(n):
+        url = FEED_RARBG_URL + ("?page=%d" % n if n > 1 else "")
+        try:
+            data = _search_json(url)
+        except Exception:
+            return                      # one dead page is not a dead source
+        got = data.get("results", []) if isinstance(data, dict) else data
+        out = []
+        for r in got if isinstance(got, list) else []:
+            if not isinstance(r, dict):
+                continue
+            out.append({"info_hash": r.get("h"), "name": r.get("n"),
+                        "seeders": r.get("se"), "leechers": r.get("le"),
+                        "size": r.get("s"), "added": r.get("a"),
+                        "imdb": r.get("i") or "",
+                        # The listing does not say how many files a torrent
+                        # holds, so packs are caught by name alone here.
+                        "num_files": 1, "status": ""})
+        with lock:
+            rows.extend(out)
+
+    threads = [threading.Thread(target=page, args=(n,), daemon=True)
+               for n in range(1, max(1, pages) + 1)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(SEARCH_TIMEOUT + 4)
-    return rows, per
+    return rows
 
 
 def bolly_fetch():

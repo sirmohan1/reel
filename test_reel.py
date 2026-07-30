@@ -646,6 +646,14 @@ class TestFeedParsing(Base):
         self.assertEqual(title, "Blade Runner 2049")
         self.assertIsNone(year)
 
+    def test_html_entities_do_not_reach_the_shelf(self):
+        # therarbg hands back escaped names, and the entity survived just far
+        # enough to be seen: the semicolon was stripped as punctuation, leaving
+        # "Shake Rattle&amp Roll" on the page.
+        title, year = self.m.feed_title("Shake Rattle &amp; Roll 2025 1080p WEB-DL")
+        self.assertEqual(title, "Shake Rattle & Roll")
+        self.assertEqual(year, 2025)
+
     def test_survives_a_name_with_no_year_at_all(self):
         title, year = self.m.feed_title("Some Obscure Film")
         self.assertEqual(title, "Some Obscure Film")
@@ -949,6 +957,34 @@ class TestShelves(Base):
         r = self.m._row("a" * 40, "3 Idiots 2009", 44, 1, 100, 1, "77", "tt1187043")
         self.assertEqual(r["imdb"], "tt1187043")
         self.assertEqual(self.m._row("a" * 40, "x", 1, 1, 1, 1, "", "garbage")["imdb"], "")
+
+    def test_a_listing_page_is_reshaped_into_a_browse_row(self):
+        # therarbg abbreviates its keys, so the mapping is the whole risk: a
+        # wrong one reads as an empty source rather than an error.
+        page = {"results": [{"h": "A" * 40, "n": "Some.Film.2026.1080p.H264-GRP",
+                             "se": 40, "le": 3, "s": 2_000_000_000,
+                             "a": 1785439244, "i": "tt77"}]}
+        self.m._search_json = lambda url, **k: page
+        rows = self.m.rarbg_browse(pages=1)
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["info_hash"], "A" * 40)
+        self.assertEqual((r["seeders"], r["size"], r["added"], r["imdb"]),
+                         (40, 2_000_000_000, 1785439244, "tt77"))
+
+    def test_one_dead_listing_page_is_not_a_dead_source(self):
+        calls = []
+
+        def flaky(url, **k):
+            calls.append(url)
+            if "page=2" in url:
+                raise OSError("gateway timeout")
+            return {"results": [{"h": "B" * 40, "n": "Film.2026.1080p.H264-G",
+                                 "se": 10, "le": 1, "s": 1, "a": 1, "i": ""}]}
+        self.m._search_json = flaky
+        rows = self.m.rarbg_browse(pages=3)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(rows), 2)          # pages 1 and 3 survived
 
     def test_a_file_count_that_arrives_as_a_string_is_still_a_count(self):
         # The precompiled lists send an int, the search endpoint a string. The

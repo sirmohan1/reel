@@ -13,6 +13,7 @@ Run:  python3 test_reel.py          (or -v for the list)
 
 import gzip
 import importlib.util
+import json
 import os
 import shutil
 import struct
@@ -827,6 +828,64 @@ class TestFeedBuild(Base):
         self.m.recommendations()
         self.m.recommendations()
         self.assertEqual(len(calls), 1)
+
+
+# --------------------------------------------------------------------------
+class TestJobLog(Base):
+    def test_events_are_kept_in_order_with_timestamps(self):
+        j = self.job()
+        self.m.record(j, "first")
+        self.m.record(j, "second")
+        self.assertEqual([e["m"] for e in j["log"]], ["first", "second"])
+        self.assertLessEqual(j["log"][0]["t"], j["log"][1]["t"])
+
+    def test_the_log_is_bounded(self):
+        # A pathological job must not grow without limit, and the oldest event
+        # is the right end to lose.
+        j = self.job()
+        for i in range(self.m.JOB_LOG_MAX + 50):
+            self.m.record(j, "event %d" % i)
+        self.assertEqual(len(j["log"]), self.m.JOB_LOG_MAX)
+        self.assertEqual(j["log"][-1]["m"], "event %d" % (self.m.JOB_LOG_MAX + 49))
+        self.assertNotIn("event 0", [e["m"] for e in j["log"]])
+
+    def test_a_long_message_cannot_bloat_the_log(self):
+        j = self.job()
+        self.m.record(j, "x" * 5000)
+        self.assertLessEqual(len(j["log"][0]["m"]), 400)
+
+    def test_recording_against_a_job_without_a_log_is_harmless(self):
+        # restore() and older paths build jobs by hand; a missing log must not
+        # turn a diagnostic into a crash.
+        self.m.record({}, "nothing to attach this to")
+        self.m.record(None, "nor this")
+
+    def test_a_failure_says_so_in_the_log(self):
+        j = self.job()
+        self.m.fail(j, "no peers found for that magnet")
+        self.assertEqual(j["status"], "error")
+        self.assertTrue(any("no peers found" in e["m"] for e in j["log"]))
+
+    def test_eviction_is_recorded_on_the_job_it_happened_to(self):
+        j = self.job()
+        j.update(status="done", path=os.path.join(self.dl, "gone.mp4"))
+        self.m.record(j, "evicted to stay under the 15 GB cap")
+        self.assertTrue(any("evicted" in e["m"] for e in j["log"]))
+
+    def test_jobs_carries_a_count_not_the_events(self):
+        # /jobs is polled every second; shipping every event on every poll to
+        # render a panel that is usually closed would dominate the wire.
+        j = self.job()
+        for i in range(5):
+            self.m.record(j, "event %d" % i)
+        pub = self.m.public(j)
+        self.assertEqual(pub["log_n"], 5)
+        self.assertNotIn("log", pub)
+
+    def test_the_log_survives_json(self):
+        j = self.job()
+        self.m.record(j, "probed in 1.2s: h264/aac -> direct stream")
+        json.dumps({"events": j["log"]})       # must not raise
 
 
 # --------------------------------------------------------------------------

@@ -490,6 +490,7 @@ def enforce_cache_cap():
             j.update(status="evicted", path=None, received=0, total=0,
                      live_file=None, live_ready=False, wt_url=None,
                      wt_direct=False, rate=None, headroom=None, pct=None)
+            record(j, "evicted to stay under the %g GB cap" % CACHE_CAP_GB)
         # Measured afresh after every deletion: a cached figure here would still
         # show the file we just removed and we would carry on evicting past the
         # point where the folder already fits.
@@ -969,14 +970,21 @@ def start_subs(job, src, name=None):
                                subs_exact=bool(s >= 100),
                                subs_why="; ".join(why)[:160],
                                subs_name=cand.get("SubFileName", "")[:120])
+                    record(job, "subtitles: %s match by %s, fit %.0f (%s)"
+                           % ("exact" if s >= 100 else "judged", how, s,
+                              cand.get("SubFileName", "")[:80]))
                     return
             # A failed upgrade attempt must not throw away what we already have.
             job["subs_status"] = "ready" if have else "unavailable"
             if rows and not scored and not have:
                 job["subs_note"] = "found %d, none matched this cut" % len(rows)
+            record(job, "subtitles: %d candidate(s) by %s, none usable"
+                   % (len(rows or []), how))
         except Exception as e:
             job["subs_status"] = "ready" if have else "unavailable"
             job["subs_note"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+            record(job, "subtitle search failed: %s: %s"
+                   % (type(e).__name__, str(e)[:120]))
     threading.Thread(target=work, daemon=True).start()
 
 
@@ -2148,12 +2156,41 @@ def tail(text, lines=4, chars=280):
     return "\n".join(keep)[-chars:]
 
 
+# How many events a job remembers. A download that probes, stalls, converts and
+# fetches subtitles produces a few dozen; the cap only bites on something
+# pathological, and the oldest is the right end to lose.
+JOB_LOG_MAX = 300
+
+
+def record(job, msg):
+    """Add one line to a job's timeline.
+
+    job["note"] holds only the most recent thing that happened, so the sequence
+    that actually explains a stuck download -- what it probed, what it decided,
+    when it stopped moving -- was overwritten as fast as it was produced. The
+    difference this makes is between reading what happened and dumping the
+    server's state to infer it.
+
+    Appending to a list is atomic under the GIL, so this is safe to call from
+    the workers, the janitor, the ffmpeg readers and the request threads without
+    taking LOCK -- which matters, because several callers already hold it.
+    """
+    if job is None:
+        return
+    log = job.get("log")
+    if log is None:
+        return
+    log.append({"t": round(time.time(), 3), "m": str(msg)[:400]})
+    if len(log) > JOB_LOG_MAX:
+        del log[:-JOB_LOG_MAX]
+
+
 def new_job(drive_id, jid=None, **extra):
     job = {"id": jid or uuid.uuid4().hex[:12], "drive_id": drive_id,
            "path": None, "total": 0, "received": 0, "status": "queued",
            "error": "", "title": drive_id or "recovered", "kind": "video",
            "cancel": threading.Event(), "proc": None, "procs": [],
-           "last_played": None, "overflow": False,
+           "last_played": None, "overflow": False, "log": [],
            # live phase: streamable is None until the header has been read
            "hold": True, "prefetch": False, "paused": False, "rate": None,
            "bitrate": None, "duration": None, "headroom": None, "eta": None,
@@ -2196,6 +2233,10 @@ def public(job):
                            job.get("streamable") is False),
             "restored": bool(job.get("restored")),
             "note": job.get("note", ""),
+            # Only the count here. /jobs is polled every second, and shipping a
+            # few hundred events per job on every poll to render a panel that
+            # is usually closed would be the most expensive thing on the wire.
+            "log_n": len(job.get("log") or ()),
             "probe_log": job.get("probe_log", ""),
             "timings": job.get("timings", {}),
             "url_log": job.get("url_log", ""),
@@ -2909,6 +2950,7 @@ def fail(job, msg):
     """
     job["status"] = "error"
     job["error"] = msg[:300]
+    record(job, "failed: " + msg[:200])
     stop_procs(job)
 
 
@@ -3833,6 +3875,9 @@ def run_torrent(job):
         source = magnet
     job["timings"] = {"metadata": round(time.time() - t_meta, 1)}
     job["probe_log"] = tail(log, 12, 900)
+    record(job, "metadata in %.1fs, %d file(s)%s"
+           % (time.time() - t_meta, len(files or []),
+              " (from .torrent)" if tfile else ""))
     if job["cancel"].is_set():
         cleanup()
         job["status"] = cancel_status(job)
@@ -3845,6 +3890,9 @@ def run_torrent(job):
         job["wt_files"] = len(files)
         job["note"] = (job.get("note", "") +
                        f"; file {chosen['index']} of {len(files)}").strip("; ")
+        record(job, "picked file %d of %d: %s (%.2f GB)"
+               % (chosen["index"], len(files), chosen["name"][:120],
+                  (chosen["size"] or 0) / GB))
     elif re.search(r"EADDRINUSE|address already in use", log, re.I):
         cleanup()
         return fail(job, "webtorrent couldn't open a port: " + tail(log, 2, 140))
@@ -4011,6 +4059,12 @@ def run_torrent(job):
               and (v is not None or a is not None))
     job["wt_codecs"] = f"{v or '-'}/{a or '-'}"
     job["timings"]["probe"] = round(time.time() - t_probe, 1)
+    # The whole verdict on one line, because every part of it is a reason the
+    # file might refuse to play and each was previously reported somewhere else.
+    record(job, "probed in %.1fs: %s/%s %s %s, ranges=%s -> %s"
+           % (time.time() - t_probe, v or "-", a or "-", pix or "-",
+              ext or "no ext", bool(job.get("wt_ranges")),
+              "direct stream" if direct else "needs conversion"))
 
     # Look for subtitles now, by name, rather than waiting for the download to
     # land. Nothing here reads the file, so it costs one request -- and waiting
@@ -4468,9 +4522,12 @@ def finalize_compat(job, frag, seekable):
         capture_output=True)
     if r.returncode == 0 and os.path.exists(seekable) and os.path.getsize(seekable):
         job["compat_path"] = seekable
+        record(job, "compatibility copy finished, seekable (%.2f GB)"
+               % (os.path.getsize(seekable) / GB))
         sweep_file(frag, LIVE_GRACE)     # let anyone mid-stream finish first
     else:
         job["compat_note"] = tail(r.stderr.decode("utf-8", "replace"), 2, 160)
+        record(job, "compatibility copy failed: " + job["compat_note"][:160])
 
 
 def sweep_file(path, delay):
@@ -4665,6 +4722,17 @@ class H(http.server.BaseHTTPRequestHandler):
         elif p == "/jobs":
             with LOCK:
                 self._json(200, [public(j) for j in JOBS.values()])
+        elif p.startswith("/log/"):
+            # Fetched on demand rather than ridden along with /jobs, which is
+            # polled every second.
+            jid = urllib.parse.unquote(p[len("/log/"):])
+            with LOCK:
+                job = JOBS.get(jid)
+                events = list(job.get("log") or ()) if job else None
+            if events is None:
+                self._json(404, {"error": "no such job"})
+            else:
+                self._json(200, {"id": jid, "events": events})
         elif p == "/debug":
             def jsonable(v):
                 try:
@@ -4754,11 +4822,13 @@ class H(http.server.BaseHTTPRequestHandler):
             for uri in magnets:
                 job = new_job(None, source="torrent", magnet=uri, caps=caps,
                               title="magnet " + infohash(uri)[:8])
+                record(job, "added as a torrent: " + infohash(uri)[:12])
                 with LOCK:
                     JOBS[job["id"]] = job
                 added.append(job["id"])      # scheduler decides when it starts
             for did in ids:
                 job = new_job(did, caps=caps)
+                record(job, "added as a Drive file: " + str(did)[:60])
                 with LOCK:
                     JOBS[job["id"]] = job
                 added.append(job["id"])
@@ -5211,6 +5281,19 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     gap:12px;padding:11px 4px;border-bottom:1px solid var(--rule);cursor:pointer;
     transition:background .1s}
   li.row:hover{background:var(--panel)}
+  /* the log lives inside the row's grid, spanning it, so opening one does not
+     disturb the columns */
+  .logbtn{font:400 10px/1 var(--mono);letter-spacing:.08em;color:var(--faint);
+    background:none;border:1px solid var(--rule);border-radius:3px;padding:3px 5px}
+  .logbtn:hover{color:var(--text);border-color:var(--dim)}
+  .logbtn.on{color:var(--brass);border-color:var(--brass)}
+  .logpanel{grid-column:1/-1;margin:8px 0 2px;padding:8px 10px;
+    background:var(--ink);border:1px solid var(--rule);border-radius:4px;
+    max-height:230px;overflow-y:auto;font:400 11px/1.6 var(--mono);
+    color:var(--dim);white-space:normal}
+  .logline{display:flex;gap:10px;align-items:baseline}
+  .logat{color:var(--faint);flex:0 0 auto;min-width:46px;text-align:right;
+    font-variant-numeric:tabular-nums}
   li.row.live{background:var(--panel)}
   li.row.live .n{color:var(--brass)}
   li.row.live .title{color:var(--text)}
@@ -5756,13 +5839,24 @@ function makeRow(id) {
     '<span class="body"><span class="title"></span>' +
     '<span class="track"><i></i></span><span class="note"></span></span>' +
     '<span class="flags"><span class="cc"></span><span class="eyes"></span>' +
+    '<button class="logbtn" type="button" hidden aria-label="Show this item\'s log">log</button>' +
     '<span class="kind"></span><span class="stat"></span></span>' +
-    '<button class="kill" type="button" aria-label="Remove">&times;</button>';
+    '<button class="kill" type="button" aria-label="Remove">&times;</button>' +
+    '<div class="logpanel" hidden></div>';
   const el = {li, n: li.querySelector('.n'), title: li.querySelector('.title'),
               track: li.querySelector('.track'), fill: li.querySelector('.track i'),
               note: li.querySelector('.note'), kind: li.querySelector('.kind'),
               eyes: li.querySelector('.eyes'), cc: li.querySelector('.cc'),
-              stat: li.querySelector('.stat'), kill: li.querySelector('.kill')};
+              stat: li.querySelector('.stat'), kill: li.querySelector('.kill'),
+              logbtn: li.querySelector('.logbtn'),
+              logpanel: li.querySelector('.logpanel')};
+  el.logbtn.addEventListener('click', ev => {
+    ev.stopPropagation();                 // the row itself means "play"
+    const open = el.logpanel.hidden;
+    el.logpanel.hidden = !open;
+    el.logbtn.classList.toggle('on', open);
+    if (open) loadLog(id, el);
+  });
   li.addEventListener('click', ev => {
     if (ev.target === el.kill) return;
     const i = order.indexOf(id), j = byId(id);
@@ -5774,6 +5868,38 @@ function makeRow(id) {
   el.kill.addEventListener('click', ev => { ev.stopPropagation(); remove(id); });
   rows.set(id, el);
   return el;
+}
+
+/* Timestamps are relative to the first event, because what matters when
+   reading one of these is how long a step took, not the wall clock. */
+function logStamp(t, t0) {
+  const d = Math.max(0, t - t0);
+  const m = Math.floor(d / 60), s = Math.floor(d % 60);
+  return (m ? m + 'm' : '') + (m ? String(s).padStart(2, '0') : s) + 's';
+}
+
+async function loadLog(id, el) {
+  let r;
+  try { r = await api('/log/' + encodeURIComponent(id)); }   // no body -> GET
+  catch (e) { el.logpanel.textContent = 'Could not load the log.'; return; }
+  const ev = r.events || [];
+  el.logShown = ev.length;
+  el.logpanel.textContent = '';
+  if (!ev.length) { el.logpanel.textContent = 'Nothing recorded yet.'; return; }
+  const t0 = ev[0].t;
+  ev.forEach(e => {
+    const line = document.createElement('div');
+    line.className = 'logline';
+    const at = document.createElement('span');
+    at.className = 'logat';
+    at.textContent = logStamp(e.t, t0);
+    at.title = new Date(e.t * 1000).toLocaleTimeString();
+    const msg = document.createElement('span');
+    msg.textContent = e.m;               // textContent, never HTML
+    line.append(at, msg);
+    el.logpanel.append(line);
+  });
+  el.logpanel.scrollTop = el.logpanel.scrollHeight;
 }
 
 const LABEL = {queued: 'waiting', converting: 'converting', evicted: 'evicted',
@@ -5824,6 +5950,10 @@ function paint() {
                           + (j.subs_why ? ' (' + j.subs_why + ')' : ''))
         : j.subs_status === 'searching' ? 'looking for subtitles'
         : j.subs_status === 'unavailable' ? (j.subs_note || 'no subtitles found') : '';
+    el.logbtn.hidden = !j.log_n;
+    // Refresh an open panel as the job goes on, so a stall can be watched
+    // rather than reopened.
+    if (!el.logpanel.hidden && el.logShown !== j.log_n) loadLog(id, el);
     el.note.textContent = j.error || (j.paused ? j.note : '');
     el.note.classList.toggle('quiet', !j.error && !!j.paused);
     el.note.style.display = j.error ? 'block' : 'none';

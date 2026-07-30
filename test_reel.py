@@ -16,6 +16,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -478,7 +479,8 @@ class TestFailureHandling(Base):
 # --------------------------------------------------------------------------
 class TestRestore(Base):
     def test_orphan_sidecar_is_removed(self):
-        open(self.m.subs_path_for("ghost", "eng"), "w").write("WEBVTT\n\n")
+        with open(self.m.subs_path_for("ghost", "eng"), "w") as f:
+            f.write("WEBVTT\n\n")
         self.m.JOBS.clear()
         self.m.restore()
         self.assertFalse(os.path.exists(self.m.subs_path_for("ghost", "eng")))
@@ -487,7 +489,8 @@ class TestRestore(Base):
         p = os.path.join(self.dl, "abc__driveid__A Film.mp4")
         with open(p, "wb") as f:
             f.write(b"\0" * 100)
-        open(self.m.subs_path_for("abc", "eng"), "w").write("WEBVTT\n\n")
+        with open(self.m.subs_path_for("abc", "eng"), "w") as f:
+            f.write("WEBVTT\n\n")
         self.m.JOBS.clear()
         # playable() shells out to ffprobe; without it, restore keeps the row
         self.m.playable = lambda _p: True
@@ -497,7 +500,8 @@ class TestRestore(Base):
 
     def test_live_fragments_are_discarded(self):
         # Not seekable, and meaningless once the writer is gone.
-        open(os.path.join(self.dl, "x.live.mp4"), "wb").write(b"\0" * 10)
+        with open(os.path.join(self.dl, "x.live.mp4"), "wb") as f:
+            f.write(b"\0" * 10)
         self.m.JOBS.clear()
         self.m.restore()
         self.assertFalse(os.path.exists(os.path.join(self.dl, "x.live.mp4")))
@@ -565,11 +569,27 @@ class TestWithFfmpeg(Base):
         # cover image anyway. The size guard reads Content-Range, so this has to
         # go over http to exercise it at all.
         film = self.make("small.mp4", secs=40)
-        import http.server, socketserver, functools
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler,
-                                    directory=self.dl)
-        srv = socketserver.TCPServer(("127.0.0.1", 0), handler)
-        srv.allow_reuse_address = True
+        import http.server, socketserver
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=dl, **kw)
+
+            def log_message(self, *a):
+                pass                      # no access log in test output
+
+        class Server(socketserver.TCPServer):
+            allow_reuse_address = True
+
+            def handle_error(self, request, client_address):
+                # ffprobe reads a few KB and disconnects. That is the whole
+                # point of a ranged probe, not an error worth a traceback.
+                if not isinstance(sys.exc_info()[1], (BrokenPipeError,
+                                                      ConnectionResetError)):
+                    super().handle_error(request, client_address)
+
+        dl = self.dl
+        srv = Server(("127.0.0.1", 0), Quiet)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             url = "http://127.0.0.1:%d/small.mp4" % srv.server_address[1]

@@ -5452,6 +5452,13 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
   }
   *{box-sizing:border-box;margin:0;padding:0}
+  /* The browser hides [hidden] elements with a rule of its own, but any author
+     rule setting display beats it outright -- author styles win over the user
+     agent's whatever the specificity. Three elements here set display and so
+     could never be hidden at all: the QR panel (which is why it sat on screen
+     permanently and its close button appeared to do nothing), the health strip,
+     and the video. Stated explicitly so the attribute means what it says. */
+  [hidden]{display:none!important}
   html{-webkit-text-size-adjust:100%}
   body{background:var(--ink);color:var(--text);font-family:var(--sans);
     font-size:13.5px;line-height:1.5;-webkit-font-smoothing:antialiased;

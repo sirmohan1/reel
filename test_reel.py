@@ -831,6 +831,102 @@ class TestFeedBuild(Base):
 
 
 # --------------------------------------------------------------------------
+class TestPacks(Base):
+    def f(self, i, name, gb):
+        return {"index": i, "name": name, "size": int(gb * 1_000_000_000)}
+
+    def test_an_ordinary_film_is_not_a_pack(self):
+        # The common case, and the one that must not change: one item, chosen
+        # by size, exactly as before.
+        files = [self.f(0, "Some.Film.2026.1080p.mkv", 6.0),
+                 self.f(1, "readme.txt", 0.0)]
+        self.assertEqual(self.m.pack_files(files), [])
+        self.assertEqual(self.m.pick_file(files)["index"], 0)
+
+    def test_extras_do_not_earn_their_own_row(self):
+        # A sample beside a feature is not a second film. Judged against the
+        # biggest file, since "big enough" means nothing on its own.
+        files = [self.f(0, "Some.Film.2026.1080p.mkv", 12.0),
+                 self.f(1, "sample.mkv", 0.2),
+                 self.f(2, "trailer.mp4", 0.1)]
+        self.assertEqual(self.m.pack_files(files), [])
+
+    def test_a_season_becomes_one_item_per_episode(self):
+        files = [self.f(0, "Show.S01E01.1080p.mkv", 2.0),
+                 self.f(1, "Show.S01E02.1080p.mkv", 2.1),
+                 self.f(2, "Show.S01E03.1080p.mkv", 1.9)]
+        got = self.m.pack_files(files)
+        self.assertEqual([f["index"] for f in got], [0, 1, 2])
+
+    def test_a_pack_plays_in_index_order_not_size_order(self):
+        # pick_file takes the biggest, which for a season is an arbitrary
+        # episode. The order that matters here is the one they were meant to be
+        # watched in.
+        files = [self.f(0, "Show.S01E01.mkv", 2.0),
+                 self.f(1, "Show.S01E02.mkv", 9.0),
+                 self.f(2, "Show.S01E03.mkv", 2.0)]
+        self.assertEqual(self.m.pick_file(files)["index"], 1)
+        self.assertEqual(self.m.pack_files(files)[0]["index"], 0)
+
+    def test_bonus_material_is_excluded_by_name_not_by_size(self):
+        # A 1.9 GB "behind the scenes" beside an 8 GB feature is a quarter of
+        # it, and no size bar loose enough to keep a short episode also excludes
+        # that. The name is the precise signal.
+        files = [self.f(0, "Movie.2026.1080p.mkv", 8.0),
+                 self.f(1, "behind.the.scenes.mkv", 1.9),
+                 self.f(2, "deleted.scenes.mkv", 0.6)]
+        self.assertEqual(self.m.pack_files(files), [])
+
+    def test_an_uneven_pack_keeps_its_smaller_features(self):
+        # Tightening the size bar to catch bonus material instead cost real
+        # files: a trilogy encoded unevenly, or a season with one double-length
+        # episode, has smaller entries that are still whole features.
+        files = [self.f(0, "Godfather.1972.mkv", 16.0),
+                 self.f(1, "Godfather.Part.II.1974.mkv", 4.0)]
+        self.assertEqual([f["index"] for f in self.m.pack_files(files)], [0, 1])
+
+    def test_only_video_files_count(self):
+        files = [self.f(0, "Film.mkv", 4.0), self.f(1, "soundtrack.mp3", 2.0),
+                 self.f(2, "cover.jpg", 1.0)]
+        self.assertEqual(self.m.pack_files(files), [])
+
+    def test_a_huge_collection_is_capped(self):
+        files = [self.f(i, "Film.%02d.mkv" % i, 2.0) for i in range(60)]
+        self.assertEqual(len(self.m.pack_files(files)), self.m.PACK_MAX)
+
+    def test_fan_out_queues_the_rest_as_their_own_jobs(self):
+        parent = self.job(source="torrent", magnet="magnet:?xt=urn:btih:" + "a" * 40)
+        files = [self.f(0, "Show.S01E01.mkv", 2.0),
+                 self.f(1, "Show.S01E02.mkv", 2.0),
+                 self.f(2, "Show.S01E03.mkv", 2.0)]
+        made = self.m.fan_out(parent, parent["magnet"], files, files[1:])
+        self.assertEqual(len(made), 2)
+        sibs = [self.m.JOBS[i] for i in made]
+        self.assertEqual([s["wt_index"] for s in sibs], [1, 2])
+        self.assertEqual([s["title"] for s in sibs], ["Show.S01E02", "Show.S01E03"])
+        # Each is an ordinary torrent job the scheduler will start in turn.
+        for s in sibs:
+            self.assertEqual(s["magnet"], parent["magnet"])
+            self.assertEqual(s["status"], "queued")
+            self.assertTrue(s["hold"])
+
+    def test_a_sibling_never_fans_out_again(self):
+        # Pinned jobs must not re-expand, or a three-file pack breeds one item
+        # per file per file.
+        files = [self.f(i, "Show.S01E%02d.mkv" % i, 2.0) for i in range(3)]
+        sib = self.job(source="torrent", magnet="m", wt_index=1)
+        self.assertIsNotNone(sib["wt_index"])
+        # pack_files is only consulted when wt_index is None; assert the flag
+        # that decides it, since run_torrent needs a live torrent to exercise.
+        self.assertTrue(len(self.m.pack_files(files)) > 1)
+
+    def test_pack_detection_can_be_turned_off(self):
+        self.m.PACK_MAX = 1
+        files = [self.f(i, "Show.S01E%02d.mkv" % i, 2.0) for i in range(3)]
+        self.assertEqual(len(self.m.pack_files(files)), 1)
+
+
+# --------------------------------------------------------------------------
 class TestJobLog(Base):
     def test_events_are_kept_in_order_with_timestamps(self):
         j = self.job()

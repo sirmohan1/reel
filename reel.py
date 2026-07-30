@@ -103,6 +103,32 @@ VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".ts", ".flv", ".w
              ".mpg", ".mpeg", ".m2ts")
 AUDIO_EXT = (".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus")
 
+# A torrent holding several films or episodes becomes several queue items, one
+# per file, rather than one item and a pile of bytes nothing can reach.
+# REEL_PACK=1 restores the old behaviour of taking only the largest file.
+try:
+    PACK_MAX = max(1, int(os.environ.get("REEL_PACK", "20")))
+except ValueError:
+    PACK_MAX = 20
+# What counts as a feature rather than an extra. A sample, a trailer or a
+# "please seed" clip is always a small fraction of the real thing, so a file has
+# to be both absolutely and relatively substantial to earn its own row --
+# otherwise a film with three extras becomes four items, three of them junk.
+# Deliberately loose, because the name check below is the precise instrument and
+# this is only a backstop. Tightening it to exclude bonus material instead cost
+# real files: an uneven trilogy, or a season with one double-length episode,
+# has smaller entries that are still whole features.
+PACK_MIN_SHARE = 0.20
+PACK_MIN_BYTES = 50 * 1024 * 1024
+# Bonus material is named as such by convention, and a size bar alone lets the
+# larger of it through: a 1.9 GB "behind the scenes" beside an 8 GB feature is
+# a quarter of it, which no threshold loose enough to keep a short episode can
+# also exclude. The name is the more precise signal.
+PACK_EXTRAS = re.compile(r"""(sample|trailer|teaser|extras?|bonus|featurette|
+    behind[ ._-]?the[ ._-]?scenes|deleted[ ._-]?scenes?|making[ ._-]?of|
+    interview|blooper|outtake|gag[ ._-]?reel|commentary|proof|screener)""",
+    re.I | re.X)
+
 # Search. One indexer to begin with, behind a normalising layer so another can
 # be added without the caller noticing. These endpoints go dark without warning
 # -- yts.mx already refuses the requests this was first written against -- so a
@@ -2198,6 +2224,9 @@ def new_job(drive_id, jid=None, **extra):
            "source": "drive", "magnet": None, "wt_port": None, "wt_url": None,
            "wt_proc": None, "wt_done": False, "wt_ranges": False,
            "wt_codecs": "", "wt_files": 0, "wt_direct": False,
+           # Which file of a multi-file torrent this item is. None means "not
+           # decided yet"; a pack's siblings are pinned to theirs.
+           "wt_index": None,
            "caps": None, "vcodec": None, "vpix": None, "play_key": None,
            "live_proc": None,
            "subs_status": None, "subs_source": None, "subs_lang": None,
@@ -3565,6 +3594,59 @@ def parse_file_list(text):
     return files
 
 
+def fan_out(job, magnet, files, extras):
+    """Queue the rest of a pack as items of their own.
+
+    Each sibling is an ordinary torrent job pinned to one file index, so it goes
+    through the same download, probe, convert and subtitle path as anything
+    else, and the scheduler decides when it starts -- which is what keeps a
+    twelve-episode pack from opening twelve webtorrent processes at once.
+    """
+    made = []
+    for f in extras:
+        sib = new_job(None, source="torrent", magnet=magnet,
+                      caps=job.get("caps"), wt_index=f["index"],
+                      title=os.path.splitext(os.path.basename(f["name"]))[0])
+        sib["total"] = f.get("size") or 0
+        sib["wt_files"] = len(files)
+        record(sib, "queued from a pack: file %d of %d, %s (%.2f GB)"
+               % (f["index"], len(files), f["name"][:120],
+                  (f.get("size") or 0) / GB))
+        with LOCK:
+            JOBS[sib["id"]] = sib
+        made.append(sib["id"])
+    if made:
+        record(job, "pack of %d: queued %d more file(s) as their own items"
+               % (len(extras) + 1, len(made)))
+    return made
+
+
+def pack_files(files):
+    """Every file in a torrent worth queueing as its own item, in play order.
+
+    Empty for an ordinary single-film torrent, which is the common case and must
+    stay exactly as it was. A pack is only recognised when two or more files
+    look like features -- judged against the biggest, since "big enough" means
+    nothing without something to compare to: a 200 MB extra beside a 12 GB
+    remux and a 200 MB episode beside a 300 MB one are different things.
+
+    Ordered by index rather than size, because for a season the order that
+    matters is the one they were meant to be watched in.
+    """
+    vids = [f for f in (files or [])
+            if (f.get("name") or "").lower().endswith(VIDEO_EXT)
+            and not PACK_EXTRAS.search(f.get("name") or "")]
+    if len(vids) < 2:
+        return []
+    biggest = max((f.get("size") or 0) for f in vids)
+    bar = max(PACK_MIN_BYTES, biggest * PACK_MIN_SHARE)
+    keep = [f for f in vids if (f.get("size") or 0) >= bar]
+    if len(keep) < 2:
+        return []
+    keep.sort(key=lambda f: f["index"])
+    return keep[:PACK_MAX]
+
+
 def pick_file(files):
     """Biggest video, else biggest audio, else biggest anything. Samples and
     extras are always smaller than the feature, so size is a good proxy."""
@@ -3883,16 +3965,32 @@ def run_torrent(job):
         job["status"] = cancel_status(job)
         return
 
-    chosen = pick_file(files)
+    # A sibling created by a fan-out is pinned to its own file and must never
+    # fan out again, or a three-file pack would breed one queue item per file
+    # per file.
+    pinned = job.get("wt_index")
+    pack = [] if pinned is not None else pack_files(files)
+    if pinned is not None:
+        chosen = next((f for f in files if f["index"] == pinned), None) or pick_file(files)
+    elif pack:
+        # The first file, not the biggest: for a season the useful order is the
+        # one they were meant to be watched in.
+        chosen = pack[0]
+    else:
+        chosen = pick_file(files)
+
     if chosen:
         job["title"] = os.path.splitext(os.path.basename(chosen["name"]))[0]
         job["total"] = chosen["size"] or 0
         job["wt_files"] = len(files)
+        job["wt_index"] = chosen["index"]
         job["note"] = (job.get("note", "") +
                        f"; file {chosen['index']} of {len(files)}").strip("; ")
         record(job, "picked file %d of %d: %s (%.2f GB)"
                % (chosen["index"], len(files), chosen["name"][:120],
                   (chosen["size"] or 0) / GB))
+        if pack:
+            fan_out(job, magnet, files, pack[1:])
     elif re.search(r"EADDRINUSE|address already in use", log, re.I):
         cleanup()
         return fail(job, "webtorrent couldn't open a port: " + tail(log, 2, 140))

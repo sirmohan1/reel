@@ -5456,7 +5456,25 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   body{background:var(--ink);color:var(--text);font-family:var(--sans);
     font-size:13.5px;line-height:1.5;-webkit-font-smoothing:antialiased;
     display:flex;justify-content:center;padding:0 20px 72px}
-  .wrap{width:100%;max-width:760px}
+  .wrap{width:100%;max-width:1440px}
+
+  /* Two columns once there is room for them: the player keeps the space that
+     benefits from it, and the queue stops being a narrow strip under a video.
+     Below this width everything stacks in source order, which is the order a
+     phone wants -- player first, queue after. */
+  .cols{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(330px,1fr);
+    gap:30px;align-items:start;margin-top:16px}
+  .main{min-width:0}
+  .side{min-width:0}
+  /* The player stays put while the queue scrolls beside it, which is the whole
+     point of putting them side by side. */
+  @media (min-width:1040px){
+    .main{position:sticky;top:18px}
+    .side .section:first-child{margin-top:0}
+  }
+  @media (max-width:1039px){
+    .cols{grid-template-columns:1fr;gap:0}
+  }
   ::selection{background:rgba(198,162,101,.25)}
   :focus-visible{outline:1px solid var(--brass);outline-offset:2px}
 
@@ -5538,6 +5556,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .rrow .rscore{color:var(--live)}
 
   /* stage */
+  .main .stage{margin-top:0}          /* .cols already supplies the gap */
   .stage{margin-top:16px;position:relative;aspect-ratio:16/9;background:#000;
     border:1px solid var(--rule);border-radius:5px;overflow:hidden}
   .stage video{position:absolute;inset:0;width:100%;height:100%;display:block}
@@ -5683,6 +5702,10 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   </form>
   <div class="results" id="results" hidden></div>
 
+  <!-- Two columns on a wide screen, one on a narrow one. The order here is the
+       order a phone gets, so the player still comes before the queue. -->
+  <div class="cols">
+  <main class="main">
   <div class="stage">
     <span class="flag" id="flag">audio only</span>
     <div class="slate" id="slate">
@@ -5704,7 +5727,9 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <span class="verdict" id="verdict"></span>
     <span class="figures" id="figures"></span>
   </div>
+  </main>
 
+  <aside class="side">
   <div class="section">
     <span class="eyebrow">Queue</span><span class="count" id="qcount"></span>
   </div>
@@ -5729,6 +5754,8 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
       <span class="u">GB</span>
       <button id="savecap">Update limit</button>
     </div>
+  </div>
+  </aside>
   </div>
 </div>
 <script>

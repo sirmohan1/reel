@@ -36,6 +36,8 @@ import json
 import queue
 import gzip
 import struct
+import random
+import binascii
 import json as _json
 import uuid
 import shutil
@@ -98,7 +100,15 @@ AUDIO_EXT = (".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".opus")
 # be added without the caller noticing. These endpoints go dark without warning
 # -- yts.mx already refuses the requests this was first written against -- so a
 # dead source has to read as "no results", never as a broken feature.
+# Three indexers, because one is not enough: against an independent source,
+# apibay was missing 10-12 viable torrents per film -- including a 195-seeder
+# Dune release that would have ranked near the top. They are queried together
+# and merged on infohash. Any one of them going dark has to read as "that source
+# returned nothing", never as a broken search: yts.mx, which this was first
+# written against, has already vanished entirely.
 SEARCH_URL = "https://apibay.org/q.php"
+SEARCH_CSV_URL = "https://torrents-csv.com/service/search"
+SEARCH_RARBG_URL = "https://therarbg.to/get-posts"
 # The search response truncates `name` -- at 64 or 80 characters, depending on
 # the row -- and a release puts its codec at the *end*, so the one field that
 # decides whether this needs remuxing is exactly what gets cut. This endpoint
@@ -114,6 +124,10 @@ SEARCH_DETAIL = 10
 # that prompted this had 2 peers, found its endpoint correctly, and sat at
 # 14 KB/s against the ~1.5 MB/s the film needed.
 SEARCH_MIN_SEEDERS = 5
+# How many top results to verify against the trackers themselves. Each scrape is
+# a couple of UDP packets, run in parallel, so this costs about a second -- worth
+# it, since the indexer figure it replaces was out by 50x on one row.
+SEARCH_VERIFY = 8
 # Appended to every magnet we build, since the indexer hands back a bare
 # infohash. DHT finds most peers on its own; these only speed up the start.
 # Tracker liveness drifts too: the dead ones in that Spider-Man magnet
@@ -943,6 +957,208 @@ def build_magnet(infohash, name):
     return "&".join(parts)
 
 
+def udp_scrape(infohash, tracker, timeout=4.0):
+    """Ask a tracker how many seeders a torrent actually has.
+
+    Indexer counts are cached and wildly optimistic -- measured against this,
+    they overstated by about 2x across the board, and in one case reported 203
+    seeders for a torrent with 4. That is precisely the torrent that looks safe
+    and then never streams, so the number worth showing is this one.
+
+    BEP 15: connect for a connection id, then scrape with it.
+    """
+    host, _, port = tracker.partition("://")[2].partition("/")[0].rpartition(":")
+    try:
+        raw = binascii.unhexlify(infohash)
+        if len(raw) != 20:
+            return None
+        addr = (host, int(port))
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            tid = random.randint(0, 2 ** 31)
+            s.sendto(struct.pack(">QII", 0x41727101980, 0, tid), addr)
+            data, _ = s.recvfrom(512)
+            action, rtid, cid = struct.unpack(">IIQ", data[:16])
+            if action != 0 or rtid != tid:
+                return None
+            tid2 = random.randint(0, 2 ** 31)
+            s.sendto(struct.pack(">QII", cid, 2, tid2) + raw, addr)
+            data, _ = s.recvfrom(512)
+            if len(data) < 20 or struct.unpack(">I", data[:4])[0] != 2:
+                return None
+            seeders, _done, _leech = struct.unpack(">III", data[8:20])
+            return seeders
+        finally:
+            s.close()
+    except Exception:
+        return None
+
+
+def live_seeders(infohash, timeout=3.0):
+    """The best count any of our trackers will admit to, or None if none answer.
+
+    Highest rather than lowest across trackers: each knows only its own slice of
+    a swarm, so the largest answer is the closest to the whole.
+
+    All of them at once, because most will not answer at all -- three of the four
+    time out from here -- and asking in turn made one search take 14 seconds
+    waiting on trackers that were never going to reply.
+    """
+    found = []
+    def ask(tr):
+        got = udp_scrape(infohash, tr, timeout)
+        if got is not None:
+            found.append(got)
+    for tr in SEARCH_TRACKERS:
+        threading.Thread(target=ask, args=(tr,), daemon=True).start()
+    # Returns shortly after the first answer instead of waiting out the ones that
+    # never reply. Those took the full timeout every time, which made a search of
+    # eight rows sit for three seconds and put 32 requests in flight at once --
+    # enough for the trackers that do work to start refusing them.
+    deadline = time.time() + timeout + 0.5
+    while time.time() < deadline:
+        if found:
+            time.sleep(0.35)          # brief grace, in case a second is close behind
+            break
+        time.sleep(0.05)
+    return max(found) if found else None
+
+
+def _search_json(url, timeout=SEARCH_TIMEOUT):
+    req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return _json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _row(ih, name, seeders, leechers, size, files=0, tid=""):
+    """One shape for every source, so the ranking never has to know which
+    indexer a result came from."""
+    ih = (ih or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", ih) or set(ih) == {"0"}:
+        return None
+    name = (name or "").strip()
+    if not name:
+        return None
+    def num(v):
+        try:
+            return max(0, int(float(v or 0)))
+        except (TypeError, ValueError):
+            return 0
+    return {"infohash": ih, "name": name, "id": str(tid or ""),
+            "seeders": num(seeders), "leechers": num(leechers),
+            "size": num(size), "files": num(files),
+            "magnet": build_magnet(ih, name)}
+
+
+def source_apibay(query):
+    """The Pirate Bay's json api. Returns rows already sorted by seeders, and
+    caps at 100 -- which costs nothing, since what it drops is the tail."""
+    url = SEARCH_URL + "?" + urllib.parse.urlencode({"q": query, "cat": 200})
+    rows = _search_json(url)
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or r.get("id") in ("0", 0):
+            continue          # the no-results sentinel row
+        out.append(_row(r.get("info_hash"), r.get("name"), r.get("seeders"),
+                        r.get("leechers"), r.get("size"), r.get("num_files"),
+                        r.get("id")))
+    return [x for x in out if x]
+
+
+def source_csv(query):
+    """torrents-csv: an aggregated dataset, and the source that demonstrated the
+    gap -- 10-12 torrents per film that apibay simply does not list."""
+    url = SEARCH_CSV_URL + "?" + urllib.parse.urlencode({"q": query, "size": 100})
+    data = _search_json(url)
+    rows = data.get("torrents", []) if isinstance(data, dict) else data
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        out.append(_row(r.get("infohash"), r.get("name"), r.get("seeders"),
+                        r.get("leechers"), r.get("size_bytes")))
+    return [x for x in out if x]
+
+
+def source_rarbg(query):
+    """therarbg, RARBG's successor. Keys are abbreviated -- h hash, n name,
+    se seeders, le leechers, s size -- and it needs its redirect followed."""
+    url = "%s/keywords:%s:format:json/" % (SEARCH_RARBG_URL,
+                                           urllib.parse.quote(query))
+    data = _search_json(url)
+    rows = data.get("results", []) if isinstance(data, dict) else data
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        out.append(_row(r.get("h"), r.get("n"), r.get("se"), r.get("le"),
+                        r.get("s")))
+    return [x for x in out if x]
+
+
+SEARCH_SOURCES = (("apibay", source_apibay), ("torrents-csv", source_csv),
+                  ("therarbg", source_rarbg))
+
+
+def search_all(query):
+    """Every source at once, merged on infohash. Returns (rows, per_source).
+
+    Run in parallel because three sequential lookups would treble the wait, and
+    each is wrapped so one being dead or reshaped costs only its own results --
+    per_source records what each contributed, so a source that quietly stops
+    working is visible rather than guessed at.
+    """
+    got, per = {}, {}
+
+    def fetch(name, fn):
+        try:
+            rows = fn(query)
+            per[name] = len(rows)
+        except Exception as e:
+            per[name] = "failed: " + str(e)[:40]
+            return
+        for r in rows:
+            old = got.get(r["infohash"])
+            if old is None:
+                r["counts"] = [r["seeders"]]
+                got[r["infohash"]] = r
+            else:
+                # Every count each source gave, kept so the merge can take a
+                # middle value rather than the most flattering one.
+                old["counts"].append(r["seeders"])
+                if r["size"] and not old["size"]:
+                    old["size"] = r["size"]
+                if len(r["name"]) > len(old["name"]):
+                    old["name"] = r["name"]
+                if r["id"] and not old["id"]:
+                    old["id"] = r["id"]
+
+    threads = [threading.Thread(target=fetch, args=(n, f), daemon=True)
+               for n, f in SEARCH_SOURCES]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT + 4)
+
+    # Indexer seeder counts disagree wildly, and are all cached rather than
+    # live. One torrent came back as 109, 487 and 1313 from the three sources
+    # while the tracker itself reported 283. Taking the highest -- which this
+    # first did -- reliably picks the stalest, most flattering number, which is
+    # the opposite of useful when the whole point of ranking by seeders is to
+    # avoid a dead swarm. The middle value is the one that survives an outlier
+    # in either direction.
+    for r in got.values():
+        c = sorted(r.pop("counts", [r["seeders"]]))
+        # Lower median, so two sources resolve to the smaller figure rather than
+        # the larger. Erring low is the right direction here: an overstated count
+        # invites a stall, an understated one only makes a good torrent look
+        # slightly worse than it is.
+        r["seeders"] = c[(len(c) - 1) // 2]
+        r["sources"] = len(c)
+    return list(got.values()), per
+
+
 def search_torrents(query, limit=SEARCH_LIMIT):
     """Find magnets by name. Returns (results, error).
 
@@ -952,43 +1168,23 @@ def search_torrents(query, limit=SEARCH_LIMIT):
     """
     q = (query or "").strip()
     if not q:
-        return [], "nothing to search for", 0
-    url = SEARCH_URL + "?" + urllib.parse.urlencode({"q": q, "cat": 200})
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
-        with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT) as r:
-            rows = _json.loads(r.read().decode("utf-8", "replace"))
-    except Exception as e:
-        # A dead or blocked indexer is an expected state, not a crash: say so
-        # plainly and leave the rest of the app alone.
-        return [], "couldn't reach the search index (%s)" % str(e)[:60], 0
-    if not isinstance(rows, list):
-        return [], "unexpected response from the search index", 0
+        return [], "nothing to search for", 0, {}
+    rows, per_source = search_all(q)
+    if not rows:
+        alive = [n for n, v in per_source.items() if isinstance(v, int)]
+        if not alive:
+            # Every source failed, which is a different thing from "no results"
+            # and deserves to be said as such.
+            return [], "no search source could be reached (%s)" % "; ".join(
+                "%s %s" % (n, v) for n, v in per_source.items())[:120], 0, per_source
+        return [], None, 0, per_source
 
     out = []
     dropped = 0                 # zero-seeder rows, reported so their absence
                                 # is visible rather than silent
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        ih = (row.get("info_hash") or "").strip()
-        # The no-results sentinel: one row, id 0, an all-zero infohash. Left
-        # unfiltered it would offer a magnet that can never resolve.
-        if row.get("id") in ("0", 0) or not re.fullmatch(r"[0-9a-fA-F]{40}", ih):
-            continue
-        if set(ih) == {"0"}:
-            continue
-        name = (row.get("name") or "").strip()
-        if not name:
-            continue
-
-        def num(key):
-            try:
-                return int(row.get(key) or 0)
-            except (TypeError, ValueError):
-                return 0
-        size = num("size")
-        seeders = num("seeders")
+        size = row["size"]
+        seeders = row["seeders"]
         # Nothing to serve the file, so there is nothing to offer. Dropped here
         # rather than shown greyed out, because on an obscure search these can
         # be the entire result set -- one search returned 19 rows of which 6
@@ -996,26 +1192,42 @@ def search_torrents(query, limit=SEARCH_LIMIT):
         if seeders <= 0:
             dropped += 1
             continue
-        out.append({"name": name, "infohash": ih.lower(), "id": str(row.get("id") or ""),
-                    "magnet": build_magnet(ih, name),
-                    "seeders": seeders, "leechers": num("leechers"),
-                    "size": size, "files": num("num_files")})
+        out.append(row)          # already normalised by _row()
 
     out.sort(key=lambda r: (-r["seeders"], r["size"]))
     out = out[:limit]
 
-    # Fill in the real filename for the rows most likely to be chosen, in
-    # parallel: ten sequential lookups would add ten round-trips to a search.
-    def enrich(res):
-        real = search_real_name(res["id"]) if res["id"] else None
-        if real:
-            res["real_name"] = real
-    threads = [threading.Thread(target=enrich, args=(r,), daemon=True)
-               for r in out[:SEARCH_DETAIL]]
+    # Two lookups per candidate, both in parallel: the real filename, and the
+    # seeder count from the trackers rather than from an indexer's cache.
+    def enrich(res, verify):
+        if res["id"]:
+            real = search_real_name(res["id"])
+            if real:
+                res["real_name"] = real
+        if verify:
+            live = live_seeders(res["infohash"])
+            if live is not None:
+                res["reported"] = res["seeders"]
+                res["seeders"] = live
+                res["verified"] = True
+    threads = [threading.Thread(target=enrich,
+                                args=(r, i < SEARCH_VERIFY), daemon=True)
+               for i, r in enumerate(out[:max(SEARCH_DETAIL, SEARCH_VERIFY)])]
     for t in threads:
         t.start()
     for t in threads:
         t.join(SEARCH_TIMEOUT)
+
+    # Re-rank on the verified numbers, since verification can move a row a long
+    # way -- one claiming 203 seeders turned out to have 4, and belongs at the
+    # bottom rather than in the middle of the list.
+    #
+    # An unverified row is ranked on half of what its indexer claimed, because
+    # that is roughly how much they overstate (1085 against 485, 487 against 289,
+    # 447 against 123). Without the haircut a row nobody could check outranks
+    # rows measured to be better, purely for being optimistic.
+    out.sort(key=lambda r: (-(r["seeders"] if r.get("verified")
+                              else r["seeders"] // 2), r["size"]))
 
     cap = cap_bytes()
     for res in out:
@@ -1036,8 +1248,10 @@ def search_torrents(query, limit=SEARCH_LIMIT):
         # obscure, and downloading it slowly is a legitimate choice -- being
         # surprised by it is not.
         res["weak"] = res["seeders"] < SEARCH_MIN_SEEDERS
+        res.setdefault("verified", False)
+        res.setdefault("reported", None)
         res.update(info)
-    return out, None, dropped
+    return out, None, dropped, per_source
 
 
 def split_sources(text):
@@ -3754,9 +3968,9 @@ class H(http.server.BaseHTTPRequestHandler):
             # Nothing is started here -- this only looks. The chosen magnet
             # comes back through /add like any other, so the download path is
             # the existing one, unchanged.
-            results, err, dropped = search_torrents(body.get("q"))
+            results, err, dropped, per = search_torrents(body.get("q"))
             return self._json(200, {"results": results, "error": err,
-                                    "dropped": dropped})
+                                    "dropped": dropped, "sources": per})
 
         if p == "/add":
             magnets, ids, bad = split_sources(body.get("links"))
@@ -4472,7 +4686,10 @@ async function runSearch(q) {
   head.className = 'rhead';
   // Say what was withheld: silently returning 6 of 19 rows looks like a thin
   // index rather than a deliberate filter.
+  const srcs = r.sources ? Object.entries(r.sources)
+        .filter(([,v]) => typeof v === 'number' && v > 0).map(([k]) => k) : [];
   head.textContent = rows.length + ' results for "' + q + '" · most seeded first'
+      + (srcs.length ? ' · ' + srcs.length + ' sources' : '')
       + (r.dropped ? ' · ' + r.dropped + ' with no seeders hidden' : '');
   box.append(head);
 
@@ -4491,8 +4708,12 @@ async function runSearch(q) {
 
     const meta = document.createElement('span');
     meta.className = 'rmeta';
-    const bits = [res.seeders + (res.weak ? ' seed — too few to stream' : ' seed'),
-                  fmtSize(res.size)];
+    /* A tilde means the count came from an indexer's cache rather than from the
+       trackers. Worth distinguishing: those caches were out by 2x across the
+       board, and by 50x on one row -- 203 claimed against 4 real. */
+    const seedTxt = (res.verified ? '' : '~') + res.seeders + ' seed'
+                  + (res.weak ? ' — too few to stream' : '');
+    const bits = [seedTxt, fmtSize(res.size)];
     if (res.res) bits.push(res.res);
     // Worth saying when the title shown is one file out of several -- a
     // trilogy pack would otherwise look like a single film.

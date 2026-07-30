@@ -739,8 +739,11 @@ def subs_fit(cand, our_name, our_duration=None, matched_by=None):
             score += 40
             why.append("ends %s before the film does" % clock_short(max(gap, 0)))
         else:
-            score -= 50
-            why.append("timings end %s out" % clock_short(abs(gap)))
+            # Decisive, not a penalty to be weighed. Subtracting a fixed amount
+            # let the popularity bonus buy the difference back: a subtitle 94
+            # minutes out of sync scored -48 against a -50 threshold and was
+            # accepted. Nothing about a download count makes wrong timings fit.
+            return -100.0, ["timings end %s out" % clock_short(abs(gap))]
 
     # Which source it was cut from. Shared words mean shared structure.
     ours = {t.lower() for t in RELEASE_TOKENS.findall(our_name or "")}

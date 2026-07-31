@@ -6364,17 +6364,42 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     color:var(--faint);background:none;border:1px solid var(--rule);border-radius:4px;
     padding:4px 8px}
   .pickbtn:hover{color:var(--text);border-color:var(--dim)}
-  .picks{margin-top:8px;background:var(--panel);border:1px solid var(--rule);
-    border-radius:5px;padding:6px;max-height:420px;overflow-y:auto;
-    font-size:12.5px;color:var(--dim)}
-  /* every shelf but the first gets a rule above it, so the sections read as
-     sections rather than as one long list with headings in it */
-  .picks .rhead:not(:first-child){border-top:1px solid var(--rule);
-    margin-top:8px;padding-top:16px}
-  .picks .rhead{color:var(--brass)}
+  .picks{margin-top:4px;font-size:12.5px;color:var(--dim)}
   .rrank{font:500 11px/1 var(--mono);color:var(--faint);letter-spacing:.06em}
   .rwhy{font:400 10.5px/1.4 var(--mono);color:var(--dim);white-space:normal}
   .rrow .rscore{color:var(--live)}
+
+  /* shelves -- one horizontally-scrolling strip per shelf, card-based rather
+     than the stacked-row layout search results use, since a poster read at a
+     glance is the point of browsing and a list of text rows isn't that. */
+  .shelf:not(:first-child){margin-top:22px}
+  .shelfhead{font:500 11px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+    color:var(--brass);margin-bottom:10px}
+  .shelfstrip{display:flex;gap:12px;overflow-x:auto;padding:2px 2px 12px;
+    scroll-snap-type:x proximity;-webkit-overflow-scrolling:touch}
+  .shelfstrip::-webkit-scrollbar{height:6px}
+  .shelfstrip::-webkit-scrollbar-thumb{background:var(--rule);border-radius:3px}
+  .card{flex:0 0 136px;display:flex;flex-direction:column;gap:6px;
+    text-align:left;background:none;border:none;padding:0;cursor:pointer;
+    scroll-snap-align:start}
+  .card:disabled{cursor:default}
+  .cardart{position:relative;width:136px;aspect-ratio:2/3;border-radius:6px;
+    overflow:hidden;background:var(--panel);border:1px solid var(--rule)}
+  .cardart img{width:100%;height:100%;object-fit:cover;display:block}
+  /* no poster (a tracker-only shelf item) falls back to the title set as the
+     card's own face, rather than an empty grey rectangle */
+  .cardart.noart{display:flex;align-items:center;justify-content:center;
+    padding:10px;text-align:center;font:400 11px/1.35 var(--mono);color:var(--faint)}
+  .cardbadge{position:absolute;top:5px;right:5px;font:500 10px/1 var(--mono);
+    background:rgba(0,0,0,.72);color:var(--live);padding:3px 5px;border-radius:3px}
+  .card:hover:not(:disabled) .cardart{border-color:var(--dim)}
+  .cardtitle{font-size:11.5px;color:var(--text);line-height:1.3;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .cardmeta{font:400 10.5px/1.35 var(--mono);color:var(--faint);
+    font-variant-numeric:tabular-nums}
+  .cardflag{font:400 10.5px/1.35 var(--mono);color:var(--warn)}
+  .card.toobig .cardtitle{color:var(--dim)}
+  .card:disabled{opacity:.5}
 
   /* stage */
   .main .stage{margin-top:0}          /* .cols already supplies the gap */
@@ -6649,16 +6674,20 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <span class="eyebrow">Queue</span><span class="count" id="qcount"></span>
   </div>
   <ul id="list"><li class="blank">Paste a Drive link above to get started.</li></ul>
+  </aside>
+  </div>
 
+  <!-- Full width rather than boxed into the sidebar -- posters at sidebar
+       width would be too small to read at a glance, and shelves read as
+       shelves only when there's room for a row of them. One toggle and one
+       refresh cover every shelf below, present and future: shelves come from
+       a single /feed response, so there is nothing per-shelf to wire up. -->
   <div class="section">
     <span class="eyebrow">Picks</span><span class="count" id="pcount"></span>
     <button class="pickbtn" id="picktog" type="button" aria-expanded="false">Show</button>
     <button class="pickbtn" id="pickref" type="button" hidden>Refresh</button>
   </div>
   <div class="picks" id="picks" hidden></div>
-
-  </aside>
-  </div>
 </div>
 <script>
 const TICKS = 48;
@@ -6959,79 +6988,84 @@ $('findgo').addEventListener('click', runFind);
    extra to load and nothing is requested on your behalf until you ask. */
 let picksLoaded = false;
 
-function pickRow(res) {
-  const row = document.createElement('button');
-  row.className = 'rrow';
-  row.type = 'button';
-  if (!res.fits || res.weak || res.queued) row.classList.add('toobig');
-  if (res.queued) row.disabled = true;
+function pickCard(res) {
+  const card = document.createElement('button');
+  card.className = 'card';
+  card.type = 'button';
+  if (!res.fits || res.weak || res.queued) card.classList.add('toobig');
+  if (res.queued) card.disabled = true;
 
-  const title = document.createElement('span');
-  title.className = 'rtitle';
-  title.textContent = res.title + (res.year ? ' (' + res.year + ')' : '');
-
-  const meta = document.createElement('span');
-  meta.className = 'rmeta';
-  const bits = [];
-  // The rating is the reason this is a recommendation rather than a listing,
-  // so it leads -- and says outright when there isn't one, since an absent
-  // rating and a bad one should never look the same.
-  bits.push(res.rating ? '★ ' + res.rating.toFixed(1)
-                       + (res.votes ? ' (' + res.votes.toLocaleString() + ')' : '')
-                       : 'no rating');
-  if (res.genres && res.genres.length) bits.push(res.genres.slice(0, 3).join(', '));
-  bits.push((res.verified ? '' : '~') + res.seeders + ' seed'
-            + (res.weak ? ' — too few to stream' : ''));
-  bits.push(fmtSize(res.size));
-  if (res.res) bits.push(res.res);
-  bits.push(res.direct ? 'plays directly' :
-            res.codec === 'hevc' ? 'needs remux' :
-            res.codec ? res.codec + ', may need remux' : 'unknown codec');
-  if (res.hdr) bits.push('HDR');
-  if (!res.fits) bits.push('needs ~' + fmtSize(res.peak) + ', over your cache cap');
-  if (res.queued) bits.push('already in your queue');
-  meta.textContent = bits.join('  ·  ');
-
-  // Why this one was picked, in the same words the ranking used -- a list of
-  // suggestions with no stated reason is just an ordering you have to trust.
-  const why = document.createElement('span');
-  why.className = 'rwhy';
-  // The overview is TMDb's synopsis when there is one; otherwise fall back to
-  // the ranking's own reasoning, so a row is never left with neither.
-  why.textContent = res.overview || (res.why || []).join(' · ');
-
-  // Only rows that came from the catalogue carry a poster. A search result or
-  // a tracker-sourced shelf item has none, and gets the plain layout rather
-  // than an empty gap where an image would be.
+  const art = document.createElement('span');
+  art.className = 'cardart';
+  // A tracker-only shelf item has no poster; the title stands in for one
+  // rather than leaving an empty grey rectangle in the row.
   if (res.poster_path) {
-    row.classList.add('withpost');
     const img = document.createElement('img');
-    img.className = 'rpost';
     img.loading = 'lazy';
     img.alt = '';
     img.src = '/poster/w154' + res.poster_path;
-    // A broken fetch should not leave a blank grey box; falling back to the
-    // plain layout is what would have been shown anyway.
-    img.addEventListener('error', () => { img.remove(); row.classList.remove('withpost'); });
-    const body = document.createElement('span');
-    body.className = 'rbody';
-    body.append(title, meta);
-    if (why.textContent) body.append(why);
-    row.append(img, body);
+    img.addEventListener('error', () => {
+      img.remove();
+      art.classList.add('noart');
+      art.append(res.title);
+    });
+    art.append(img);
   } else {
-    row.append(title, meta);
-    if (why.textContent) row.append(why);
+    art.classList.add('noart');
+    art.append(res.title);
   }
-  if (!res.queued) row.addEventListener('click', async () => {
-    row.disabled = true;
-    title.textContent = 'Adding: ' + res.title;
+  // The rating is the reason this is a recommendation rather than a listing,
+  // so it sits on the poster itself -- the one thing glanced at first.
+  if (res.rating) {
+    const badge = document.createElement('span');
+    badge.className = 'cardbadge';
+    badge.textContent = '★ ' + res.rating.toFixed(1);
+    art.append(badge);
+  }
+
+  const title = document.createElement('span');
+  title.className = 'cardtitle';
+  title.textContent = res.title + (res.year ? ' (' + res.year + ')' : '');
+
+  const meta = document.createElement('span');
+  meta.className = 'cardmeta';
+  const bits = [];
+  bits.push((res.verified ? '' : '~') + res.seeders + ' seed'
+            + (res.weak ? ' — too few' : ''));
+  bits.push(fmtSize(res.size));
+  meta.textContent = bits.join('  ·  ');
+
+  const flag = document.createElement('span');
+  flag.className = 'cardflag';
+  if (res.queued) flag.textContent = 'in your queue';
+  else if (!res.fits) flag.textContent = 'over your cache cap';
+
+  // Everything a card has no room for -- genre, codec, HDR, the reasoning
+  // behind the pick -- still reaches the viewer, just as a tooltip instead
+  // of a fourth line of text.
+  const tip = [];
+  if (res.genres && res.genres.length) tip.push(res.genres.slice(0, 3).join(', '));
+  tip.push(res.direct ? 'plays directly' :
+           res.codec === 'hevc' ? 'needs remux' :
+           res.codec ? res.codec + ', may need remux' : 'unknown codec');
+  if (res.hdr) tip.push('HDR');
+  const why = res.overview || (res.why || []).join(' · ');
+  if (why) tip.push(why);
+  card.title = tip.join(' · ');
+
+  card.append(art, title, meta);
+  if (flag.textContent) card.append(flag);
+
+  if (!res.queued) card.addEventListener('click', async () => {
+    card.disabled = true;
+    meta.textContent = 'adding…';
     const add = await api('/add', {links: res.magnet, client: clientId});
     (add.added || []).forEach(id => { if (!order.includes(id)) order.push(id); });
     meta.textContent = 'added to your queue';
-    row.classList.add('toobig');
+    card.classList.add('toobig');
     refresh();
   });
-  return row;
+  return card;
 }
 
 async function loadPicks(force) {
@@ -7048,14 +7082,19 @@ async function loadPicks(force) {
   $('pcount').textContent = total ? total + ' films' : '';
   if (!total) { box.textContent = 'Nothing to suggest right now.'; return; }
 
-  // A film sits on exactly one shelf, so these read as sections of a list
-  // rather than as four rankings of the same few titles.
+  // A film sits on exactly one shelf, so these read as sections -- a strip
+  // per shelf, each scrolling on its own, rather than one long list.
   shelves.forEach(shelf => {
+    const sec = document.createElement('div');
+    sec.className = 'shelf';
     const head = document.createElement('div');
-    head.className = 'rhead';
+    head.className = 'shelfhead';
     head.textContent = shelf.name + ' — ' + shelf.note;
-    box.append(head);
-    shelf.films.forEach(res => box.append(pickRow(res)));
+    const strip = document.createElement('div');
+    strip.className = 'shelfstrip';
+    shelf.films.forEach(res => strip.append(pickCard(res)));
+    sec.append(head, strip);
+    box.append(sec);
   });
 }
 

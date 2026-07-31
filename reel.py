@@ -3001,6 +3001,12 @@ def new_job(drive_id, jid=None, **extra):
            # Which file of a multi-file torrent this item is. None means "not
            # decided yet"; a pack's siblings are pinned to theirs.
            "wt_index": None,
+           # Every audio track the finished file carries, and which one is the
+           # best guess for a first play. Empty until a conversion actually
+           # probes the source; a direct-play file that needed no conversion
+           # keeps every track already and never populates this, since a
+           # browser's own audioTracks reads them straight off the container.
+           "audio_tracks": [], "audio_default": 0,
            "caps": None, "vcodec": None, "vpix": None, "play_key": None,
            "live_proc": None,
            "subs_status": None, "subs_source": None, "subs_lang": None,
@@ -3038,6 +3044,8 @@ def public(job):
             "note": job.get("note", ""),
             # Where to pick this up, or null to start at the beginning.
             "resume_at": resume_at(job["id"]),
+            "audio_tracks": job.get("audio_tracks") or [],
+            "audio_default": job.get("audio_default") or 0,
             # Only the count here. /jobs is polled every second, and shipping a
             # few hundred events per job on every poll to render a panel that
             # is usually closed would be the most expensive thing on the wire.
@@ -3525,19 +3533,62 @@ def probe_all(path, timeout=25):
     Over a torrent every byte ffprobe reads has to be fetched from peers first,
     so repeating this per property was costing real minutes. The probe size is
     capped too: the defaults read far more than is needed to identify streams.
+
+    Carries language tags and the container's own default flag now, which nothing
+    used to ask for -- probe_media() collapsed straight to "the first audio
+    stream", so a release that put a dub before the original had no signal
+    anywhere in this file saying so.
     """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error",
              "-probesize", "2000000", "-analyzeduration", "3000000",
              "-show_entries",
-             "stream=codec_type,codec_name,height,color_transfer,pix_fmt,profile:"
+             "stream=index,codec_type,codec_name,height,color_transfer,pix_fmt,"
+             "profile:stream_tags=language,title:stream_disposition=default:"
              "format=bit_rate,duration",
              "-of", "json", path], capture_output=True, text=True, timeout=timeout)
         data = _json.loads(out.stdout)
     except Exception:
         return {}
     return data
+
+
+def audio_tracks(data_or_path, timeout=25):
+    """Every audio stream in a file, in container order -- which is the order
+    ffmpeg's `-map 0:a:N` addresses and the order a browser's own audioTracks
+    list will present them in, so nothing here has to renumber anything.
+
+    Takes either a path (probes it) or probe_all's already-parsed json, so a
+    caller that already has one pass in hand does not pay for a second.
+    """
+    data = probe_all(data_or_path, timeout) if isinstance(data_or_path, str) else data_or_path
+    out = []
+    for s in data.get("streams", []):
+        if s.get("codec_type") != "audio":
+            continue
+        tags = s.get("tags", {})
+        out.append({"index": len(out), "codec": s.get("codec_name"),
+                    "lang": (tags.get("language") or "und").lower(),
+                    "title": (tags.get("title") or "")[:60],
+                    "default": bool((s.get("disposition") or {}).get("default"))})
+    return out
+
+
+def guess_audio_default(tracks):
+    """Which track to enable when nothing has chosen one yet.
+
+    Preferring 'eng' over the container's own default flag looks backwards, but
+    the flag is set by whoever packaged the release -- for a dub-first MULTi
+    release that is the dub, which is exactly the case this exists to fix.
+    """
+    for i, t in enumerate(tracks):
+        if t["lang"] == "eng":
+            return i
+    for i, t in enumerate(tracks):
+        if t["default"]:
+            return i
+    return 0
 
 
 def codecs_of(path):
@@ -4142,12 +4193,27 @@ def run_job(job):
             out = os.path.join(DL, base + ".mp4")
             # Don't re-encode audio that's already fine; it costs time and quality.
             _v, _a, _h, _hdr, _b2, _d2, _pix = probe_media(raw)
+            # Every audio track kept, not only the first. A MULTi release orders
+            # tracks however the packager chose to, and blindly taking index 0
+            # once handed a French dub for a release whose original was English,
+            # with no way to ask for anything else short of re-fetching the
+            # source -- which by the time anyone noticed was already gone.
+            atracks = audio_tracks(raw)
+            job["audio_tracks"] = atracks
+            job["audio_default"] = guess_audio_default(atracks)
+            amaps, ameta = [], []
+            for t in atracks:
+                amaps += ["-map", "0:a:%d?" % t["index"]]
+                ameta += ["-metadata:s:a:%d" % t["index"], "language=" + t["lang"]]
             # Normalised to AAC even when the video is copied. AC3 and DTS are
             # what x265 rips usually carry, and a device that decodes the video
             # may still have no idea what to do with the sound. Audio is cheap to
             # encode, so this costs seconds and makes the file universally
-            # playable for anything that can handle the picture.
-            acodec = ["-c:a", "copy"] if _a in BROWSER_AUDIO else ["-c:a", "aac"]
+            # playable for anything that can handle the picture. One track
+            # deciding for all of them, rather than per stream, keeps this the
+            # same one-line choice it always was.
+            acodec = ["-c:a", "copy"] if all(t["codec"] in BROWSER_AUDIO for t in atracks) \
+                else ["-c:a", "aac"]
             _dur = job.get("duration") or _d2
             # The whole file is here by now, so its true average rate is simply
             # size over duration. Nothing extra is read to learn it, and the
@@ -4178,18 +4244,22 @@ def run_job(job):
             r = run_with_progress(
                 job, ["ffmpeg", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
                       "-i", raw,
-                      # Only the streams we mean to keep. Left to itself ffmpeg
-                      # drags along whatever else the MKV had -- the stray
-                      # bin_data track that turned up in the last conversion.
-                      "-map", "0:v:0", "-map", "0:a:0?",
+                      # Only the streams we mean to keep, and every audio track
+                      # among them -- left to itself ffmpeg drags along whatever
+                      # else the MKV had, the stray bin_data track that turned up
+                      # in an earlier conversion, but a single -map 0:a:0? used to
+                      # drop every audio track past the first.
+                      "-map", "0:v:0", *amaps, *ameta,
                       *vfilter, *vargs, *acodec,
                       "-movflags", "+faststart", out], _dur)
             if r.returncode != 0:
                 # Fall back to a plain software encode.
                 r = subprocess.run(
-                    ["ffmpeg", "-nostdin", "-y", "-i", raw, "-c:v", "libx264",
-                     "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-                     *acodec, "-movflags", "+faststart", out],
+                    ["ffmpeg", "-nostdin", "-y", "-i", raw,
+                     "-map", "0:v:0", *amaps, *ameta,
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                     "-pix_fmt", "yuv420p", *acodec,
+                     "-movflags", "+faststart", out],
                     capture_output=True, text=True)
                 if r.returncode != 0:
                     cleanup()
@@ -5162,7 +5232,19 @@ def finalize_torrent(job, out_dir, chosen):
     job["status"] = "converting"
     v, a, h, hdr, _br, dur, pix = probe_media(src)
     dur = job.get("duration") or dur
-    acodec = ["-c:a", "copy"] if a in BROWSER_AUDIO else ["-c:a", "aac"]
+    # Every audio track kept, not only the first -- this is exactly the finalize
+    # that turned a MULTi release into whichever language its packager happened
+    # to put first in the container, with the source gone by the time it was
+    # noticed and no way back to the original short of re-fetching the torrent.
+    atracks = audio_tracks(src)
+    job["audio_tracks"] = atracks
+    job["audio_default"] = guess_audio_default(atracks)
+    amaps, ameta = [], []
+    for t in atracks:
+        amaps += ["-map", "0:a:%d?" % t["index"]]
+        ameta += ["-metadata:s:a:%d" % t["index"], "language=" + t["lang"]]
+    acodec = ["-c:a", "copy"] if all(t["codec"] in BROWSER_AUDIO for t in atracks) \
+        else ["-c:a", "aac"]
     caps = ({codec_key(v, pix)} | MP4_VIDEO) if v in MP4_VIDEO else set()
     vargs, vfilter, vnote = video_args(v, h, hdr, live=False, pix=pix, caps=caps)
     if vnote:
@@ -5171,7 +5253,7 @@ def finalize_torrent(job, out_dir, chosen):
     out = os.path.join(DL, f"{job['id']}__torrent__{safe_title}.mp4")
     r = run_with_progress(
         job, ["ffmpeg", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
-              "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+              "-i", src, "-map", "0:v:0", *amaps, *ameta,
               *vfilter, *vargs, *acodec, "-movflags", "+faststart", out], dur)
 
     if job["cancel"].is_set():
@@ -5439,9 +5521,15 @@ def start_compat(job):
     _v, _a, _h, _hdr, _br, dur, _pix = probe_media(src)
     acodec = ["-c:a", "copy"] if _a in BROWSER_AUDIO else ["-c:a", "aac", "-ac", "2"]
     vargs, vfilter, _n = video_args(_v, _h, _hdr, pix=_pix, caps=set(BROWSER_VIDEO))
+    # This rendition is a single-track fallback for a client that cannot decode
+    # what was kept, not a place to offer a language choice -- but it should
+    # still be the guessed-best track rather than blindly whichever the
+    # container lists first, which is what left a compat viewer on a French
+    # dub too.
+    sel = job.get("audio_default") or 0
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
            "-progress", "pipe:1", "-nostats", "-i", src,
-           "-map", "0:v:0", "-map", "0:a:0?", *vfilter, *vargs, *acodec,
+           "-map", "0:v:0", "-map", "0:a:%d?" % sel, *vfilter, *vargs, *acodec,
            "-f", "mp4",
            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
            "-frag_duration", "1500000", "-flush_packets", "1", out]
@@ -6356,6 +6444,21 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .logline{display:flex;gap:10px;align-items:baseline}
   .logat{color:var(--faint);flex:0 0 auto;min-width:46px;text-align:right;
     font-variant-numeric:tabular-nums}
+  .moreBtn{font:400 13px/1 var(--mono);color:var(--faint);
+    background:none;border:1px solid var(--rule);border-radius:3px;
+    padding:3px 7px}
+  .moreBtn:hover{color:var(--text);border-color:var(--dim)}
+  .moreBtn.on{color:var(--brass);border-color:var(--brass)}
+  .morepanel{grid-column:1/-1;margin:8px 0 2px;padding:8px 10px;
+    background:var(--ink);border:1px solid var(--rule);border-radius:4px;
+    font:400 11.5px/1.6 var(--mono);color:var(--dim)}
+  .morehead{font:500 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+    color:var(--faint);margin-bottom:6px}
+  .moreopt{display:block;width:100%;text-align:left;padding:6px 8px;
+    background:none;border:none;border-radius:3px;color:var(--dim);font-size:12px}
+  .moreopt:hover{background:var(--panel);color:var(--text)}
+  .moreopt.on{color:var(--brass)}
+  .moreopt.on::before{content:'✓ '}
   li.row.live{background:var(--panel)}
   li.row.live .n{color:var(--brass)}
   li.row.live .title{color:var(--text)}
@@ -7096,6 +7199,83 @@ function applySeek() {
   cue.classList.remove('none');
 }
 v.addEventListener('loadedmetadata', applySeek);
+v.addEventListener('loadedmetadata', () => {
+  const j = byId(order[cur]);
+  if (j) applyAudioChoice(j);
+});
+
+/* Audio language ------------------------------------------------------------
+   A MULTi release orders its tracks however the packager chose to, and the
+   server no longer decides for you: every track is kept, tagged with its
+   language. Switching is the browser's own AudioTrack.enabled flag, so it
+   takes effect instantly with nothing to re-fetch or re-encode.
+
+   Whether that flag actually works is not something to assume -- it is
+   feature-detected here, the same way PiP and AirPlay hide themselves when
+   the browser lacks the capability, rather than guessed from the user agent.
+   Checked on a bare element, since capability does not depend on what is
+   currently loaded. */
+const HAS_AUDIO_TRACKS = 'audioTracks' in document.createElement('video');
+
+const LANG_NAMES = {eng:'English', fre:'French', fra:'French', ger:'German',
+  deu:'German', spa:'Spanish', ita:'Italian', por:'Portuguese', rus:'Russian',
+  jpn:'Japanese', kor:'Korean', chi:'Chinese', zho:'Chinese', ara:'Arabic',
+  hin:'Hindi', dut:'Dutch', nld:'Dutch', pol:'Polish', tur:'Turkish',
+  swe:'Swedish', dan:'Danish', fin:'Finnish', nor:'Norwegian', ces:'Czech',
+  cze:'Czech', ell:'Greek', gre:'Greek', heb:'Hebrew', tha:'Thai',
+  vie:'Vietnamese', ind:'Indonesian', und:'Unknown language'};
+const langName = code => LANG_NAMES[(code || 'und').toLowerCase()] || (code || 'Unknown').toUpperCase();
+
+function audioKey(id) { return 'reel.audio.' + id; }
+
+function wantedAudioIndex(j) {
+  let saved = null;
+  try { saved = localStorage.getItem(audioKey(j.id)); } catch (e) {}
+  const i = saved === null ? j.audio_default || 0 : parseInt(saved, 10);
+  return (j.audio_tracks || [])[i] ? i : (j.audio_default || 0);
+}
+
+// Applied once per load, same moment the subtitle restore runs -- both are
+// "what was chosen for this item last time," and audioTracks is populated by
+// the same point loadedmetadata fires.
+function applyAudioChoice(j) {
+  if (!HAS_AUDIO_TRACKS || !v.audioTracks || v.audioTracks.length < 2) return;
+  const want = wantedAudioIndex(j);
+  for (let i = 0; i < v.audioTracks.length; i++) v.audioTracks[i].enabled = (i === want);
+}
+
+function fillAudioMenu(id, el) {
+  const j = byId(id);
+  const box = el.morepanel;
+  box.textContent = '';
+  const tracks = (j && j.audio_tracks) || [];
+  if (!HAS_AUDIO_TRACKS) {
+    box.textContent = 'This browser cannot switch audio tracks.';
+    return;
+  }
+  if (tracks.length < 2) {
+    box.textContent = 'Only one audio track.';
+    return;
+  }
+  const head = document.createElement('div');
+  head.className = 'morehead';
+  head.textContent = 'Audio language';
+  box.append(head);
+  const want = wantedAudioIndex(j);
+  tracks.forEach(t => {
+    const opt = document.createElement('button');
+    opt.type = 'button';
+    opt.className = 'moreopt' + (t.index === want ? ' on' : '');
+    opt.textContent = langName(t.lang) + (t.title ? ' — ' + t.title : '');
+    opt.addEventListener('click', ev => {
+      ev.stopPropagation();
+      try { localStorage.setItem(audioKey(id), String(t.index)); } catch (e) {}
+      if (order[cur] === id) applyAudioChoice(j);   // takes effect immediately
+      fillAudioMenu(id, el);                        // repaint the checkmark
+    });
+    box.append(opt);
+  });
+}
 
 v.addEventListener('play', () => { wantPlay = true; });
 v.addEventListener('pause', () => { if (!v.ended) wantPlay = false; });
@@ -7174,22 +7354,33 @@ function makeRow(id) {
     '<span class="track"><i></i></span><span class="note"></span></span>' +
     '<span class="flags"><span class="cc"></span><span class="eyes"></span>' +
     '<button class="logbtn" type="button" hidden aria-label="Show this item\'s log">log</button>' +
+    '<button class="moreBtn" type="button" hidden aria-label="More options">&#8942;</button>' +
     '<span class="kind"></span><span class="stat"></span></span>' +
     '<button class="kill" type="button" aria-label="Remove">&times;</button>' +
-    '<div class="logpanel" hidden></div>';
+    '<div class="logpanel" hidden></div>' +
+    '<div class="morepanel" hidden></div>';
   const el = {li, n: li.querySelector('.n'), title: li.querySelector('.title'),
               track: li.querySelector('.track'), fill: li.querySelector('.track i'),
               note: li.querySelector('.note'), kind: li.querySelector('.kind'),
               eyes: li.querySelector('.eyes'), cc: li.querySelector('.cc'),
               stat: li.querySelector('.stat'), kill: li.querySelector('.kill'),
               logbtn: li.querySelector('.logbtn'),
-              logpanel: li.querySelector('.logpanel')};
+              logpanel: li.querySelector('.logpanel'),
+              moreBtn: li.querySelector('.moreBtn'),
+              morepanel: li.querySelector('.morepanel')};
   el.logbtn.addEventListener('click', ev => {
     ev.stopPropagation();                 // the row itself means "play"
     const open = el.logpanel.hidden;
     el.logpanel.hidden = !open;
     el.logbtn.classList.toggle('on', open);
     if (open) loadLog(id, el);
+  });
+  el.moreBtn.addEventListener('click', ev => {
+    ev.stopPropagation();
+    const open = el.morepanel.hidden;
+    el.morepanel.hidden = !open;
+    el.moreBtn.classList.toggle('on', open);
+    if (open) fillAudioMenu(id, el);
   });
   li.addEventListener('click', ev => {
     if (ev.target === el.kill) return;
@@ -7288,6 +7479,13 @@ function paint() {
     // Refresh an open panel as the job goes on, so a stall can be watched
     // rather than reopened.
     if (!el.logpanel.hidden && el.logShown !== j.log_n) loadLog(id, el);
+    // Hidden until there is an actual choice to make, and until the browser
+    // has said it can act on one -- a track list nobody can switch between is
+    // not an option, it is a label.
+    const nTracks = (j.audio_tracks || []).length;
+    el.moreBtn.hidden = !(HAS_AUDIO_TRACKS && nTracks > 1);
+    if (!el.morepanel.hidden && el.moreShown !== nTracks) fillAudioMenu(id, el);
+    el.moreShown = nTracks;
     el.note.textContent = j.error || (j.paused ? j.note : '');
     el.note.classList.toggle('quiet', !j.error && !!j.paused);
     el.note.style.display = j.error ? 'block' : 'none';

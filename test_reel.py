@@ -1688,6 +1688,84 @@ class TestResume(Base):
 
 
 # --------------------------------------------------------------------------
+class TestAudioTracks(Base):
+    def test_tracks_come_back_in_container_order(self):
+        data = {"streams": [
+            {"codec_type": "video", "codec_name": "h264"},
+            {"codec_type": "audio", "codec_name": "aac", "tags": {"language": "fre"}},
+            {"codec_type": "audio", "codec_name": "aac", "tags": {"language": "eng"}},
+        ]}
+        got = self.m.audio_tracks(data)
+        self.assertEqual([t["lang"] for t in got], ["fre", "eng"])
+        # The index is the audio-relative position, which is exactly what
+        # ffmpeg's -map 0:a:N addresses -- not the container's own stream index.
+        self.assertEqual([t["index"] for t in got], [0, 1])
+
+    def test_an_untagged_track_reads_as_undetermined_not_english(self):
+        data = {"streams": [{"codec_type": "audio", "codec_name": "aac", "tags": {}}]}
+        self.assertEqual(self.m.audio_tracks(data)[0]["lang"], "und")
+
+    def test_english_is_preferred_over_the_containers_own_default_flag(self):
+        # The real bug: a MULTi release had its French track flagged default by
+        # whoever packaged it, and French is exactly what should not win.
+        tracks = [{"index": 0, "lang": "fre", "default": True},
+                  {"index": 1, "lang": "eng", "default": False}]
+        self.assertEqual(self.m.guess_audio_default(tracks), 1)
+
+    def test_the_default_flag_only_matters_absent_an_english_track(self):
+        tracks = [{"index": 0, "lang": "jpn", "default": False},
+                  {"index": 1, "lang": "fre", "default": True}]
+        self.assertEqual(self.m.guess_audio_default(tracks), 1)
+
+    def test_absent_either_signal_the_first_track_is_kept(self):
+        tracks = [{"index": 0, "lang": "und", "default": False},
+                  {"index": 1, "lang": "und", "default": False}]
+        self.assertEqual(self.m.guess_audio_default(tracks), 0)
+
+    def test_a_single_track_is_its_own_default(self):
+        self.assertEqual(self.m.guess_audio_default(
+            [{"index": 0, "lang": "und", "default": False}]), 0)
+
+    def test_no_tracks_does_not_crash(self):
+        self.assertEqual(self.m.guess_audio_default([]), 0)
+
+    @needs_ffmpeg
+    def test_every_track_survives_a_real_conversion(self):
+        # The actual bug, reproduced: a MULTi release with French ordered first
+        # and English second. Runs the real ffmpeg command finalize_torrent
+        # builds and checks what came out the other end, not just the argv.
+        src = os.path.join(self.dl, "multi.mkv")
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=5:d=1",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+             "-f", "lavfi", "-i", "sine=frequency=880:duration=1",
+             "-map", "0:v", "-map", "1:a", "-map", "2:a",
+             "-c:v", "libx264", "-c:a", "aac",
+             "-metadata:s:a:0", "language=fre", "-metadata:s:a:1", "language=eng",
+             src], check=True, capture_output=True)
+
+        tracks = self.m.audio_tracks(src)
+        self.assertEqual([t["lang"] for t in tracks], ["fre", "eng"])
+        self.assertEqual(self.m.guess_audio_default(tracks), 1)   # English, not first
+
+        amaps, ameta = [], []
+        for t in tracks:
+            amaps += ["-map", "0:a:%d?" % t["index"]]
+            ameta += ["-metadata:s:a:%d" % t["index"], "language=" + t["lang"]]
+        out = os.path.join(self.dl, "multi_out.mp4")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src,
+             "-map", "0:v:0", *amaps, *ameta, "-c:v", "copy", "-c:a", "copy", out],
+            capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        kept = self.m.audio_tracks(out)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual([t["lang"] for t in kept], ["fre", "eng"])
+
+
+# --------------------------------------------------------------------------
 class TestJobLog(Base):
     def test_events_are_kept_in_order_with_timestamps(self):
         j = self.job()

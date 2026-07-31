@@ -3446,10 +3446,19 @@ def restore():
             JOBS[jid] = new_job(did, jid=jid, status="evicted", restored=True,
                                 hold=False, title=title, **extra)
             continue
+        kind = "audio" if name.lower().endswith(".mp3") else "video"
+        # audio_tracks lives only on the in-memory job, never on disk, so a
+        # restart otherwise loses it even for a file that was converted with
+        # every track kept -- the language menu vanishes and playback falls
+        # back to index 0, which for a MULTi release can be the wrong
+        # language. One more ffprobe pass here, the same one finalize_torrent
+        # and run_job already pay at conversion time, fixes that.
+        atracks = audio_tracks(p) if kind == "video" else []
         JOBS[jid] = new_job(did, jid=jid, path=p, total=size, received=size,
                             status="done", restored=True, hold=False,
-                            title=title, **extra,
-                            kind="audio" if name.lower().endswith(".mp3") else "video")
+                            title=title, audio_tracks=atracks,
+                            audio_default=guess_audio_default(atracks),
+                            **extra, kind=kind)
 
     # Second pass for subtitle sidecars, now that every job is known. One whose
     # job didn't come back is an orphan: it can never be reached, and leaving it

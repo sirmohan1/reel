@@ -549,6 +549,38 @@ class TestRestore(Base):
         self.m.restore()
         self.assertFalse(os.path.exists(os.path.join(self.dl, "x.live.mp4")))
 
+    def test_audio_tracks_are_reprobed_on_restore(self):
+        # audio_tracks lives only on the in-memory job, not on disk -- a real
+        # Supergirl download had three tracks correctly kept at conversion
+        # time (fre default, fre, eng), then lost the whole language menu and
+        # fell back to French on the very next restart, because restore()
+        # never re-ran the probe that conversion pays for once.
+        p = os.path.join(self.dl, "abc__driveid__A Show.mp4")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 100)
+        self.m.JOBS.clear()
+        self.m.playable = lambda _p: True
+        self.m.audio_tracks = lambda p: [
+            {"index": 0, "lang": "fre", "default": True},
+            {"index": 1, "lang": "eng", "default": False}]
+        self.m.restore()
+        job = self.m.JOBS["abc"]
+        self.assertEqual(len(job["audio_tracks"]), 2)
+        self.assertEqual(job["audio_default"], 1)   # English, despite the
+                                                     # container's own flag
+
+    def test_an_audio_only_file_is_not_probed_for_audio_tracks(self):
+        p = os.path.join(self.dl, "abc__driveid__A Song.mp3")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 100)
+        self.m.JOBS.clear()
+        self.m.playable = lambda _p: True
+        calls = []
+        self.m.audio_tracks = lambda p: calls.append(p) or []
+        self.m.restore()
+        self.assertEqual(calls, [])
+        self.assertEqual(self.m.JOBS["abc"]["audio_tracks"], [])
+
 
 # --------------------------------------------------------------------------
 class TestLanAddress(Base):

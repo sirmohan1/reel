@@ -17,3 +17,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Never the API key.
+.reel_tmdb_key
+*.key

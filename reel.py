@@ -2298,6 +2298,216 @@ def recommendations(force=False):
         return FEED_CACHE["rows"], FEED_CACHE["error"], FEED_CACHE["sources"]
 
 
+# Catalogue search. The torrent indexers match filenames, and a filename says
+# nothing about genre or cast -- so "a well-reviewed sci-fi film from the
+# eighties" is unanswerable no matter how the query is phrased. TMDb answers it
+# in one request, and the torrent search then only has to find a copy of a film
+# already chosen.
+#
+# The first credential this file has ever needed. Everything else was picked to
+# avoid one -- OpenSubtitles over the keyed alternatives, IMDb's dumps over its
+# API -- but there is no keyless source of cast and genre data at a size worth
+# downloading, and 740 MB of title.principals to answer "films with this actor"
+# is not a trade worth making. Absent a key this behaves exactly as before.
+TMDB_URL = "https://api.themoviedb.org/3"
+TMDB_KEY_FILE = os.path.expanduser("~/.reel_tmdb_key")
+TMDB_TIMEOUT = 12
+TMDB_LIMIT = 20                  # catalogue rows kept
+TMDB_AVAIL = 12                  # of those, how many get looked for on a tracker
+TMDB_MIN_VOTES = 200             # below this a rating is noise, as on the shelves
+_TMDB = {}
+
+
+def tmdb_key():
+    """The key, from the environment or a file beside it. Cached, including the
+    absence of one, so a machine without it pays nothing per call."""
+    if "key" not in _TMDB:
+        key = (os.environ.get("REEL_TMDB_KEY") or "").strip()
+        if not key:
+            try:
+                with open(TMDB_KEY_FILE) as f:
+                    key = f.read().strip()
+            except OSError:
+                key = ""
+        _TMDB["key"] = key
+    return _TMDB["key"]
+
+
+def has_tmdb():
+    return bool(tmdb_key())
+
+
+def tmdb_get(path, **params):
+    """One request. Returns parsed json, or None -- a catalogue that cannot be
+    reached has to read as "no results", never as a broken search."""
+    key = tmdb_key()
+    if not key:
+        return None
+    params["api_key"] = key
+    url = "%s/%s?%s" % (TMDB_URL, path.lstrip("/"), urllib.parse.urlencode(
+        {k: v for k, v in params.items() if v not in (None, "")}))
+    # Retried once, because these were observed failing in a batch immediately
+    # after a dozen parallel indexer lookups and succeeding again seconds later
+    # -- transient, and a whole search reading as "no results" over one hiccup
+    # is a poor trade for one extra request.
+    for attempt in (0, 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
+            with urllib.request.urlopen(req, timeout=TMDB_TIMEOUT) as r:
+                return _json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:
+            if attempt:
+                return None
+            time.sleep(0.4)
+    return None
+
+
+def tmdb_genres(kind="movie"):
+    """{lowercase name: id}, fetched once. The api takes ids, people say words."""
+    ck = "genres_" + kind
+    if ck not in _TMDB:
+        data = tmdb_get("genre/%s/list" % kind) or {}
+        _TMDB[ck] = {g["name"].lower(): g["id"]
+                     for g in data.get("genres", []) if g.get("name")}
+    return _TMDB[ck]
+
+
+def tmdb_person(name):
+    """A person id from a name, or None. Cast filtering needs the id."""
+    data = tmdb_get("search/person", query=(name or "").strip())
+    for row in (data or {}).get("results", []):
+        if row.get("id"):
+            return row["id"], row.get("name") or name
+    return None, None
+
+
+def catalogue_search(q):
+    """Films and shows matching a set of filters, best first.
+
+    q keys: kind, genre, actor, year_from, year_to, rating_min, votes_min, text.
+    Returns (rows, error, note).
+    """
+    if not has_tmdb():
+        return [], "no TMDb key, so genre and cast search is unavailable", ""
+    kind = "tv" if (q.get("kind") or "movie").lower().startswith("tv") else "movie"
+    note = []
+
+    params = {"sort_by": "vote_average.desc", "include_adult": "false",
+              "vote_count.gte": int(q.get("votes_min") or TMDB_MIN_VOTES)}
+    if q.get("rating_min"):
+        params["vote_average.gte"] = q["rating_min"]
+
+    # Movies and shows do not share a date field, nor a title field, which is
+    # the sort of difference that reads as "no results" rather than as a bug.
+    date_key = "first_air_date" if kind == "tv" else "primary_release_date"
+    if q.get("year_from"):
+        params[date_key + ".gte"] = "%d-01-01" % int(q["year_from"])
+    if q.get("year_to"):
+        params[date_key + ".lte"] = "%d-12-31" % int(q["year_to"])
+
+    if q.get("genre"):
+        gid = tmdb_genres(kind).get(str(q["genre"]).strip().lower())
+        if gid:
+            params["with_genres"] = gid
+        else:
+            note.append("unknown genre %r" % q["genre"])
+
+    if q.get("actor"):
+        pid, real = tmdb_person(q["actor"])
+        if not pid:
+            return [], "no one found called %r" % q["actor"], ""
+        # Cast filtering is with_cast on films and with_people on shows.
+        params["with_cast" if kind == "movie" else "with_people"] = pid
+        note.append("cast: " + real)
+
+    # Free text cannot be combined with discover's filters, so a query with both
+    # searches by name and then applies what it can locally.
+    if (q.get("text") or "").strip():
+        data = tmdb_get("search/%s" % kind, query=q["text"].strip(),
+                        include_adult="false")
+        rows = (data or {}).get("results", [])
+        lo = float(q.get("rating_min") or 0)
+        rows = [r for r in rows if (r.get("vote_average") or 0) >= lo]
+    else:
+        data = tmdb_get("discover/%s" % kind, **params)
+        rows = (data or {}).get("results", [])
+
+    if data is None:
+        return [], "could not reach the catalogue", ""
+
+    out = []
+    names = {v: k.title() for k, v in tmdb_genres(kind).items()}
+    for r in rows[:TMDB_LIMIT]:
+        date = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+        out.append({
+            "tmdb_id": r.get("id"), "kind": kind,
+            "title": r.get("title") or r.get("name") or "",
+            "year": int(date) if date.isdigit() else None,
+            "rating": round(float(r.get("vote_average") or 0), 1) or None,
+            "votes": int(r.get("vote_count") or 0),
+            "overview": (r.get("overview") or "")[:400],
+            "genres": [names.get(g) for g in (r.get("genre_ids") or []) if names.get(g)],
+        })
+    return [r for r in out if r["title"]], None, "; ".join(note)
+
+
+def find_torrent(title, year=None):
+    """The best copy of a named film on any indexer, or None.
+
+    The catalogue chose the film, so this only has to find it -- and has to
+    refuse near misses, since a search for one title cheerfully returns others.
+    """
+    rows, _per = search_all(("%s %s" % (title, year)) if year else title)
+    want = _norm_title(title)
+    keep = []
+    for r in rows:
+        if feed_cam(r["name"]) or feed_pack(r["name"], r.get("files")):
+            continue
+        got, got_year = feed_title(r["name"])
+        if want and want not in _norm_title(got):
+            continue
+        # A year either side, since release names and release dates disagree
+        # across territories more often than they agree exactly.
+        if year and got_year and abs(got_year - year) > 1:
+            continue
+        keep.append(r)
+    if not keep:
+        return None
+    keep.sort(key=lambda r: (not read_release(r["name"])["direct"], -r["seeders"]))
+    return keep[0]
+
+
+def catalogue_with_copies(q):
+    """Catalogue results, with a torrent attached to those that have one."""
+    rows, err, note = catalogue_search(q)
+    if not rows:
+        return rows, err, note
+
+    def look(row):
+        try:
+            hit = find_torrent(row["title"], row["year"])
+        except Exception:
+            hit = None
+        if hit:
+            info = read_release(hit["name"])
+            row.update(magnet=hit["magnet"], seeders=hit["seeders"],
+                       size=hit["size"], release=hit["name"], **info)
+        row["available"] = bool(hit)
+
+    threads = [threading.Thread(target=look, args=(r,), daemon=True)
+               for r in rows[:TMDB_AVAIL]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT + 4)
+    for r in rows:
+        r.setdefault("available", None)      # None = never looked
+    # Something you can actually watch outranks something you cannot.
+    rows.sort(key=lambda r: (r.get("available") is not True,
+                             -(r.get("rating") or 0)))
+    return rows, err, note
+
+
 def split_sources(text):
     """Pull magnets out first, then treat what's left as Drive links.
 
@@ -5243,6 +5453,11 @@ class H(http.server.BaseHTTPRequestHandler):
         elif p == "/sys":
             self._json(200, {"rclone": has_rclone(), "ffmpeg": has_ffmpeg(),
                              "webtorrent": has_webtorrent(),
+                             # Whether genre and cast search can work at all.
+                             # Without a key the filters are hidden rather than
+                             # offered and then refused.
+                             "tmdb": has_tmdb(),
+                             "genres": sorted(tmdb_genres("movie")) if has_tmdb() else [],
                              "cap_gb": CACHE_CAP_GB,
                              "used_gb": round(folder_size_bytes() / GB, 3),
                              # null tells the client there's nothing to scan:
@@ -5286,6 +5501,12 @@ class H(http.server.BaseHTTPRequestHandler):
             results, err, dropped, per = search_torrents(body.get("q"))
             return self._json(200, {"results": results, "error": err,
                                     "dropped": dropped, "sources": per})
+
+        if p == "/find":
+            # Nothing starts here: this only looks, and a chosen row goes
+            # through /add like anything else.
+            rows, err, note = catalogue_with_copies(body or {})
+            return self._json(200, {"results": rows, "error": err, "note": note})
 
         if p == "/feed":
             # Nothing starts here either -- this only suggests. Chosen rows go
@@ -5738,6 +5959,23 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   button:hover:not(:disabled){border-color:#3B434C;background:#22272C}
   button:disabled{color:var(--faint);cursor:default}
 
+  /* catalogue filters */
+  .filttog{margin-top:10px}
+  .filters{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 14px;
+    margin-top:10px;padding:12px 14px;background:var(--panel);
+    border:1px solid var(--rule);border-radius:6px}
+  .filters label{display:flex;flex-direction:column;gap:5px;
+    font:500 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+    color:var(--faint)}
+  .filters input,.filters select{background:var(--ink);border:1px solid var(--rule);
+    border-radius:4px;color:var(--text);font-family:var(--mono);font-size:12px;
+    height:30px;padding:0 8px}
+  .filters input[type=number]{width:78px}
+  .filters #factor{width:150px}
+  .filters label:has(#fyfrom){flex-direction:row;align-items:flex-end;gap:6px;
+    flex-wrap:wrap}
+  .filters button{height:30px;padding:0 14px;font-size:12px;margin-left:auto}
+
   /* search results */
   .results{margin-top:10px;background:var(--panel);border:1px solid var(--rule);
     border-radius:5px;padding:6px;max-height:340px;overflow-y:auto;
@@ -5946,6 +6184,18 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <textarea id="links" rows="1" placeholder="Search by name, or paste Drive links / magnet URIs"></textarea>
     <button type="submit">Add</button>
   </form>
+  <button class="pickbtn filttog" id="filttog" type="button" hidden aria-expanded="false">Filters</button>
+  <div class="filters" id="filters" hidden>
+    <label>Kind
+      <select id="fkind"><option value="movie">Movie</option><option value="tv">TV show</option></select>
+    </label>
+    <label>Genre <select id="fgenre"><option value="">Any</option></select></label>
+    <label>Actor <input id="factor" type="text" placeholder="anyone" autocomplete="off"></label>
+    <label>Years <input id="fyfrom" type="number" min="1900" max="2100" placeholder="from">
+                 <input id="fyto" type="number" min="1900" max="2100" placeholder="to"></label>
+    <label>Rating at least <input id="frating" type="number" min="0" max="10" step="0.5" placeholder="any"></label>
+    <button id="findgo" type="button">Find</button>
+  </div>
   <div class="results" id="results" hidden></div>
 
   <!-- Two columns on a wide screen, one on a narrow one. The order here is the
@@ -6205,6 +6455,99 @@ async function runSearch(q) {
     box.append(row);
   });
 }
+
+/* catalogue search --------------------------------------------------------
+   The indexers match filenames, so "a well-reviewed sci-fi film from the
+   eighties" is unanswerable there however it is phrased. This asks a catalogue
+   which films those are, then looks for a copy of each. Hidden entirely when
+   there is no key, rather than offered and then refused. */
+$('filttog').addEventListener('click', () => {
+  const box = $('filters'), open = box.hidden;
+  box.hidden = !open;
+  $('filttog').setAttribute('aria-expanded', open ? 'true' : 'false');
+});
+
+function fillGenres(list) {
+  const sel = $('fgenre');
+  if (sel.dataset.filled || !list || !list.length) return;
+  list.forEach(g => {
+    const o = document.createElement('option');
+    o.value = g; o.textContent = g.replace(/\b\w/g, c => c.toUpperCase());
+    sel.append(o);
+  });
+  sel.dataset.filled = '1';
+}
+
+async function runFind() {
+  const box = $('results');
+  box.hidden = false;
+  box.textContent = 'Searching the catalogue…';
+  const q = {kind: $('fkind').value, genre: $('fgenre').value,
+             actor: $('factor').value.trim(), year_from: $('fyfrom').value,
+             year_to: $('fyto').value, rating_min: $('frating').value,
+             text: ta.value.trim()};
+  let r;
+  try { r = await api('/find', q); }
+  catch (e) { box.textContent = 'Catalogue search failed.'; return; }
+  box.textContent = '';
+  if (r.error) { box.textContent = r.error; return; }
+  const rows = r.results || [];
+  if (!rows.length) { box.textContent = 'Nothing matched those filters.'; return; }
+
+  const head = document.createElement('div');
+  head.className = 'rhead';
+  head.textContent = rows.length + ' from the catalogue'
+      + (r.note ? ' · ' + r.note : '') + ' · with a copy first';
+  box.append(head);
+
+  rows.forEach(res => {
+    const row = document.createElement('button');
+    row.className = 'rrow';
+    row.type = 'button';
+    // Nothing to press play on, so it reads as unavailable rather than broken.
+    if (!res.available) row.classList.add('toobig');
+    row.disabled = !res.available;
+
+    const title = document.createElement('span');
+    title.className = 'rtitle';
+    title.textContent = res.title + (res.year ? ' (' + res.year + ')' : '');
+
+    const meta = document.createElement('span');
+    meta.className = 'rmeta';
+    const bits = [];
+    bits.push(res.rating ? '★ ' + res.rating.toFixed(1)
+              + (res.votes ? ' (' + res.votes.toLocaleString() + ')' : '') : 'no rating');
+    if (res.genres && res.genres.length) bits.push(res.genres.slice(0, 3).join(', '));
+    if (res.available) {
+      bits.push('~' + res.seeders + ' seed', fmtSize(res.size));
+      bits.push(res.direct ? 'plays directly' :
+                res.codec === 'hevc' ? 'needs remux' : 'may need remux');
+    } else if (res.available === false) {
+      bits.push('no copy found');
+    } else {
+      bits.push('not looked for yet');
+    }
+    meta.textContent = bits.join('  ·  ');
+
+    const why = document.createElement('span');
+    why.className = 'rwhy';
+    why.textContent = res.overview || '';
+
+    row.append(title, meta);
+    if (why.textContent) row.append(why);
+    if (res.available) row.addEventListener('click', async () => {
+      row.disabled = true;
+      title.textContent = 'Adding: ' + res.title;
+      const add = await api('/add', {links: res.magnet, client: clientId});
+      (add.added || []).forEach(id => { if (!order.includes(id)) order.push(id); });
+      box.hidden = true; box.textContent = '';
+      ta.value = ''; grow();
+      refresh();
+    });
+    box.append(row);
+  });
+}
+$('findgo').addEventListener('click', runFind);
 
 /* picks --------------------------------------------------------------------
    A shelf rather than a search: what to watch, when you don't already know.
@@ -6855,6 +7198,10 @@ async function pollSys() {
     $('qrbtn').hidden = !s.lan_url;
     lanUrl = s.lan_url || null;
     if (!lanUrl) { $('qrpop').hidden = true; qrLoaded = false; }
+    // No key, no genre or cast search -- so the control is absent rather than
+    // present and disappointing.
+    $('filttog').hidden = !s.tmdb;
+    if (s.tmdb) fillGenres(s.genres);
   } catch (e) {
     $('led').classList.remove('on');
     $('statetext').textContent = 'server offline';

@@ -1150,6 +1150,147 @@ class TestSecondInstance(Base):
 
 
 # --------------------------------------------------------------------------
+class TestCatalogue(Base):
+    """TMDb-backed search with stubbed responses: no key, no network."""
+
+    def setUp(self):
+        super().setUp()
+        self.m.TMDB_KEY_FILE = os.path.join(self.dl, "nokey")
+        self.m._TMDB.clear()
+        self.m._TMDB["key"] = "test-key"
+        self.calls = []
+        self.m.tmdb_genres = lambda kind="movie": {
+            "science fiction": 878, "horror": 27, "drama": 18}
+
+    def stub(self, payload):
+        def fake(path, **params):
+            self.calls.append((path, params))
+            return payload(path, params) if callable(payload) else payload
+        self.m.tmdb_get = fake
+
+    def movie(self, title, year, rating=8.0, votes=5000, genres=(878,)):
+        return {"id": 1, "title": title, "release_date": "%d-01-01" % year,
+                "vote_average": rating, "vote_count": votes,
+                "genre_ids": list(genres), "overview": "A film."}
+
+    def test_filters_become_query_parameters(self):
+        self.stub({"results": []})
+        self.m.catalogue_search({"kind": "movie", "genre": "horror",
+                                 "year_from": 1980, "year_to": 1989,
+                                 "rating_min": 7.5, "votes_min": 900})
+        path, p = self.calls[-1]
+        self.assertEqual(path, "discover/movie")
+        self.assertEqual(p["with_genres"], 27)
+        self.assertEqual(p["vote_average.gte"], 7.5)
+        self.assertEqual(p["vote_count.gte"], 900)
+        self.assertEqual(p["primary_release_date.gte"], "1980-01-01")
+        self.assertEqual(p["primary_release_date.lte"], "1989-12-31")
+
+    def test_television_uses_its_own_field_names(self):
+        # Shows carry name and first_air_date where films carry title and
+        # primary_release_date. Getting it wrong reads as "no results" rather
+        # than as an error, which is why it is worth pinning.
+        self.stub({"results": [{"id": 2, "name": "Some Show",
+                                "first_air_date": "2016-05-01",
+                                "vote_average": 8.5, "vote_count": 900,
+                                "genre_ids": [18], "overview": ""}]})
+        rows, err, _ = self.m.catalogue_search({"kind": "tv", "year_from": 2015})
+        path, p = self.calls[-1]
+        self.assertEqual(path, "discover/tv")
+        self.assertIn("first_air_date.gte", p)
+        self.assertEqual(rows[0]["title"], "Some Show")
+        self.assertEqual(rows[0]["year"], 2016)
+
+    def test_an_actor_becomes_a_cast_id(self):
+        self.m.tmdb_person = lambda n: (3063, "Tilda Swinton")
+        self.stub({"results": []})
+        _rows, _err, note = self.m.catalogue_search({"actor": "tilda swinton"})
+        self.assertEqual(self.calls[-1][1]["with_cast"], 3063)
+        self.assertIn("Tilda Swinton", note)
+
+    def test_an_unknown_person_is_said_so(self):
+        self.m.tmdb_person = lambda n: (None, None)
+        self.stub({"results": []})
+        rows, err, _ = self.m.catalogue_search({"actor": "nobody at all"})
+        self.assertEqual(rows, [])
+        self.assertIn("nobody at all", err)
+
+    def test_an_unknown_genre_is_noted_not_fatal(self):
+        # Dropping the filter and saying so beats returning nothing.
+        self.stub({"results": [self.movie("Something", 2020)]})
+        rows, err, note = self.m.catalogue_search({"genre": "wuxia"})
+        self.assertIsNone(err)
+        self.assertTrue(rows)
+        self.assertIn("wuxia", note)
+        self.assertNotIn("with_genres", self.calls[-1][1])
+
+    def test_free_text_searches_by_name_instead(self):
+        # discover cannot take a title, so a query with text has to switch
+        # endpoints rather than silently ignore it.
+        self.stub({"results": [self.movie("Zindagi Na Milegi Dobara", 2011, 7.6)]})
+        rows, _err, _ = self.m.catalogue_search({"text": "zindagi"})
+        self.assertEqual(self.calls[-1][0], "search/movie")
+        self.assertEqual(rows[0]["title"], "Zindagi Na Milegi Dobara")
+
+    def test_an_unreachable_catalogue_is_not_a_crash(self):
+        self.m.tmdb_get = lambda path, **p: None
+        rows, err, _ = self.m.catalogue_search({"genre": "horror"})
+        self.assertEqual(rows, [])
+        self.assertIn("could not reach", err)
+
+    def test_without_a_key_the_feature_says_so(self):
+        self.m._TMDB.clear()
+        self.m._TMDB["key"] = ""
+        rows, err, _ = self.m.catalogue_search({"genre": "horror"})
+        self.assertEqual(rows, [])
+        self.assertIn("no TMDb key", err)
+        self.assertFalse(self.m.has_tmdb())
+
+    def test_a_copy_of_the_wrong_film_is_refused(self):
+        # A search for one title cheerfully returns others, and the catalogue
+        # already decided which film this is.
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40, "name": "Some.Other.Film.2019.1080p.H264-GRP",
+             "seeders": 900, "leechers": 1, "size": 2_000_000_000, "files": 1,
+             "magnet": "magnet:?xt=urn:btih:" + "a" * 40},
+        ], {})
+        self.assertIsNone(self.m.find_torrent("The Thing", 1982))
+
+    def test_the_right_film_is_matched_across_a_year_of_drift(self):
+        # Release names and release dates disagree across territories more
+        # often than they agree exactly.
+        self.m.search_all = lambda q: ([
+            {"infohash": "b" * 40, "name": "The.Thing.1983.1080p.BluRay.H264-GRP",
+             "seeders": 120, "leechers": 1, "size": 2_000_000_000, "files": 1,
+             "magnet": "magnet:?xt=urn:btih:" + "b" * 40},
+        ], {})
+        hit = self.m.find_torrent("The Thing", 1982)
+        self.assertIsNotNone(hit)
+
+    def test_a_playable_copy_beats_a_better_seeded_one(self):
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40, "name": "The.Thing.1982.1080p.x265-HEVC",
+             "seeders": 900, "leechers": 1, "size": 2_000_000_000, "files": 1,
+             "magnet": "m1"},
+            {"infohash": "b" * 40, "name": "The.Thing.1982.1080p.WEB-DL.H264-GRP",
+             "seeders": 40, "leechers": 1, "size": 2_000_000_000, "files": 1,
+             "magnet": "m2"},
+        ], {})
+        self.assertEqual(self.m.find_torrent("The Thing", 1982)["magnet"], "m2")
+
+    def test_camera_rips_and_packs_are_not_offered_as_the_copy(self):
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40, "name": "The.Thing.1982.1080p.TELESYNC-X",
+             "seeders": 900, "leechers": 1, "size": 2_000_000_000, "files": 1,
+             "magnet": "m1"},
+            {"infohash": "b" * 40, "name": "The.Thing.Complete.Collection",
+             "seeders": 800, "leechers": 1, "size": 9_000_000_000, "files": 40,
+             "magnet": "m2"},
+        ], {})
+        self.assertIsNone(self.m.find_torrent("The Thing", 1982))
+
+
+# --------------------------------------------------------------------------
 class TestUndoRemove(Base):
     def finished(self):
         j = self.job()

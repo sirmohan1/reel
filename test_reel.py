@@ -343,6 +343,25 @@ class TestSearchMerge(Base):
         for t in self.m.VERIFY_TRACKERS:
             self.assertIn(t, self.m.SEARCH_TRACKERS)
 
+    def test_bitsearch_rows_are_reshaped_correctly(self):
+        # A fourth source, and the mapping is the whole risk again: a swapped
+        # field reads as "this source is a bit off" rather than as a bug.
+        page = {"results": [
+            {"infohash": "A" * 40, "title": "Some.Film.2026.1080p.H264-GRP",
+             "seeders": 40, "leechers": 3, "size": 2_000_000_000}]}
+        self.m._search_json = lambda url, **k: page
+        rows = self.m.source_bitsearch("some film")
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["infohash"], r["name"], r["seeders"],
+                         r["leechers"], r["size"]),
+                         ("a" * 40, "Some.Film.2026.1080p.H264-GRP", 40, 3,
+                          2_000_000_000))
+
+    def test_bitsearch_is_in_the_default_source_list(self):
+        names = [n for n, _ in self.m.SEARCH_SOURCES]
+        self.assertIn("bitsearch", names)
+
 
 # --------------------------------------------------------------------------
 class TestUrls(Base):

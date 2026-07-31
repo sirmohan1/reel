@@ -197,7 +197,7 @@ def pack_order(files):
 # be added without the caller noticing. These endpoints go dark without warning
 # -- yts.mx already refuses the requests this was first written against -- so a
 # dead source has to read as "no results", never as a broken feature.
-# Three indexers, because one is not enough: against an independent source,
+# Four indexers, because one is not enough: against an independent source,
 # apibay was missing 10-12 viable torrents per film -- including a 195-seeder
 # Dune release that would have ranked near the top. They are queried together
 # and merged on infohash. Any one of them going dark has to read as "that source
@@ -206,6 +206,9 @@ def pack_order(files):
 SEARCH_URL = "https://apibay.org/q.php"
 SEARCH_CSV_URL = "https://torrents-csv.com/service/search"
 SEARCH_RARBG_URL = "https://therarbg.to/get-posts"
+# bitsearch.to redirects here permanently -- hit the real host directly rather
+# than pay for a 301 on every call.
+SEARCH_BITSEARCH_URL = "https://bitsearch.eu/api/v1/search"
 # The search response truncates `name` -- at 64 or 80 characters, depending on
 # the row -- and a release puts its codec at the *end*, so the one field that
 # decides whether this needs remuxing is exactly what gets cut. This endpoint
@@ -1599,8 +1602,25 @@ def source_rarbg(query):
     return [x for x in out if x]
 
 
+def source_bitsearch(query):
+    """bitsearch (formerly solidtorrents -- the same site, redirected, rather
+    than a fifth independent one). A general indexer, not a television or
+    anime specialist, so it pulls its weight on both the movie and TV shelves
+    the same way apibay does."""
+    url = SEARCH_BITSEARCH_URL + "?" + urllib.parse.urlencode({"q": query})
+    data = _search_json(url)
+    rows = data.get("results", []) if isinstance(data, dict) else data
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        out.append(_row(r.get("infohash"), r.get("title"), r.get("seeders"),
+                        r.get("leechers"), r.get("size")))
+    return [x for x in out if x]
+
+
 SEARCH_SOURCES = (("apibay", source_apibay), ("torrents-csv", source_csv),
-                  ("therarbg", source_rarbg))
+                  ("therarbg", source_rarbg), ("bitsearch", source_bitsearch))
 
 
 def search_all(query):

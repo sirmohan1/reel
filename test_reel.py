@@ -1150,6 +1150,74 @@ class TestSecondInstance(Base):
 
 
 # --------------------------------------------------------------------------
+class TestUndoRemove(Base):
+    def finished(self):
+        j = self.job()
+        j["status"] = "done"
+        j["path"] = os.path.join(self.dl, "film.mp4")
+        with open(j["path"], "wb") as f:
+            f.write(b"x" * 4096)
+        return j
+
+    def test_removing_takes_the_row_but_keeps_the_bytes(self):
+        # The row goes at once, because that is what was asked for. The file
+        # waits, because a mis-click on a small x otherwise costs a
+        # multi-gigabyte re-download.
+        j = self.finished()
+        self.assertTrue(self.m.remove_job(j["id"]))
+        self.assertNotIn(j["id"], self.m.JOBS)
+        self.assertTrue(os.path.exists(j["path"]))
+
+    def test_undo_puts_it_back(self):
+        j = self.finished()
+        self.m.remove_job(j["id"])
+        self.assertTrue(self.m.undo_remove(j["id"]))
+        self.assertIn(j["id"], self.m.JOBS)
+        self.assertEqual(self.m.JOBS[j["id"]]["status"], "done")
+        self.assertTrue(os.path.exists(j["path"]))
+
+    def test_the_grace_period_ends_in_a_real_deletion(self):
+        j = self.finished()
+        self.m.remove_job(j["id"])
+        self.m.empty_trash()                       # too soon
+        self.assertTrue(os.path.exists(j["path"]))
+        self.m.empty_trash(force=True)
+        self.assertFalse(os.path.exists(j["path"]))
+
+    def test_undo_after_the_grace_period_says_no(self):
+        # Rather than reporting success and restoring nothing.
+        j = self.finished()
+        self.m.remove_job(j["id"])
+        self.m.empty_trash(force=True)
+        self.assertFalse(self.m.undo_remove(j["id"]))
+        self.assertNotIn(j["id"], self.m.JOBS)
+
+    def test_an_unfinished_item_comes_back_ready_to_restart(self):
+        # Its processes were stopped on the way out, so there is nothing left
+        # running to resume -- it has to go back to the scheduler.
+        j = self.job()
+        j["status"] = "downloading"
+        self.m.remove_job(j["id"])
+        self.m.undo_remove(j["id"])
+        back = self.m.JOBS[j["id"]]
+        self.assertEqual(back["status"], "queued")
+        self.assertTrue(back["hold"])
+        # the old cancel Event was set on removal and cannot be reused
+        self.assertFalse(back["cancel"].is_set())
+
+    def test_undoing_something_never_removed_is_harmless(self):
+        self.assertFalse(self.m.undo_remove("no-such-job"))
+
+    def test_eviction_still_deletes_immediately(self):
+        # drop() is what runs where no one is clicking anything -- eviction and
+        # restore cleanup -- and there is nothing to take back there.
+        j = self.finished()
+        self.m.drop(j["id"])
+        self.assertNotIn(j["id"], self.m.JOBS)
+        self.assertFalse(os.path.exists(j["path"]))
+
+
+# --------------------------------------------------------------------------
 class TestResume(Base):
     def test_a_position_comes_back(self):
         self.m.note_resume("job1", 1830.0, 7200.0)

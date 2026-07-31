@@ -893,6 +893,7 @@ def janitor():
         # Before the cap checks below, all of which bail out early. Throttled
         # internally, so this is a no-op most times round.
         save_resume()
+        empty_trash()
         try:
             if folder_size_bytes() <= cap_bytes():
                 continue
@@ -5049,13 +5050,64 @@ def worker():
         WORK_Q.task_done()
 
 
-def drop(jid, delete_file=True):
+# A mis-click on a small × costs a re-download of several gigabytes. The row
+# goes at once, because that is what was asked for, but the bytes wait here
+# briefly so the removal can be taken back.
+UNDO_GRACE = 12.0
+TRASH = {}
+TRASH_LOCK = threading.Lock()
+
+
+def remove_job(jid):
+    """Take an item out of the queue, keeping its files for a moment."""
     with LOCK:
         job = JOBS.pop(jid, None)
     if not job:
-        return
+        return False
     job["cancel"].set()
     stop_procs(job)
+    with TRASH_LOCK:
+        TRASH[jid] = {"job": job, "at": time.time()}
+    return True
+
+
+def undo_remove(jid):
+    """Put it back.
+
+    A finished item returns intact. One still downloading returns to the queue
+    for the scheduler to restart, because its processes were stopped on the way
+    out and there is nothing left running to resume.
+    """
+    with TRASH_LOCK:
+        row = TRASH.pop(jid, None)
+    if not row:
+        return False
+    job = row["job"]
+    job["cancel"] = threading.Event()      # the old one is set; it cannot be reused
+    done = job.get("status") == "done" and job.get("path") and os.path.exists(job["path"])
+    if not done:
+        job.update(status="queued", hold=True, procs=[], proc=None,
+                   wt_proc=None, live_proc=None)
+    with LOCK:
+        JOBS[jid] = job
+    record(job, "removal undone")
+    return True
+
+
+def empty_trash(force=False):
+    """Delete for real once the grace period is up."""
+    now = time.time()
+    with TRASH_LOCK:
+        due = [(j, r["job"]) for j, r in TRASH.items()
+               if force or now - r["at"] >= UNDO_GRACE]
+        for jid, _ in due:
+            TRASH.pop(jid, None)
+    for jid, job in due:
+        purge_files(jid, job)
+
+
+def purge_files(jid, job, delete_file=True):
+    """Everything on disk belonging to an item that is going away."""
     # Removing an item is deliberate in a way eviction is not, so its position
     # goes with it. An evicted one keeps its place, since it may well come back.
     forget_resume(jid)
@@ -5071,6 +5123,21 @@ def drop(jid, delete_file=True):
                 os.remove(f)
             except OSError:
                 pass
+
+
+def drop(jid, delete_file=True):
+    """Remove an item and its files at once, with no grace period.
+
+    Still used wherever the removal is not a person clicking a small x --
+    eviction cleanup and restore() -- where there is nothing to take back.
+    """
+    with LOCK:
+        job = JOBS.pop(jid, None)
+    if not job:
+        return
+    job["cancel"].set()
+    stop_procs(job)
+    purge_files(jid, job, delete_file)
 
 
 # ---- http --------------------------------------------------------------------
@@ -5320,8 +5387,11 @@ class H(http.server.BaseHTTPRequestHandler):
             self._json(200, {"ok": True})
 
         elif p == "/remove":
-            drop(body.get("id"))
-            self._json(200, {"ok": True})
+            ok = remove_job(body.get("id"))
+            self._json(200, {"ok": ok, "undo_for": UNDO_GRACE})
+
+        elif p == "/undo":
+            self._json(200, {"ok": undo_remove(body.get("id"))})
 
         elif p == "/setcap":
             global CACHE_CAP_GB
@@ -5635,6 +5705,19 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .qrclose{position:absolute;top:5px;right:7px;width:20px;height:20px;padding:0;
     line-height:1;font-size:15px;background:none;border:none;color:var(--faint)}
   .qrclose:hover{color:var(--text)}
+
+  /* Sits over the page, bottom left, out of the way of the player. Fixed so it
+     is reachable wherever you had scrolled to when you removed something. */
+  .undo{position:fixed;left:20px;bottom:20px;z-index:70;display:flex;
+    align-items:center;gap:14px;padding:10px 12px 10px 14px;
+    background:var(--panel);border:1px solid var(--rule);border-radius:7px;
+    font-size:12.5px;color:var(--dim);max-width:calc(100vw - 40px);
+    box-shadow:0 14px 34px rgba(0,0,0,.55)}
+  .undo span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .undobtn{flex:none;height:26px;padding:0 11px;font:500 11px/1 var(--mono);
+    letter-spacing:.1em;text-transform:uppercase;color:var(--brass);
+    background:none;border:1px solid rgba(198,162,101,.45);border-radius:4px}
+  .undobtn:hover{color:var(--ink);background:var(--brass);border-color:var(--brass)}
   .qrimg{width:96px;height:96px;background:#fff;border-radius:3px;
     padding:5px;display:flex;flex:none}
   .qrimg svg{width:100%;height:100%;display:block}
@@ -5712,6 +5795,17 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .cue{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     font-size:12.5px;color:var(--dim);padding-left:4px}
   .cue.none{color:var(--faint)}
+  /* Only present while a subtitle is actually loaded, so it never suggests a
+     control for something that isn't there. */
+  .suboff{display:flex;align-items:center;gap:2px;flex:none}
+  .suboff button{width:24px;height:26px;padding:0;font-size:13px;line-height:1;
+    color:var(--faint);background:var(--panel);border:1px solid var(--rule)}
+  .suboff button:hover{color:var(--text);border-color:var(--dim)}
+  .suboff button:first-child{border-radius:4px 0 0 4px}
+  .suboff button:last-child{border-radius:0 4px 4px 0}
+  #subval{min-width:46px;text-align:center;font:400 11px/1 var(--mono);
+    color:var(--faint);font-variant-numeric:tabular-nums;cursor:pointer}
+  #subval.set{color:var(--brass)}
   .toggle{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);
     cursor:pointer;white-space:nowrap;user-select:none}
   .toggle input{accent-color:var(--brass);width:14px;height:14px;cursor:pointer}
@@ -5837,6 +5931,11 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <button class="qrbtn" id="qrbtn" type="button" hidden aria-label="Show QR code for this address">QR</button>
     <span class="state"><i class="led" id="led"></i><span id="statetext">checking</span></span>
   </header>
+  <div class="undo" id="undo" hidden role="status">
+    <span id="undotext"></span>
+    <button class="undobtn" id="undobtn" type="button">Undo</button>
+  </div>
+
   <div class="qrpop" id="qrpop" hidden role="dialog" aria-label="Address for this server">
     <div class="qrimg" id="qrimg"></div>
     <span class="qrurl" id="qrurl"></span>
@@ -5866,6 +5965,11 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <button id="prev" disabled>Previous</button>
     <button id="next" disabled>Next</button>
     <span class="cue none" id="cue">Queue is empty</span>
+    <span class="suboff" id="suboff" hidden title="Nudge subtitle timing">
+      <button id="subminus" type="button" aria-label="Show subtitles earlier">&minus;</button>
+      <span id="subval" role="status" title="Click to reset">0.0s</span>
+      <button id="subplus" type="button" aria-label="Show subtitles later">+</button>
+    </span>
     <label class="toggle"><input type="checkbox" id="auto" checked> Play next automatically</label>
   </div>
 
@@ -6209,12 +6313,68 @@ function applySubs(j) {
   t.srclang = (j.subs_lang || 'eng').slice(0, 2);
   t.src = '/subs/' + j.id + '.vtt';
   t.default = true;
+  // Cues only exist once the file has been parsed, so any saved offset has to
+  // wait for this rather than being applied alongside the track.
+  t.addEventListener('load', () => { subShift = 0; restoreShift(j.id); });
   v.append(t);
   // Chrome ignores the default attribute on a track added after load, so the
   // mode is set explicitly once the element registers it.
   setTimeout(() => { try { if (v.textTracks[0]) v.textTracks[0].mode = 'showing'; }
                      catch (e) {} }, 0);
+  showShift();
 }
+
+/* Subtitle timing ---------------------------------------------------------
+   A CC? badge says outright that a subtitle was judged to fit rather than
+   matched to the file, and that it may drift -- this is what you do about it.
+   Cue times are editable, so the fix is applied to the cues themselves: no
+   round trip, no re-fetch, and it takes effect on the line already on screen.
+   Kept per item in this browser, since drift belongs to a subtitle rather than
+   to a device. */
+const SUB_STEP = 0.5;
+let subShift = 0;          // seconds currently applied to the loaded cues
+
+function subKey(id) { return 'reel.suboff.' + id; }
+
+function shiftCues(delta) {
+  const tt = v.textTracks && v.textTracks[0];
+  if (!tt || !tt.cues || !tt.cues.length) return false;
+  for (let i = 0; i < tt.cues.length; i++) {
+    const c = tt.cues[i];
+    // Never past the start of the file: a cue cannot begin before zero, and a
+    // browser will refuse the whole assignment rather than clamp it.
+    const s = Math.max(0, c.startTime + delta);
+    c.endTime = Math.max(s + 0.05, c.endTime + delta);
+    c.startTime = s;
+  }
+  return true;
+}
+
+function restoreShift(id) {
+  let want = 0;
+  try { want = parseFloat(localStorage.getItem(subKey(id)) || '0') || 0; } catch (e) {}
+  if (want && shiftCues(want)) subShift = want;
+  showShift();
+}
+
+function nudgeSubs(delta) {
+  const id = order[cur];
+  if (!id || !shiftCues(delta)) return;
+  subShift = Math.round((subShift + delta) * 100) / 100;
+  try { localStorage.setItem(subKey(id), String(subShift)); } catch (e) {}
+  showShift();
+}
+
+function showShift() {
+  const box = $('suboff'), tt = v.textTracks && v.textTracks[0];
+  box.hidden = !(tt && tt.cues && tt.cues.length);
+  $('subval').textContent = (subShift > 0 ? '+' : '') + subShift.toFixed(1) + 's';
+  $('subval').classList.toggle('set', subShift !== 0);
+}
+
+$('subminus').addEventListener('click', () => nudgeSubs(-SUB_STEP));
+$('subplus').addEventListener('click', () => nudgeSubs(SUB_STEP));
+$('subval').addEventListener('click', () => nudgeSubs(-subShift));   // back to zero
 
 /* playback ---------------------------------------------------------------- */
 function setFlag(j) {
@@ -6514,7 +6674,8 @@ function paint() {
 async function remove(id) {
   const wasPlaying = order[cur] === id;
   const at = order.indexOf(id);
-  await api('/remove', {id});
+  const title = (byId(id) || {}).title || 'that item';
+  const r = await api('/remove', {id});
   order = order.filter(x => x !== id);
   jobs = jobs.filter(j => j.id !== id);
   if (wasPlaying) {
@@ -6526,6 +6687,33 @@ async function remove(id) {
     paint();
   }
   refresh();
+  offerUndo(id, title, (r && r.undo_for) || 12);
+}
+
+/* Undo -------------------------------------------------------------------
+   The row goes immediately, because that is what was asked for. The files sit
+   in the server's trash for a few seconds, which is the only reason this can
+   put anything back -- a re-download of several gigabytes is a steep price for
+   a mis-click on a small x. */
+let undoTimer = null;
+
+function offerUndo(id, title, secs) {
+  const bar = $('undo');
+  clearTimeout(undoTimer);
+  $('undotext').textContent = 'Removed ' + title;
+  bar.hidden = false;
+  const go = async () => {
+    clearTimeout(undoTimer);
+    bar.hidden = true;
+    const r = await api('/undo', {id});
+    // The grace period can lapse while the toast is still up; say so rather
+    // than leave it looking as though it worked.
+    if (!r || !r.ok) { cue.textContent = 'Too late to undo that one'; cue.classList.add('none'); return; }
+    if (!order.includes(id)) order.push(id);
+    refresh();
+  };
+  $('undobtn').onclick = go;
+  undoTimer = setTimeout(() => { bar.hidden = true; }, secs * 1000);
 }
 
 /* capacity ---------------------------------------------------------------- */
@@ -6794,6 +6982,9 @@ def main():
             s.serve_forever()
         except KeyboardInterrupt:
             save_resume(force=True)
+            # Nothing can be taken back once the page is gone, so a pending
+            # removal becomes final rather than reappearing on next start.
+            empty_trash(force=True)
             print("\n  stopped\n")
 
 

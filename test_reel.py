@@ -2010,6 +2010,46 @@ class TestAudioTracks(Base):
         self.assertEqual(len(kept), 2)
         self.assertEqual([t["lang"] for t in kept], ["fre", "eng"])
 
+    @needs_ffmpeg
+    def test_the_output_is_actually_reordered_not_just_tagged(self):
+        # Keeping every track and tagging the right one "default" was the
+        # first fix, and it was not enough: Chrome, Brave and Edge have no
+        # audioTracks API to read that tag with, and simply play whichever
+        # audio stream is physically first in the container. Proven with two
+        # distinctly-pitched tones and a browser's own Web Audio analyser
+        # against the real finalize command, not asserted from the argv.
+        src = os.path.join(self.dl, "multi2.mkv")
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=5:d=1",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+             "-f", "lavfi", "-i", "sine=frequency=880:duration=1",
+             "-map", "0:v", "-map", "1:a", "-map", "2:a",
+             "-c:v", "libx264", "-c:a", "aac",
+             "-metadata:s:a:0", "language=fre", "-disposition:a:0", "default",
+             "-metadata:s:a:1", "language=eng", "-disposition:a:1", "0",
+             src], check=True, capture_output=True)
+
+        tracks = self.m.audio_tracks(src)
+        amaps, ameta, ordered = self.m.audio_remap_args(tracks)
+        self.assertEqual([t["lang"] for t in ordered], ["eng", "fre"])
+
+        out = os.path.join(self.dl, "multi2_out.mp4")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src,
+             "-map", "0:v:0", *amaps, *ameta, "-c:v", "copy", "-c:a", "copy",
+             out], capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        kept = self.m.probe_all(out)["streams"]
+        audio = [s for s in kept if s["codec_type"] == "audio"]
+        self.assertEqual([s["tags"]["language"] for s in audio], ["eng", "fre"])
+        self.assertEqual(audio[0]["disposition"]["default"], 1)
+        self.assertEqual(audio[1]["disposition"]["default"], 0)
+
+    def test_no_tracks_is_a_no_op(self):
+        self.assertEqual(self.m.audio_remap_args([]), ([], [], []))
+
 
 # --------------------------------------------------------------------------
 class TestJobLog(Base):

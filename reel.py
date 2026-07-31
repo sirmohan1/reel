@@ -3868,6 +3868,40 @@ def guess_audio_default(tracks):
     return 0
 
 
+def audio_remap_args(tracks):
+    """ffmpeg args that keep every audio track but put the guessed-best one
+    first in the OUTPUT, plus the track list and default index the job
+    should record afterward.
+
+    This is the fix guess_audio_default() alone couldn't be: it only decides
+    which track a browser *should* play, and the browser is the one making
+    that decision. Chrome, Brave and Edge have no HTMLMediaElement.audioTracks
+    API at all -- verified against a real build, not assumed -- so there is
+    no page-level fallback for them; whatever the container lists as its
+    first audio stream is what plays, full stop, proven with two distinctly-
+    pitched test tones and a Web Audio analyser. Reordering the container
+    itself is the only lever that reaches those browsers. Safari and Firefox,
+    which do implement the API, get the same correct starting point and can
+    still switch through the in-page menu.
+
+    Metadata and disposition are addressed by *output* position (s:a:0,
+    s:a:1, ...), which is not the same numbering as the -map arguments' --
+    those still address each track at its original position in the source.
+    Getting that pairing wrong tags the wrong stream instead of the one just
+    moved there.
+    """
+    if not tracks:
+        return [], [], []
+    best = guess_audio_default(tracks)
+    ordered = [tracks[best]] + [t for i, t in enumerate(tracks) if i != best]
+    amaps, ameta = [], []
+    for out_i, t in enumerate(ordered):
+        amaps += ["-map", "0:a:%d?" % t["index"]]
+        ameta += ["-metadata:s:a:%d" % out_i, "language=" + t["lang"],
+                  "-disposition:a:%d" % out_i, "default" if out_i == 0 else "0"]
+    return amaps, ameta, ordered
+
+
 def codecs_of(path):
     """(video_codec, audio_codec, height, hdr) for the first stream of each."""
     try:
@@ -4458,30 +4492,49 @@ def run_job(job):
                     cleanup()
                     return fail(job, tail(r.stderr) or "Audio conversion failed.")
         elif browser_ready(raw):
-            # Nothing to do: hand the file over exactly as it arrived. No
-            # 'converting' stage, because there is no conversion.
             job["kind"] = "video"
             out = os.path.join(DL, base + os.path.splitext(safe)[1].lower())
-            shutil.move(raw, out)
-            job["note"] = "played as downloaded, no conversion needed"
+            atracks = audio_tracks(raw)
+            amaps, ameta, ordered = audio_remap_args(atracks)
+            job["audio_tracks"] = ordered
+            job["audio_default"] = 0
+            # A remux is only worth paying for when the order actually needs
+            # fixing -- most files already have one track, or already open in
+            # the right language, and a plain move keeps those exactly as
+            # cheap as this was before.
+            if len(atracks) < 2 or ordered[0]["index"] == atracks[0]["index"]:
+                shutil.move(raw, out)
+                job["note"] = "played as downloaded, no conversion needed"
+            else:
+                r = subprocess.run(
+                    ["ffmpeg", "-nostdin", "-y", "-i", raw, "-map", "0:v:0",
+                     *amaps, *ameta, "-c:v", "copy", "-c:a", "copy",
+                     "-movflags", "+faststart", out],
+                    capture_output=True, text=True)
+                if r.returncode == 0:
+                    job["note"] = "audio reordered so it opens in the right language"
+                else:
+                    # A failed reorder is not worth losing the file over --
+                    # keep it playable in whatever language it already opens in.
+                    shutil.move(raw, out)
+                    job["note"] = "played as downloaded, no conversion needed"
         else:
             job["kind"] = "video"
             job["status"] = "converting"
             out = os.path.join(DL, base + ".mp4")
             # Don't re-encode audio that's already fine; it costs time and quality.
             _v, _a, _h, _hdr, _b2, _d2, _pix = probe_media(raw)
-            # Every audio track kept, not only the first. A MULTi release orders
-            # tracks however the packager chose to, and blindly taking index 0
-            # once handed a French dub for a release whose original was English,
-            # with no way to ask for anything else short of re-fetching the
-            # source -- which by the time anyone noticed was already gone.
+            # Every audio track kept, not only the first, and reordered so the
+            # guessed-best one is first in the output -- see audio_remap_args.
+            # A MULTi release orders tracks however the packager chose to, and
+            # blindly taking index 0 once handed a French dub for a release
+            # whose original was English, with no way to ask for anything
+            # else short of re-fetching the source -- which by the time
+            # anyone noticed was already gone.
             atracks = audio_tracks(raw)
-            job["audio_tracks"] = atracks
-            job["audio_default"] = guess_audio_default(atracks)
-            amaps, ameta = [], []
-            for t in atracks:
-                amaps += ["-map", "0:a:%d?" % t["index"]]
-                ameta += ["-metadata:s:a:%d" % t["index"], "language=" + t["lang"]]
+            amaps, ameta, ordered = audio_remap_args(atracks)
+            job["audio_tracks"] = ordered
+            job["audio_default"] = 0
             # Normalised to AAC even when the video is copied. AC3 and DTS are
             # what x265 rips usually carry, and a device that decodes the video
             # may still have no idea what to do with the sound. Audio is cheap to
@@ -5496,30 +5549,59 @@ def finalize_torrent(job, out_dir, chosen):
         ext = os.path.splitext(src)[1].lower() or ".mp4"
         stem = re.sub(r"[^\w.\- ]", "_", job["title"])[:110]
         out = os.path.join(DL, f"{job['id']}__torrent__{stem}{ext}")
-        job["note"] = (job.get("note", "") +
-                       "; played as downloaded, no conversion needed").strip("; ")
-        try:
-            shutil.move(src, out)
-        except OSError as e:
-            fail(job, "Couldn't keep the downloaded file: %s" % e)
-            return
+        atracks = audio_tracks(src)
+        amaps, ameta, ordered = audio_remap_args(atracks)
+        job["audio_tracks"] = ordered
+        job["audio_default"] = 0
+        # A remux is only worth paying for when the order actually needs
+        # fixing -- most torrents already have one track, or already open in
+        # the right language, and a plain move keeps those exactly as cheap
+        # as this was before.
+        if len(atracks) < 2 or ordered[0]["index"] == atracks[0]["index"]:
+            job["note"] = (job.get("note", "") +
+                           "; played as downloaded, no conversion needed").strip("; ")
+            try:
+                shutil.move(src, out)
+            except OSError as e:
+                fail(job, "Couldn't keep the downloaded file: %s" % e)
+                return
+        else:
+            r = subprocess.run(
+                ["ffmpeg", "-nostdin", "-y", "-i", src, "-map", "0:v:0",
+                 *amaps, *ameta, "-c:v", "copy", "-c:a", "copy",
+                 "-movflags", "+faststart", out],
+                capture_output=True, text=True)
+            if r.returncode == 0:
+                job["note"] = (job.get("note", "") +
+                               "; audio reordered so it opens in the right "
+                               "language").strip("; ")
+            else:
+                # A failed reorder is not worth losing the file over -- keep
+                # it playable in whatever language it already opens in.
+                try:
+                    shutil.move(src, out)
+                    job["note"] = (job.get("note", "") +
+                                   "; played as downloaded, no conversion "
+                                   "needed").strip("; ")
+                except OSError as e:
+                    fail(job, "Couldn't keep the downloaded file: %s" % e)
+                    return
         adopt_finalized(job, out_dir, src, out)
         return
 
     job["status"] = "converting"
     v, a, h, hdr, _br, dur, pix = probe_media(src)
     dur = job.get("duration") or dur
-    # Every audio track kept, not only the first -- this is exactly the finalize
-    # that turned a MULTi release into whichever language its packager happened
-    # to put first in the container, with the source gone by the time it was
-    # noticed and no way back to the original short of re-fetching the torrent.
+    # Every audio track kept, not only the first, and reordered so the
+    # guessed-best one is first in the output -- see audio_remap_args. This
+    # is exactly the finalize that turned a MULTi release into whichever
+    # language its packager happened to put first in the container, with the
+    # source gone by the time it was noticed and no way back to the original
+    # short of re-fetching the torrent.
     atracks = audio_tracks(src)
-    job["audio_tracks"] = atracks
-    job["audio_default"] = guess_audio_default(atracks)
-    amaps, ameta = [], []
-    for t in atracks:
-        amaps += ["-map", "0:a:%d?" % t["index"]]
-        ameta += ["-metadata:s:a:%d" % t["index"], "language=" + t["lang"]]
+    amaps, ameta, ordered = audio_remap_args(atracks)
+    job["audio_tracks"] = ordered
+    job["audio_default"] = 0
     acodec = ["-c:a", "copy"] if all(t["codec"] in BROWSER_AUDIO for t in atracks) \
         else ["-c:a", "aac"]
     caps = ({codec_key(v, pix)} | MP4_VIDEO) if v in MP4_VIDEO else set()

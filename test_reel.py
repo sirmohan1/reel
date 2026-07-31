@@ -1479,6 +1479,201 @@ class TestCatalogueShelves(Base):
 
 
 # --------------------------------------------------------------------------
+class TestSeasonDetection(Base):
+    """A TV shelf must offer whole seasons only. Two layers: a cheap name
+    check that decides what's worth a request, and a real file-list check
+    that decides what's actually trusted."""
+
+    def test_a_bare_season_number_looks_like_a_pack(self):
+        self.assertTrue(self.m.tv_looks_like_season("Severance.S01.1080p.WEB"))
+        self.assertTrue(self.m.tv_looks_like_season("Show Season 2 Complete"))
+        self.assertTrue(self.m.tv_looks_like_season("Breaking.Bad.Complete.Series.1080p"))
+
+    def test_a_single_episode_does_not_look_like_a_pack_name(self):
+        self.assertFalse(self.m.tv_looks_like_episode("Severance.S01.1080p.WEB"))
+        self.assertTrue(self.m.tv_looks_like_episode("Severance.S01E04.1080p.WEB"))
+
+    def test_a_spelled_out_range_is_not_mistaken_for_one_episode(self):
+        # "S01E01-E10" names a season as surely as bare "S01" does -- refusing
+        # it as "one episode" because E01 appears would throw out a real pack
+        # for looking like the episode it happens to start with.
+        name = "Show.S01E01-E10.1080p.WEB"
+        self.assertFalse(self.m.tv_looks_like_episode(name))
+        self.assertTrue(self.m.tv_looks_like_season(name))
+
+    def f(self, name, gb):
+        return {"name": name, "size": int(gb * 1_000_000_000)}
+
+    def test_a_real_season_survives_the_file_check(self):
+        files = [self.f("Show.S01E%02d.1080p.mkv" % i, 1.5) for i in range(1, 9)]
+        got = self.m.season_episode_files(files)
+        self.assertEqual(len(got), 8)
+
+    def test_a_single_video_file_is_not_a_season(self):
+        # Whatever the torrent's name claims, one file is one file.
+        files = [self.f("Show.S01E01.1080p.mkv", 1.5),
+                 self.f("NEW upcoming releases by Xclusive.txt", 0.0)]
+        self.assertEqual(self.m.season_episode_files(files), [])
+
+    def test_a_trilogy_is_not_a_season(self):
+        # Passes the same count-and-size bar a season does; only the episode
+        # numbering in the names tells them apart.
+        files = [self.f("Godfather.1972.mkv", 14.0),
+                 self.f("Godfather.Part.II.1974.mkv", 16.0),
+                 self.f("Godfather.Part.III.1990.mkv", 13.0)]
+        self.assertEqual(self.m.season_episode_files(files), [])
+
+    def test_bonus_material_does_not_count_toward_the_episode_total(self):
+        files = [self.f("Show.S01E01.mkv", 2.0), self.f("Show.S01E02.mkv", 2.0),
+                 self.f("sample.mkv", 0.1)]
+        got = self.m.season_episode_files(files)
+        self.assertEqual(len(got), 2)
+
+    def test_is_real_season_reports_none_when_unfetchable(self):
+        self.m.torrent_file_list = lambda tid, timeout=6: None
+        self.assertIsNone(self.m.is_real_season("123"))
+
+    def test_is_real_season_confirms_a_real_pack(self):
+        self.m.torrent_file_list = lambda tid, timeout=6: [
+            self.f("Show.S01E%02d.mkv" % i, 1.2) for i in range(1, 7)]
+        self.assertTrue(self.m.is_real_season("123"))
+
+    def test_is_real_season_refuses_a_single_file_dressed_as_a_pack(self):
+        # The name check alone would have accepted this -- "Show.S01." reads
+        # as a season -- which is exactly why the file list gets checked too.
+        self.m.torrent_file_list = lambda tid, timeout=6: [
+            self.f("Show.S01.Episode.1.mkv", 4.0)]
+        self.assertFalse(self.m.is_real_season("123"))
+
+
+# --------------------------------------------------------------------------
+class TestFindSeason(Base):
+    """find_season(), the TV-shelf equivalent of find_torrent() -- accepts
+    the opposite shape, and never trusts a name alone."""
+
+    def row(self, name, seeders=100, tid="1", size=8_000_000_000, ih="a" * 40):
+        return self.m._row(ih, name, seeders, 1, size, files=0, tid=tid)
+
+    def test_single_episodes_are_never_offered(self):
+        self.m.search_all = lambda q: ([
+            self.row("Severance.S01E04.1080p.WEB-DL.x265-GRP")], {})
+        self.assertIsNone(self.m.find_season("Severance", 2022))
+
+    def test_a_season_shaped_name_is_confirmed_against_its_file_list(self):
+        self.m.search_all = lambda q: ([
+            self.row("Severance.S01.1080p.WEB-DL.x265-GRP")], {})
+        self.m.torrent_file_list = lambda tid, timeout=6: [
+            {"name": "Severance.S01E%02d.mkv" % i, "size": 1_200_000_000}
+            for i in range(1, 10)]
+        got = self.m.find_season("Severance", 2022)
+        self.assertIsNotNone(got)
+        self.assertIn("Severance", got["name"])
+
+    def test_a_pack_shaped_name_around_a_single_file_is_refused(self):
+        # The bait case: named like a season, but the real file list shows
+        # one episode. The name alone must not be trusted.
+        self.m.search_all = lambda q: ([
+            self.row("Severance.S01.COMPLETE.1080p.WEB-DL.x265-GRP")], {})
+        self.m.torrent_file_list = lambda tid, timeout=6: [
+            {"name": "Severance.S01E01.mkv", "size": 1_200_000_000}]
+        self.assertIsNone(self.m.find_season("Severance", 2022))
+
+    def test_a_row_with_no_id_cannot_be_verified_so_is_not_offered(self):
+        # torrents-csv and therarbg never supply an id -- no id, no file list,
+        # no way to confirm a name-only guess.
+        row = self.row("Severance.S01.1080p.WEB-DL.x265-GRP", tid="")
+        self.m.search_all = lambda q: ([row], {})
+        self.m.torrent_file_list = lambda tid, timeout=6: [
+            {"name": "Severance.S01E01.mkv", "size": 1_200_000_000}] * 8
+        self.assertIsNone(self.m.find_season("Severance", 2022))
+
+    def test_camera_rips_are_excluded_the_same_as_for_films(self):
+        self.m.search_all = lambda q: ([
+            self.row("Severance.S01.HDCAM.x265-GRP")], {})
+        self.assertIsNone(self.m.find_season("Severance", 2022))
+
+    def test_the_best_verified_candidate_wins(self):
+        # Two season-shaped names; only the second holds up under the file
+        # check, and it has fewer seeders -- a real pack should still win
+        # over a higher-seeded name that doesn't check out.
+        self.m.search_all = lambda q: ([
+            self.row("Severance.S01.2160p.WEB-DL-GRP", seeders=900, tid="1",
+                    ih="a" * 40),
+            self.row("Severance.S01.1080p.WEB-DL-GRP", seeders=50, tid="2",
+                    ih="b" * 40),
+        ], {})
+        def files(tid, timeout=6):
+            if tid == "2":
+                return [{"name": "Severance.S01E%02d.mkv" % i,
+                        "size": 1_200_000_000} for i in range(1, 10)]
+            return [{"name": "Severance.S01E01.mkv", "size": 1_200_000_000}]
+        self.m.torrent_file_list = files
+        got = self.m.find_season("Severance", 2022)
+        self.assertEqual(got["id"], "2")
+
+
+# --------------------------------------------------------------------------
+class TestTvShelves(Base):
+    """The catalogue shelves extended to TV -- same ranking and verification
+    machinery, gated by find_season instead of find_torrent."""
+
+    def setUp(self):
+        super().setUp()
+        self.m._TMDB.clear()
+        self.m._TMDB["key"] = "test-key"
+        self.m.AVAIL.clear()
+
+    def test_shelf_from_catalogue_uses_the_finder_it_is_given(self):
+        calls = []
+        def fake_season(title, year=None):
+            calls.append(title)
+            return {"infohash": "a" * 40, "name": title, "seeders": 50,
+                   "leechers": 1, "size": 4_000_000_000, "magnet": "m"}
+        self.m.feed_verify = lambda rows, now=None: rows
+        rows = [{"title": "Severance", "year": 2022, "rating": 8.7, "votes": 5000}]
+        got = self.m.shelf_from_catalogue(rows, 8, time.time(), finder=fake_season)
+        self.assertEqual(calls, ["Severance"])
+        self.assertEqual(got[0]["title"], "Severance")
+
+    def test_default_finder_is_still_cached_torrent(self):
+        # The film shelves must keep working unmodified -- finder is opt-in.
+        self.m.cached_torrent = lambda t, y=None: (
+            {"infohash": "a" * 40, "name": t, "seeders": 50, "leechers": 1,
+             "size": 4_000_000_000, "magnet": "m"})
+        self.m.feed_verify = lambda rows, now=None: rows
+        rows = [{"title": "Ikiru", "year": 1952, "rating": 8.5, "votes": 5000}]
+        got = self.m.shelf_from_catalogue(rows, 8, time.time())
+        self.assertEqual(got[0]["title"], "Ikiru")
+
+    def test_movie_and_tv_shelves_are_tagged_by_section(self):
+        self.m.build_catalogue_shelves = lambda: (
+            [{"name": "Tonight", "note": "n", "films": []}], None, {})
+        self.m.build_catalogue_shelves_tv = lambda: (
+            [{"name": "Tonight", "note": "n", "films": []}], {})
+        rows, err, per = self.m.build_shelves()
+        self.assertEqual([r["section"] for r in rows], ["movie", "tv"])
+
+    def test_a_broken_tv_build_does_not_cost_the_movie_shelves(self):
+        self.m.build_catalogue_shelves = lambda: (
+            [{"name": "Tonight", "note": "n", "films": []}], None, {})
+        def broken():
+            raise RuntimeError("tv catalogue query failed")
+        self.m.build_catalogue_shelves_tv = broken
+        rows, err, per = self.m.build_shelves()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["section"], "movie")
+
+    def test_no_key_means_no_tv_section_either(self):
+        self.m._TMDB.clear()
+        self.m._TMDB["key"] = ""
+        self.m.live_seeders = lambda *a, **k: None
+        self.m.bolly_fetch = lambda: ([], {})
+        self.m.feed_fetch = lambda: ([], {})
+        rows, err, per = self.m.build_shelves()
+        self.assertNotIn("tv", [r.get("section") for r in rows])
+
+
+# --------------------------------------------------------------------------
 class TestPosterProxy(Base):
     """Posters are proxied rather than pointed at image.tmdb.org directly, so
     the CSP never has to trust a third party. The path is built from whatever

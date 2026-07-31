@@ -1371,13 +1371,28 @@ def read_release(name):
             "direct": codec == "h264" and not hdr and container_ok}
 
 
-def search_real_name(tid, timeout=6):
-    """The largest filename inside a torrent, or None.
+def _apibay_file_values(v):
+    """Two shapes come back from apibay's file-list endpoint for the same
+    field, seemingly at random:
+        {"name": {"0": "a.mkv"}, "size": {"0": "123"}}   -- index-keyed maps
+        {"name": ["a.mkv"],      "size": [123]}          -- plain lists
+    Flattened to a list either way, in index order, so a name and its size
+    stay paired.
+    """
+    if isinstance(v, dict):
+        return [v[k] for k in sorted(v, key=lambda x: str(x))]
+    if isinstance(v, list):
+        return v
+    return [] if v is None else [v]
 
-    Worth one extra request per row because the truncated search name loses the
-    codec, and the codec is the difference between "streams as-is" and "costs a
-    remux and twice the disk". Picks the largest file, since that is the one
-    pick_file() will choose to play.
+
+def torrent_file_list(tid, timeout=6):
+    """Every real file inside a torrent, as [{"name":.., "size":..}], or None
+    if the listing could not be fetched.
+
+    The same endpoint search_real_name() uses, kept whole here instead of
+    reduced to the single largest entry -- deciding whether something is a
+    real season pack needs every file, not just the biggest one.
     """
     try:
         url = SEARCH_FILES_URL + "?" + urllib.parse.urlencode({"id": tid})
@@ -1386,26 +1401,12 @@ def search_real_name(tid, timeout=6):
             rows = _json.loads(r.read().decode("utf-8", "replace"))
     except Exception:
         return None
-
-    # Two shapes come back from the same endpoint, seemingly at random:
-    #   {"name": {"0": "a.mkv"}, "size": {"0": "123"}}   -- index-keyed maps
-    #   {"name": ["a.mkv"],      "size": [123]}          -- plain lists
-    # and either may carry several entries. Flattening both to a list keeps the
-    # pairing between a name and its size, which matters because the largest
-    # file is the one pick_file() will play -- taking the first instead picked
-    # "NEW upcoming releases by Xclusive.txt" as the name to judge a film by.
-    def values(v):
-        if isinstance(v, dict):
-            return [v[k] for k in sorted(v, key=lambda x: str(x))]
-        if isinstance(v, list):
-            return v
-        return [] if v is None else [v]
-
-    best, best_size = None, -1
+    out = []
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
             continue
-        names, sizes = values(row.get("name")), values(row.get("size"))
+        names = _apibay_file_values(row.get("name"))
+        sizes = _apibay_file_values(row.get("size"))
         for i, nm in enumerate(names):
             if not isinstance(nm, (str, int, float)):
                 continue
@@ -1417,8 +1418,25 @@ def search_real_name(tid, timeout=6):
                 size = int(sizes[i]) if i < len(sizes) else 0
             except (TypeError, ValueError):
                 size = 0
-            if size > best_size:
-                best, best_size = nm, size
+            out.append({"name": nm, "size": size})
+    return out
+
+
+def search_real_name(tid, timeout=6):
+    """The largest filename inside a torrent, or None.
+
+    Worth one extra request per row because the truncated search name loses the
+    codec, and the codec is the difference between "streams as-is" and "costs a
+    remux and twice the disk". Picks the largest file, since that is the one
+    pick_file() will choose to play.
+    """
+    files = torrent_file_list(tid, timeout=timeout)
+    if files is None:
+        return None
+    best, best_size = None, -1
+    for f in files:
+        if f["size"] > best_size:
+            best, best_size = f["name"], f["size"]
     # A name is only worth trusting if it belongs to something big enough to be
     # the feature: a .txt or .jpg tells us nothing about the video's codec.
     if best and best.lower().endswith(VIDEO_EXT + AUDIO_EXT):
@@ -1762,6 +1780,23 @@ FEED_YEAR = re.compile(r"[\(\[\.\s_-]((?:19|20)\d{2})[\)\]\.\s_-]")
 FEED_PACK = re.compile(r"""\b(collection|boxset|box ?set|complete|seasons?|duology|
     trilogy|quadrilogy|anthology|mega ?pack|movie pack|filmography)\b""", re.I | re.X)
 FEED_EPISODE = re.compile(r"\bS\d{1,2}(E\d{1,2}|\b)", re.I)
+# For the TV shelves, which need the opposite question answered: not "is this
+# TV-shaped" but "is this a whole season, or one episode of it". A release
+# naming a specific episode ("S01E04") is refused; a bare season number
+# ("S01"), the word "season", or "complete" is what a pack looks like. Both
+# can appear together in a pack that spells out its range ("S01E01-E10"),
+# which is why TV_EPISODE excludes anything a dash-joined second episode
+# number follows -- without that, a real ten-episode pack would be refused for
+# being named like the one episode it starts with.
+TV_EPISODE = re.compile(r"\bS\d{1,2}[ ._-]?E\d{1,3}(?!\s*[-–]\s*E?\d)\b", re.I)
+# The bare-season branch needs its own trailing boundary: without one, "S01"
+# matches as a prefix of "S01E04" too, which would make this true of every
+# single episode as well as every pack. The second branch catches a pack that
+# spells out its range ("S01E01-E10") -- its own "S01" is glued to "E01" with
+# no boundary between them, so the first branch alone would miss it.
+TV_SEASON = re.compile(
+    r"\bS\d{1,2}\b|\bS\d{1,2}E\d{1,3}[ ._-]?-[ ._-]?E?\d{1,3}\b|"
+    r"\bseasons?\b|\bcomplete\b", re.I)
 # Filmed off a cinema screen, or an unfinished review copy. These rank well --
 # new, heavily seeded, and too recent to have collected a rating that would drag
 # them down -- so three of the top twelve were camcorder recordings. Recommending
@@ -1833,6 +1868,20 @@ def feed_pack(name, files):
         count = 0
     return count >= FEED_PACK_FILES or bool(
         FEED_PACK.search(name or "") or FEED_EPISODE.search(name or ""))
+
+
+def tv_looks_like_episode(name):
+    """A release name that points at one specific episode."""
+    return bool(TV_EPISODE.search(name or ""))
+
+
+def tv_looks_like_season(name):
+    """A release name with some season-shaped marker in it.
+
+    Only a pre-filter -- cheap enough to run against every search result,
+    before is_real_season() spends a request confirming the ones that pass.
+    """
+    return bool(TV_SEASON.search(name or ""))
 
 
 def _norm_title(t):
@@ -2285,16 +2334,91 @@ def build_catalogue_shelves():
     return out, None, per
 
 
+# TV shelves, parallel to CAT_SHELVES -- first_air_date where films use
+# primary_release_date, and no Bollywood-equivalent language shelf, since
+# nothing asked for one yet. Add one the same way if that changes.
+CAT_SHELVES_TV = (
+    ("Tonight", "popular right now",
+     {"sort_by": "popularity.desc", "vote_count.gte": 300}),
+    ("Just landed", "new seasons, out in the last few months",
+     {"sort_by": "first_air_date.desc", "vote_count.gte": 80}),
+    ("Top rated", "the best there is",
+     {"sort_by": "vote_average.desc", "vote_count.gte": 2000}),
+    ("Hidden gems", "excellent, and barely seen",
+     {"sort_by": "vote_average.desc", "vote_average.gte": 8.0,
+      "vote_count.gte": 300, "vote_count.lte": 2000}),
+)
+
+
+def build_catalogue_shelves_tv():
+    """TV shelves, built the same way as build_catalogue_shelves -- except a
+    copy only counts here when it is a whole season. A show whose only
+    torrents are single episodes is treated the same as one with no copy at
+    all: dropped, not offered with a caveat.
+    """
+    now = time.time()
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    recent = time.strftime("%Y-%m-%d", time.gmtime(now - 200 * 86400))
+    built, used, per = {}, set(), {}
+
+    for name, note, params in CAT_SHELVES_TV:
+        q = dict(params, kind="tv")
+        q.setdefault("first_air_date.lte", today)
+        if name == "Just landed":
+            q["first_air_date.gte"] = recent
+        elif name == "Hidden gems":
+            q["first_air_date.lte"] = time.strftime(
+                "%Y-%m-%d", time.gmtime(now - 5 * 365 * 86400))
+        rows = tmdb_rows(**q)
+        per["tv/" + name] = len(rows)
+        if not rows:
+            continue
+        rows = [r for r in rows if _norm_title(r["title"]) not in used]
+        shows = shelf_from_catalogue(rows, FEED_SHELF, now,
+                                     finder=cached_season)[:FEED_SHELF]
+        if not shows:
+            continue
+        for s in shows:
+            used.add(_norm_title(s["title"]))
+        built[name] = {"name": name, "note": note, "films": feed_dress(shows)}
+
+    order = [n for n, _, _ in CAT_SHELVES_TV]
+    return [built[n] for n in order if n in built], per
+
+
 def build_shelves():
     """Every shelf, filled in order. Returns (shelves, error, sources).
 
-    Built from the catalogue when there is a key for one, and from the trackers
-    otherwise -- which is what this did before TMDb existed, and still the only
-    thing that works with no credentials.
+    Built from the catalogue when there is a key for one, and from the
+    trackers otherwise -- which is what this did before TMDb existed, and
+    still the only thing that works with no credentials. TV shelves only
+    exist on the catalogue path: the tracker top-lists publish only the
+    Movies categories (see FEED_CATS), and there is no keyless way to tell a
+    season pack from a single episode the way find_season does for TMDb-
+    sourced titles.
+
+    Every shelf carries a "section" so the client can group TV separately
+    from film without a second endpoint or a second refresh button -- one
+    /feed call, and one cache, covers both.
     """
-    if has_tmdb():
-        return build_catalogue_shelves()
-    return build_tracker_shelves()
+    if not has_tmdb():
+        rows, err, per = build_tracker_shelves()
+        for s in rows:
+            s["section"] = "movie"
+        return rows, err, per
+
+    movies, err, per = build_catalogue_shelves()
+    for s in movies:
+        s["section"] = "movie"
+    try:
+        tv, tv_per = build_catalogue_shelves_tv()
+    except Exception:
+        # A TV-specific fault should cost the TV shelves, not the film ones.
+        tv, tv_per = [], {}
+    for s in tv:
+        s["section"] = "tv"
+    per.update(tv_per)
+    return movies + tv, err, per
 
 
 def build_tracker_shelves():
@@ -2608,6 +2732,126 @@ def cached_torrent(title, year=None):
     return hit
 
 
+# How many season-shaped candidates for one show get their real file list
+# checked, in parallel, before giving up on it. A release *named* like a
+# season is only a candidate -- a trilogy box set passes the same name check a
+# season does, and only the file list settles it.
+SEASON_VERIFY_TOP = 5
+
+
+def season_episode_files(files):
+    """The real episode files in a candidate's file list, or [] if what's
+    there doesn't look like a season.
+
+    Mirrors pack_files()'s video/extras/size-share filtering -- fewer than two
+    substantial video files means this isn't a pack of anything -- with one
+    check pack_files() doesn't need: every kept file must carry season+episode
+    numbering, because a trilogy box set and a season pack are otherwise
+    indistinguishable by count and size alone.
+    """
+    vids = [f for f in (files or [])
+            if (f.get("name") or "").lower().endswith(VIDEO_EXT)
+            and not PACK_EXTRAS.search(f.get("name") or "")]
+    if len(vids) < 2:
+        return []
+    biggest = max((f.get("size") or 0) for f in vids)
+    bar = max(PACK_MIN_BYTES, biggest * PACK_MIN_SHARE)
+    keep = [f for f in vids if (f.get("size") or 0) >= bar]
+    if len(keep) < 2:
+        return []
+    episode = SEQ_SCHEMES[0][0]      # s(\d{1,2})e(\d{1,3}), the television form
+    if not all(episode.search(os.path.basename(f["name"])) for f in keep):
+        return []
+    return keep
+
+
+def is_real_season(tid, timeout=6):
+    """Whether a candidate's actual file list shows a real season, or None if
+    the listing could not be fetched.
+
+    None is deliberately not the same as False: a recommendation shelf should
+    not gamble that an unverifiable pack is a real one, so the caller treats
+    "couldn't check" the same as "no" -- but the distinction is kept in case a
+    future caller wants to retry rather than refuse.
+    """
+    files = torrent_file_list(tid, timeout=timeout)
+    if files is None:
+        return None
+    return len(season_episode_files(files)) >= 2
+
+
+def find_season(title, year=None, min_res=None):
+    """The best whole-season copy of a named show, or None.
+
+    The acceptance runs the opposite way from find_torrent: there, anything
+    pack-shaped is refused because a film search wants one film. Here, a
+    release naming one specific episode is refused, because a shelf that
+    recommends a show and hands over one hour of it has not recommended the
+    show -- and a pack-shaped *name* is only a candidate, confirmed against
+    its real file list (is_real_season) before being trusted, in parallel
+    across however many of the top candidates it takes to find one that
+    survives.
+    """
+    rows, _per = search_all(("%s %s" % (title, year)) if year else title)
+    want = _norm_title(title)
+    floor = RES_ORDER.get(min_res) if min_res else None
+    keep = []
+    for r in rows:
+        # No id, no file list, nothing to verify a pack-shaped name against.
+        if not r.get("id"):
+            continue
+        if feed_cam(r["name"]) or tv_looks_like_episode(r["name"]):
+            continue
+        if not tv_looks_like_season(r["name"]):
+            continue
+        got, got_year = feed_title(r["name"])
+        if want and want not in _norm_title(got):
+            continue
+        if year and got_year and abs(got_year - year) > 1:
+            continue
+        if floor is not None:
+            res = read_release(r["name"])["res"]
+            if RES_ORDER.get(res, 0) < floor:
+                continue
+        keep.append(r)
+    if not keep:
+        return None
+    keep.sort(key=lambda r: (_norm_title(feed_title(r["name"])[0]) != want,
+                             not read_release(r["name"])["direct"],
+                             -r["seeders"]))
+
+    top = keep[:SEASON_VERIFY_TOP]
+    verified = {}
+
+    def check(r):
+        verified[r["id"]] = is_real_season(r["id"])
+    threads = [threading.Thread(target=check, args=(r,), daemon=True) for r in top]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    for r in top:
+        if verified.get(r["id"]):
+            return r
+    return None
+
+
+def cached_season(title, year=None):
+    """find_season, remembered -- same reasoning as cached_torrent, and the
+    same AVAIL store, keyed apart so a show and a film sharing a title never
+    collide."""
+    key = "tv|" + _norm_title(title) + "|" + str(year or "")
+    now = time.time()
+    with AVAIL_LOCK:
+        row = AVAIL.get(key)
+        if row and now - row[0] < AVAIL_TTL:
+            return row[1]
+    hit = find_season(title, year)
+    with AVAIL_LOCK:
+        AVAIL[key] = (now, hit)
+    return hit
+
+
 def tmdb_rows(kind="movie", limit=24, **params):
     """Catalogue rows for a shelf, normalised into the shape the ranking wants.
 
@@ -2635,7 +2879,7 @@ def tmdb_rows(kind="movie", limit=24, **params):
     return out
 
 
-def shelf_from_catalogue(rows, want, now):
+def shelf_from_catalogue(rows, want, now, finder=cached_torrent):
     """Attach a copy to each film and drop the ones with none.
 
     A recommendation you cannot press play on is not a recommendation, which is
@@ -2647,11 +2891,15 @@ def shelf_from_catalogue(rows, want, now):
     GB (a real one runs 4-10 GB here) with leechers roughly equal to seeders,
     the standard signature of a bait upload. The fix already exists: verify
     against the trackers themselves, same as search and the tracker shelves.
+
+    finder is cached_torrent for a film shelf, cached_season for a TV one --
+    the only difference between the two is which copy counts, and this
+    ranking, scoring and seeder-verification is identical either way.
     """
     found = []
 
     def look(row):
-        hit = cached_torrent(row["title"], row["year"])
+        hit = finder(row["title"], row["year"])
         if not hit:
             return
         info = read_release(hit["name"])
@@ -6369,6 +6617,13 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .rwhy{font:400 10.5px/1.4 var(--mono);color:var(--dim);white-space:normal}
   .rrow .rscore{color:var(--live)}
 
+  /* Only shown when more than one section is actually present -- see
+     loadPicks -- so this never adds a label above the only section there is. */
+  .picksection{font:600 12.5px/1 var(--mono);letter-spacing:.1em;
+    text-transform:uppercase;color:var(--text);margin:30px 0 16px;
+    padding-top:22px;border-top:1px solid var(--rule)}
+  .picksection:first-child{margin-top:0;padding-top:0;border-top:none}
+
   /* shelves -- one horizontally-scrolling strip per shelf, card-based rather
      than the stacked-row layout search results use, since a poster read at a
      glance is the point of browsing and a list of text rows isn't that. */
@@ -7115,12 +7370,27 @@ async function loadPicks(force) {
   if (r.error) { box.textContent = r.error; return; }
   const shelves = r.shelves || [];
   const total = shelves.reduce((n, s) => n + s.films.length, 0);
-  $('pcount').textContent = total ? total + ' films' : '';
+  $('pcount').textContent = total ? total + ' titles' : '';
   if (!total) { box.textContent = 'Nothing to suggest right now.'; return; }
+
+  // Movies and TV shows are only worth telling apart when both are actually
+  // present -- a divider above the one section there is would be a label for
+  // nothing. shelves already arrives movies-then-tv, so this only has to
+  // notice when the section changes, not sort anything itself.
+  const sections = new Set(shelves.map(s => s.section).filter(Boolean));
+  let lastSection = null;
 
   // A film sits on exactly one shelf, so these read as sections -- a strip
   // per shelf, each scrolling on its own, rather than one long list.
   shelves.forEach(shelf => {
+    if (sections.size > 1 && shelf.section !== lastSection) {
+      lastSection = shelf.section;
+      const div = document.createElement('div');
+      div.className = 'picksection';
+      div.textContent = shelf.section === 'tv' ? 'TV Shows' : 'Movies';
+      box.append(div);
+    }
+
     const sec = document.createElement('div');
     sec.className = 'shelf';
     const head = document.createElement('div');

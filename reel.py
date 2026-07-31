@@ -6380,11 +6380,28 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
      with a "visible" one forces the visible one to auto), turning each
      strip into a vertical scroll box clipped to whatever height it
      happened to compute first. Scrolling was meant to be horizontal only. */
-  .shelfstrip{display:flex;gap:12px;overflow-x:auto;overflow-y:hidden;
-    padding:2px 2px 12px;scroll-snap-type:x proximity;
-    -webkit-overflow-scrolling:touch}
+  /* align-items:flex-start, not the flex default of stretch -- stretch
+     means every card's height is resolved against the flex line's own
+     cross size, and a flex line's cross size is itself derived from its
+     items' stretched heights: exactly the circular auto-sizing case
+     nested flex containers are known to get wrong, and the actual cause
+     of the strip clipping to far less than a card's real content height.
+     flex-start sizes each card to its own content directly, no circle. */
+  .shelfstripwrap{display:flex;align-items:stretch;gap:6px}
+  .shelfstrip{display:flex;align-items:flex-start;gap:12px;overflow-x:auto;
+    overflow-y:hidden;padding:2px 2px 12px;scroll-snap-type:x proximity;
+    -webkit-overflow-scrolling:touch;flex:1;min-width:0}
   .shelfstrip::-webkit-scrollbar{height:6px}
   .shelfstrip::-webkit-scrollbar-thumb{background:var(--rule);border-radius:3px}
+  /* Not overlaid on the strip -- a triangle sitting on top of the edge
+     poster hides exactly the thing someone's trying to see past it.
+     Sitting beside it instead costs 2*30px of shelf width and hides
+     nothing. */
+  .shelfnav{flex:0 0 26px;display:flex;align-items:center;justify-content:center;
+    background:var(--panel);border:1px solid var(--rule);border-radius:4px;
+    color:var(--dim);cursor:pointer;font-size:10px;padding:0}
+  .shelfnav:hover:not(:disabled){color:var(--text);border-color:var(--dim)}
+  .shelfnav:disabled{opacity:.3;cursor:default}
   /* min-width:0 overrides the flex-item default of min-width:auto, which
      resolves to the content's min-content width -- without it, a card whose
      title or meta has a long unbreakable token renders wider than 136px
@@ -7102,10 +7119,36 @@ async function loadPicks(force) {
     const head = document.createElement('div');
     head.className = 'shelfhead';
     head.textContent = shelf.name + ' — ' + shelf.note;
+
     const strip = document.createElement('div');
     strip.className = 'shelfstrip';
     shelf.films.forEach(res => strip.append(pickCard(res)));
-    sec.append(head, strip);
+
+    const prev = document.createElement('button');
+    prev.className = 'shelfnav'; prev.type = 'button';
+    prev.textContent = '◀'; prev.setAttribute('aria-label', 'Scroll left');
+    const next = document.createElement('button');
+    next.className = 'shelfnav'; next.type = 'button';
+    next.textContent = '▶'; next.setAttribute('aria-label', 'Scroll right');
+    const page = () => Math.max(strip.clientWidth - 60, 136);
+    prev.addEventListener('click', () => strip.scrollBy({left: -page(), behavior: 'smooth'}));
+    next.addEventListener('click', () => strip.scrollBy({left: page(), behavior: 'smooth'}));
+    // A card's width never changes after layout, so the strip's scrollable
+    // range is known as soon as it's built -- no need to wait on the posters,
+    // which load lazily and would otherwise leave the arrows briefly wrong.
+    const updateNav = () => {
+      prev.disabled = strip.scrollLeft <= 4;
+      next.disabled = strip.scrollLeft + strip.clientWidth >= strip.scrollWidth - 1;
+    };
+    strip.addEventListener('scroll', updateNav);
+    window.addEventListener('resize', updateNav);
+    requestAnimationFrame(updateNav);
+
+    const stripwrap = document.createElement('div');
+    stripwrap.className = 'shelfstripwrap';
+    stripwrap.append(prev, strip, next);
+
+    sec.append(head, stripwrap);
     box.append(sec);
   });
 }

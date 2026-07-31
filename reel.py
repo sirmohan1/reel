@@ -2596,6 +2596,7 @@ def tmdb_rows(kind="movie", limit=24, **params):
     re-ranked on it.
     """
     data = tmdb_get("discover/%s" % kind, include_adult="false", **params) or {}
+    names = {v: k.title() for k, v in tmdb_genres(kind).items()}
     out = []
     for r in data.get("results", [])[:limit]:
         date = (r.get("release_date") or r.get("first_air_date") or "")[:4]
@@ -2606,6 +2607,9 @@ def tmdb_rows(kind="movie", limit=24, **params):
                     "rating": round(float(r.get("vote_average") or 0), 1) or None,
                     "votes": int(r.get("vote_count") or 0),
                     "overview": (r.get("overview") or "")[:300],
+                    "poster_path": r.get("poster_path"),
+                    "genres": [names[g] for g in (r.get("genre_ids") or [])
+                              if g in names],
                     "tmdb_id": r.get("id")})
     return out
 
@@ -2655,6 +2659,44 @@ def shelf_from_catalogue(rows, want, now):
               if not (r.get("verified") and r["seeders"] < SEARCH_MIN_SEEDERS)]
     checked.sort(key=lambda r: -r["score"])
     return checked + found[want:]
+
+
+TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
+# Sizes actually offered, not a free-form path -- the route builds a url from
+# whatever a client sends, so this whitelist is what stops it being handed to
+# fetch an arbitrary path off image.tmdb.org.
+TMDB_IMG_SIZES = ("w92", "w154", "w185", "w342", "w500", "original")
+TMDB_IMG_NAME = re.compile(r"^[A-Za-z0-9_-]+\.(jpg|jpeg|png)$")
+TMDB_IMG_DIR = os.path.join(CACHE_DIR, "posters")
+
+
+def poster_file(size, name):
+    """A poster on disk, fetching it once if it is not there yet.
+
+    A poster never changes once TMDb has minted its filename, so this is the
+    rare case worth keeping forever rather than on a TTL -- the fetch itself is
+    the only real cost, and it is paid at most once per film.
+    """
+    if size not in TMDB_IMG_SIZES or not TMDB_IMG_NAME.match(name or ""):
+        return None
+    path = os.path.join(TMDB_IMG_DIR, size, name)
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    try:
+        req = urllib.request.Request("%s/%s/%s" % (TMDB_IMG_BASE, size, name),
+                                     headers={"User-Agent": "reel/1.0"})
+        with urllib.request.urlopen(req, timeout=TMDB_TIMEOUT) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    return path
 
 
 def catalogue_with_copies(q):
@@ -5589,6 +5631,7 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Security-Policy",
                              "default-src 'none'; media-src 'self'; "
+                             "img-src 'self'; "
                              "style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
                              "connect-src 'self'")
             self.send_header("Content-Length", str(len(b)))
@@ -5645,6 +5688,24 @@ class H(http.server.BaseHTTPRequestHandler):
                              "lan_url": lan_url() if has_qrcode() else None})
         elif p == "/qr":
             self._qr()
+        elif p.startswith("/poster/"):
+            # Proxied rather than pointed at image.tmdb.org directly, so the
+            # CSP never has to trust a third party -- img-src stays 'self' and
+            # every image the browser loads still comes from this server.
+            parts = p[len("/poster/"):].split("/", 1)
+            path = poster_file(parts[0], parts[1]) if len(parts) == 2 else None
+            if not path:
+                return self._json(404, {"error": "no such poster"})
+            ext = os.path.splitext(path)[1].lower()
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "image/png" if ext == ".png" else "image/jpeg")
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            # Immutable: TMDb never reuses a filename for different bytes.
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
         elif p.startswith("/subs/"):
             self._subs(p.split("/subs/", 1)[1].split("?")[0])
         elif p.startswith("/stream/"):
@@ -6167,6 +6228,13 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     border:none;border-radius:4px;border-bottom:1px solid var(--rule)}
   .rrow:hover:not(:disabled){background:var(--raise);border-color:var(--rule)}
   .rrow:last-child{border-bottom:none}
+  /* Only rows that carry a poster switch to this layout -- a search result or
+     a tracker-only shelf has no image and keeps the plain stacked one. */
+  .rrow.withpost{flex-direction:row;align-items:flex-start;gap:12px}
+  .rpost{flex:none;width:56px;aspect-ratio:2/3;object-fit:cover;
+    border-radius:4px;background:var(--panel);border:1px solid var(--rule)}
+  .rrow.withpost .rbody{display:flex;flex-direction:column;gap:4px;
+    min-width:0;flex:1;text-align:left}
   .rtitle{font-size:12.5px;color:var(--text);word-break:break-word;
     white-space:normal;line-height:1.45}
   .rmeta{font:400 11px/1.4 var(--mono);color:var(--faint);
@@ -6755,6 +6823,7 @@ function pickRow(res) {
   bits.push(res.rating ? '★ ' + res.rating.toFixed(1)
                        + (res.votes ? ' (' + res.votes.toLocaleString() + ')' : '')
                        : 'no rating');
+  if (res.genres && res.genres.length) bits.push(res.genres.slice(0, 3).join(', '));
   bits.push((res.verified ? '' : '~') + res.seeders + ' seed'
             + (res.weak ? ' — too few to stream' : ''));
   bits.push(fmtSize(res.size));
@@ -6771,10 +6840,32 @@ function pickRow(res) {
   // suggestions with no stated reason is just an ordering you have to trust.
   const why = document.createElement('span');
   why.className = 'rwhy';
-  why.textContent = (res.why || []).join(' · ');
+  // The overview is TMDb's synopsis when there is one; otherwise fall back to
+  // the ranking's own reasoning, so a row is never left with neither.
+  why.textContent = res.overview || (res.why || []).join(' · ');
 
-  row.append(title, meta);
-  if (why.textContent) row.append(why);
+  // Only rows that came from the catalogue carry a poster. A search result or
+  // a tracker-sourced shelf item has none, and gets the plain layout rather
+  // than an empty gap where an image would be.
+  if (res.poster_path) {
+    row.classList.add('withpost');
+    const img = document.createElement('img');
+    img.className = 'rpost';
+    img.loading = 'lazy';
+    img.alt = '';
+    img.src = '/poster/w154' + res.poster_path;
+    // A broken fetch should not leave a blank grey box; falling back to the
+    // plain layout is what would have been shown anyway.
+    img.addEventListener('error', () => { img.remove(); row.classList.remove('withpost'); });
+    const body = document.createElement('span');
+    body.className = 'rbody';
+    body.append(title, meta);
+    if (why.textContent) body.append(why);
+    row.append(img, body);
+  } else {
+    row.append(title, meta);
+    if (why.textContent) row.append(why);
+  }
   if (!res.queued) row.addEventListener('click', async () => {
     row.disabled = true;
     title.textContent = 'Adding: ' + res.title;

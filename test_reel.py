@@ -13,6 +13,7 @@ Run:  python3 test_reel.py          (or -v for the list)
 
 import gzip
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -1408,6 +1409,57 @@ class TestCatalogueShelves(Base):
         rows, err, per = self.m.build_shelves()
         self.assertEqual(rows, [])
         self.assertIn("could not reach", err)
+
+
+# --------------------------------------------------------------------------
+class TestPosterProxy(Base):
+    """Posters are proxied rather than pointed at image.tmdb.org directly, so
+    the CSP never has to trust a third party. The path is built from whatever
+    a client sends, so validation is the security-relevant part."""
+
+    def setUp(self):
+        super().setUp()
+        self.m.TMDB_IMG_DIR = os.path.join(self.dl, "posters")
+
+    def test_an_unlisted_size_is_refused(self):
+        self.assertIsNone(self.m.poster_file("w9999", "abc123.jpg"))
+
+    def test_a_path_that_is_not_a_bare_filename_is_refused(self):
+        # What stops this being handed a path to fetch or read arbitrarily.
+        for bad in ("../../../../etc/passwd", "a/b.jpg", "abc123.jpg/../x",
+                    "abc123.exe", "abc123", ""):
+            self.assertIsNone(self.m.poster_file("w154", bad), bad)
+
+    def stand_in(self, fn):
+        """Rebinds the module's whole urllib rather than patching
+        urllib.request.urlopen in place, which would patch the *shared*
+        module and take every other test's http fixture down with it."""
+        self.m.urllib = types.SimpleNamespace(
+            request=types.SimpleNamespace(urlopen=fn, Request=urllib.request.Request),
+            parse=urllib.parse)
+
+    def test_a_valid_request_is_fetched_once_and_then_cached(self):
+        calls = []
+        class FakeResponse(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def fake_urlopen(req, timeout=None):
+            calls.append(req.full_url)
+            return FakeResponse(b"\xff\xd8\xff" + b"x" * 100)   # jpeg-ish bytes
+        self.stand_in(fake_urlopen)
+        p1 = self.m.poster_file("w154", "abc123.jpg")
+        p2 = self.m.poster_file("w154", "abc123.jpg")
+        self.assertEqual(p1, p2)
+        self.assertEqual(len(calls), 1)          # the second call never fetched
+        self.assertIn("w154/abc123.jpg", calls[0])
+
+    def test_a_failed_fetch_leaves_no_partial_file(self):
+        def refuse(req, timeout=None):
+            raise OSError("unreachable")
+        self.stand_in(refuse)
+        self.assertIsNone(self.m.poster_file("w154", "abc123.jpg"))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.m.TMDB_IMG_DIR, "w154", "abc123.jpg.part")))
 
 
 # --------------------------------------------------------------------------

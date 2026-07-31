@@ -730,6 +730,7 @@ class TestFeedBuild(Base):
         self.m.live_seeders = lambda *a, **k: None      # never scrape a tracker
         self.m.ratings_for = lambda ids: self.ratings
         self.m.bolly_fetch = lambda: ([], {})          # its own source, tested apart
+        self.m._TMDB.clear(); self.m._TMDB["key"] = ""   # force the tracker path
         self.ratings = {}
 
     def shelves(self, *raw):
@@ -1278,6 +1279,21 @@ class TestCatalogue(Base):
         ], {})
         self.assertEqual(self.m.find_torrent("The Thing", 1982)["magnet"], "m2")
 
+    def test_an_exact_title_beats_a_longer_one_containing_it(self):
+        # "Gabriel's Inferno" is a substring of "Gabriel's Inferno Part Three",
+        # and matching loosely handed the first film the third one's copy.
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40,
+             "name": "Gabriels.Inferno.Part.Three.2020.1080p.WEB-DL.H264-GRP",
+             "seeders": 900, "leechers": 1, "size": 2_000_000_000, "files": 1,
+             "magnet": "wrong"},
+            {"infohash": "b" * 40,
+             "name": "Gabriels.Inferno.2020.1080p.WEB-DL.H264-GRP",
+             "seeders": 40, "leechers": 1, "size": 2_000_000_000, "files": 1,
+             "magnet": "right"},
+        ], {})
+        self.assertEqual(self.m.find_torrent("Gabriel's Inferno", 2020)["magnet"], "right")
+
     def test_camera_rips_and_packs_are_not_offered_as_the_copy(self):
         self.m.search_all = lambda q: ([
             {"infohash": "a" * 40, "name": "The.Thing.1982.1080p.TELESYNC-X",
@@ -1288,6 +1304,110 @@ class TestCatalogue(Base):
              "magnet": "m2"},
         ], {})
         self.assertIsNone(self.m.find_torrent("The Thing", 1982))
+
+
+# --------------------------------------------------------------------------
+class TestCatalogueShelves(Base):
+    """The inversion: shelves built from what TMDb says is good, not from what
+    a tracker happens to be seeding this week."""
+
+    def setUp(self):
+        super().setUp()
+        self.m._TMDB.clear()
+        self.m._TMDB["key"] = "test-key"
+        self.m.AVAIL.clear()
+
+    def test_availability_is_cached_rather_than_asked_twice(self):
+        # Five shelves asking about the same classics every half hour would be
+        # sixty indexer searches per rebuild; almost all of that is memory.
+        calls = []
+        def fake_find(title, year=None):
+            calls.append(title)
+            return {"infohash": "a" * 40, "name": title, "seeders": 50,
+                   "leechers": 1, "size": 2_000_000_000, "magnet": "m"}
+        self.m.find_torrent = fake_find
+        self.m.cached_torrent("The Godfather", 1972)
+        self.m.cached_torrent("The Godfather", 1972)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_cached_miss_is_not_retried_either(self):
+        calls = []
+        def fake_find(title, year=None):
+            calls.append(title)
+            return None
+        self.m.find_torrent = fake_find
+        self.m.cached_torrent("Nothing Findable", 2026)
+        self.m.cached_torrent("Nothing Findable", 2026)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_stale_entry_is_asked_about_again(self):
+        self.m.AVAIL_TTL = 0.01
+        calls = []
+        def fake_find(title, year=None):
+            calls.append(title)
+            return None
+        self.m.find_torrent = fake_find
+        self.m.cached_torrent("X", 2020)
+        time.sleep(0.02)
+        self.m.cached_torrent("X", 2020)
+        self.assertEqual(len(calls), 2)
+
+    def test_films_with_no_copy_are_dropped_not_greyed_out(self):
+        # Unlike a search result, where the specific film was asked for, a
+        # recommendation you cannot press play on is not one.
+        self.m.cached_torrent = lambda t, y=None: (
+            {"infohash": "a" * 40, "name": t, "seeders": 50, "leechers": 1,
+             "size": 2_000_000_000, "magnet": "m"} if t == "Found" else None)
+        self.m.feed_verify = lambda rows, now=None: rows
+        rows = [{"title": "Found", "year": 2020, "rating": 8.0, "votes": 5000},
+                {"title": "Not Found", "year": 2020, "rating": 8.0, "votes": 5000}]
+        got = self.m.shelf_from_catalogue(rows, 8, time.time())
+        self.assertEqual([r["title"] for r in got], ["Found"])
+
+    def test_a_swarm_that_measures_thin_is_dropped(self):
+        # A title still in theatrical release turned up a "1080p WEB" release
+        # at a tenth of the size a real one runs here, with leechers roughly
+        # equal to seeders -- the standard bait-upload signature. The indexer
+        # claimed 137 seeders; the tracker itself said 15. This is the general
+        # form: whatever the indexer claims, a swarm measured too thin to
+        # stream is not a recommendation.
+        self.m.cached_torrent = lambda t, y=None: (
+            {"infohash": "a" * 40, "name": t, "seeders": 137, "leechers": 139,
+             "size": 900_000_000, "magnet": "m"})
+        self.m.feed_verify = lambda rows, now=None: [
+            dict(r, seeders=2, verified=True) for r in rows]
+        rows = [{"title": "Bait Upload", "year": 2026, "rating": 8.0, "votes": 5000}]
+        got = self.m.shelf_from_catalogue(rows, 8, time.time())
+        self.assertEqual(got, [])
+
+    def test_ratings_are_reweighted_not_trusted_as_given(self):
+        # TMDb's own "top rated" sort surfaces a 2026 film at 9.4 from 497
+        # votes over The Godfather -- brand new and barely seen. The same
+        # vote-weighting the IMDb ratings already get is applied here.
+        self.m.tmdb_get = lambda path, **p: {"results": [
+            {"id": 1, "title": "Brand New", "release_date": "2026-01-01",
+             "vote_average": 9.4, "vote_count": 497, "genre_ids": [], "overview": ""},
+            {"id": 2, "title": "The Godfather", "release_date": "1972-01-01",
+             "vote_average": 8.7, "vote_count": 23236, "genre_ids": [], "overview": ""},
+        ]}
+        rows = self.m.tmdb_rows(sort_by="vote_average.desc")
+        self.m.cached_torrent = lambda t, y=None: (
+            {"infohash": "a" * 40, "name": t, "seeders": 500, "leechers": 1,
+             "size": 8_000_000_000, "magnet": "m"})
+        self.m.feed_verify = lambda rows, now=None: rows
+        got = self.m.shelf_from_catalogue(rows, 8, time.time())
+        self.assertEqual(got[0]["title"], "The Godfather")
+
+    def test_no_key_falls_back_to_the_tracker_shelves(self):
+        self.m._TMDB.clear()
+        self.m._TMDB["key"] = ""
+        self.m.live_seeders = lambda *a, **k: None
+        self.m.ratings_for = lambda ids: {}
+        self.m.bolly_fetch = lambda: ([], {})
+        self.m.feed_fetch = lambda: ([], {"201": "failed: no network in this test"})
+        rows, err, per = self.m.build_shelves()
+        self.assertEqual(rows, [])
+        self.assertIn("could not reach", err)
 
 
 # --------------------------------------------------------------------------
@@ -1515,6 +1635,7 @@ class TestShelves(Base):
         self.m.live_seeders = lambda *a, **k: None
         self.m.ratings_for = lambda ids: self.ratings
         self.m.bolly_fetch = lambda: (list(self.bolly), {})
+        self.m._TMDB.clear(); self.m._TMDB["key"] = ""   # force the tracker path
         self.ratings, self.bolly = {}, []
 
     def raw(self, ih, name, **kw):

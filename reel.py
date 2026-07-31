@@ -2219,8 +2219,85 @@ SHELVES = (
 )
 
 
+# Shelves, when there is a catalogue to build them from. Each is a discover
+# query, and every one of them is something the tracker-sourced shelves could
+# not express: "the best films there are" is not a question an indexer can
+# answer, because it only knows what is seeding this week.
+#
+# Every vote floor here is load-bearing. Without one, discover happily reports
+# a 2026 film rated 9.4 from 497 votes as the best-reviewed thing ever made.
+CAT_SHELVES = (
+    ("Tonight", "popular right now",
+     {"sort_by": "popularity.desc", "vote_count.gte": 300}),
+    ("Just landed", "out in the last few months",
+     {"sort_by": "primary_release_date.desc", "vote_count.gte": 120}),
+    ("Top rated", "the best there is",
+     {"sort_by": "vote_average.desc", "vote_count.gte": 5000}),
+    ("Hidden gems", "excellent, and barely seen",
+     {"sort_by": "vote_average.desc", "vote_average.gte": 7.5,
+      "vote_count.gte": 800, "vote_count.lte": 4000}),
+    ("Bollywood", "Hindi-language cinema",
+     {"with_original_language": "hi", "vote_count.gte": 300,
+      "sort_by": "vote_average.desc"}),
+)
+
+
+def build_catalogue_shelves():
+    """Shelves chosen from the catalogue, then found on the trackers.
+
+    The inversion that matters: the old shelves could only ever contain what
+    was trending on one tracker this week, so a great film from 2015 could not
+    appear however good it was. These start from films and ask the indexers
+    only whether a copy exists.
+    """
+    now = time.time()
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    recent = time.strftime("%Y-%m-%d", time.gmtime(now - 200 * 86400))
+    built, used, per = {}, set(), {}
+
+    for name, note, params in CAT_SHELVES:
+        q = dict(params)
+        # Nothing released tomorrow can be watched tonight.
+        q.setdefault("primary_release_date.lte", today)
+        if name == "Just landed":
+            q["primary_release_date.gte"] = recent
+        elif name == "Hidden gems":
+            # Old enough that its rating has settled and its audience is
+            # genuinely small, rather than merely new.
+            q["primary_release_date.lte"] = time.strftime(
+                "%Y-%m-%d", time.gmtime(now - 5 * 365 * 86400))
+        rows = tmdb_rows(**q)
+        per[name] = len(rows)
+        if not rows:
+            continue
+        rows = [r for r in rows if _norm_title(r["title"]) not in used]
+        films = shelf_from_catalogue(rows, FEED_SHELF, now)[:FEED_SHELF]
+        if not films:
+            continue
+        for f in films:
+            used.add(_norm_title(f["title"]))
+        built[name] = {"name": name, "note": note, "films": feed_dress(films)}
+
+    order = [n for n, _, _ in CAT_SHELVES]
+    out = [built[n] for n in order if n in built]
+    if not out:
+        return [], "the catalogue returned nothing with a copy available", per
+    return out, None, per
+
+
 def build_shelves():
-    """Every shelf, filled in order. Returns (shelves, error, sources)."""
+    """Every shelf, filled in order. Returns (shelves, error, sources).
+
+    Built from the catalogue when there is a key for one, and from the trackers
+    otherwise -- which is what this did before TMDb existed, and still the only
+    thing that works with no credentials.
+    """
+    if has_tmdb():
+        return build_catalogue_shelves()
+    return build_tracker_shelves()
+
+
+def build_tracker_shelves():
     raw, per = feed_fetch()
     bolly_raw, bolly_per = bolly_fetch()
     per.update(bolly_per)
@@ -2473,8 +2550,111 @@ def find_torrent(title, year=None):
         keep.append(r)
     if not keep:
         return None
-    keep.sort(key=lambda r: (not read_release(r["name"])["direct"], -r["seeders"]))
+    # An exact title beats a longer one that merely contains it: "Gabriel's
+    # Inferno" is a substring of "Gabriel's Inferno Part Three", and matching
+    # loosely handed the first film the third one's copy.
+    keep.sort(key=lambda r: (_norm_title(feed_title(r["name"])[0]) != want,
+                             not read_release(r["name"])["direct"],
+                             -r["seeders"]))
     return keep[0]
+
+
+# Whether a film can be found at all changes on the scale of weeks, while the
+# shelves rebuild every half hour and ask about the same classics each time.
+# Without this, five shelves cost sixty indexer searches per rebuild; with it,
+# almost all of them are answered from memory.
+AVAIL_TTL = 6 * 3600
+AVAIL = {}
+AVAIL_LOCK = threading.Lock()
+
+
+def cached_torrent(title, year=None):
+    """find_torrent, remembered. A miss is cached too -- a film with no copy
+    today will not have one in ten minutes, and re-asking is the expensive
+    half of building a shelf."""
+    key = _norm_title(title) + "|" + str(year or "")
+    now = time.time()
+    with AVAIL_LOCK:
+        row = AVAIL.get(key)
+        if row and now - row[0] < AVAIL_TTL:
+            return row[1]
+    hit = find_torrent(title, year)
+    with AVAIL_LOCK:
+        AVAIL[key] = (now, hit)
+        if len(AVAIL) > 2000:
+            for k in sorted(AVAIL, key=lambda k: AVAIL[k][0])[:500]:
+                AVAIL.pop(k, None)
+    return hit
+
+
+def tmdb_rows(kind="movie", limit=24, **params):
+    """Catalogue rows for a shelf, normalised into the shape the ranking wants.
+
+    Never trusts the catalogue's own ordering. TMDb's top_rated returns films
+    rated 9.4 from 497 votes -- brand new, barely seen -- so the same
+    vote-weighting the IMDb ratings get is applied here and everything is
+    re-ranked on it.
+    """
+    data = tmdb_get("discover/%s" % kind, include_adult="false", **params) or {}
+    out = []
+    for r in data.get("results", [])[:limit]:
+        date = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+        title = r.get("title") or r.get("name")
+        if not title:
+            continue
+        out.append({"title": title, "year": int(date) if date.isdigit() else None,
+                    "rating": round(float(r.get("vote_average") or 0), 1) or None,
+                    "votes": int(r.get("vote_count") or 0),
+                    "overview": (r.get("overview") or "")[:300],
+                    "tmdb_id": r.get("id")})
+    return out
+
+
+def shelf_from_catalogue(rows, want, now):
+    """Attach a copy to each film and drop the ones with none.
+
+    A recommendation you cannot press play on is not a recommendation, which is
+    why these are dropped rather than greyed out -- unlike a search result,
+    where you asked for that specific thing.
+
+    An indexer's seeder count cannot be trusted here more than anywhere else --
+    a title still in theatrical release turned up a "1080p WEB" release at 0.96
+    GB (a real one runs 4-10 GB here) with leechers roughly equal to seeders,
+    the standard signature of a bait upload. The fix already exists: verify
+    against the trackers themselves, same as search and the tracker shelves.
+    """
+    found = []
+
+    def look(row):
+        hit = cached_torrent(row["title"], row["year"])
+        if not hit:
+            return
+        info = read_release(hit["name"])
+        row.update(hit, **info)
+        row["name"] = hit["name"]
+        row["title"] = row["title"]        # the catalogue's title, not the release's
+        row["added"] = 0                   # a search row carries no upload time
+        row["status"] = ""
+        row["verified"] = False
+        row["reported"] = None
+        found.append(row)
+
+    threads = [threading.Thread(target=look, args=(r,), daemon=True)
+               for r in rows[:want * 2]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(SEARCH_TIMEOUT + 4)
+    for r in found:
+        r["score"], r["why"] = feed_score(r, now)
+    found.sort(key=lambda r: -r["score"])
+    checked = feed_verify(found[:want], now)
+    # A swarm measured too thin to stream is not a recommendation -- and a bait
+    # upload, scraped for real, reads as exactly that: seeders near zero.
+    checked = [r for r in checked
+              if not (r.get("verified") and r["seeders"] < SEARCH_MIN_SEEDERS)]
+    checked.sort(key=lambda r: -r["score"])
+    return checked + found[want:]
 
 
 def catalogue_with_copies(q):

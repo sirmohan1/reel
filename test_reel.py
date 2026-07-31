@@ -684,6 +684,108 @@ class TestWithFfmpeg(Base):
 
 
 # --------------------------------------------------------------------------
+class TestFindWtUrl(Base):
+    """The bug that looked like broken subtitles: a Planet Earth II job
+    picked for S01E01 Islands ended up streaming S01E02 Mountains instead --
+    a sibling episode from the same pack, discovered on the same server
+    listing, whose size (1,292,117,405 bytes) was within a megabyte of
+    Islands' own (1,292,928,557). The old size floor only rejected a
+    candidate *dramatically* smaller than expected, so Mountains passed it
+    easily -- and it already had real data (a sibling job was actively
+    downloading it) while Islands' own url kept timing out with nothing to
+    serve yet. Subtitles fetched and scored for Islands then played out
+    against Mountains, which is what looked like a subtitle bug."""
+
+    IH = "a" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.job_ = self.job(
+            magnet="magnet:?xt=urn:btih:%s&dn=Planet.Earth.II.2016.S01.1080p."
+                   "BluRay.x264-RiPRG" % self.IH)
+        self.chosen = {
+            "name": "Planet.Earth.II.S01E01.Islands.mkv",
+            "rel": "Planet.Earth.II.2016.S01.1080p.BluRay.x264-RiPRG/"
+                   "Planet.Earth.II.S01E01.Islands.mkv",
+            "index": 0, "size": 1_292_928_557}
+        self.right_url = ("http://127.0.0.1:9/webtorrent/%s/Planet.Earth.II."
+                          "2016.S01.1080p.BluRay.x264-RiPRG/Planet.Earth.II."
+                          "S01E01.Islands.mkv" % self.IH)
+        self.wrong_url = ("http://127.0.0.1:9/webtorrent/%s/Planet.Earth.II."
+                          "2016.S01.1080p.BluRay.x264-RiPRG/Planet.Earth.II."
+                          "S01E02.Mountains.mkv" % self.IH)
+        self.m.WT_SERVER_WAIT = 0.3
+        self.validated = []
+
+    def test_a_same_sized_sibling_is_never_substituted(self):
+        # Both files are on the server listing. Only Mountains -- the wrong
+        # episode -- has real data behind it (a sibling job is actively
+        # downloading it); every path to Islands, crawled or guessed, is
+        # still empty and times out -- exactly the real Planet Earth II
+        # timeline, before any distinction is made between them.
+        self.m.discover_links = lambda base, timeout=5: (
+            [self.wrong_url, self.right_url] if base.endswith("/") else [])
+        probed = []
+
+        def fake_probe_url(url, timeout=4):
+            probed.append(url)
+            if "Mountains" in url:
+                return {"ok": True, "status": 200, "ranges": True,
+                        "length": "1292117405"}
+            return {"ok": False, "status": None, "ranges": False,
+                    "error": "timed out"}
+        self.m.probe_url = fake_probe_url
+
+        def fake_validate(url, want_bytes=0):
+            self.validated.append(url)
+            # The old bug: this is exactly what let Mountains pass -- 99.94%
+            # of the expected size, nowhere near the 50% floor. Only reached
+            # if the name filter failed to exclude it first.
+            return (None, None, None, None, None, None, None)
+        self.m.validate_stream_url = fake_validate
+
+        got = self.m.find_wt_url(self.job_, 9, self.chosen)
+        self.assertNotIn(self.wrong_url, probed,
+                         "a same-shaped sibling must never even be probed: "
+                         + repr(probed))
+        self.assertEqual(self.validated, [],
+                         "nothing reached the size check at all -- "
+                         "every candidate that was tried timed out")
+        # Every url actually named for the chosen file timed out in this
+        # test, so the honest answer is one of those -- stalled, not
+        # substituted -- never the wrong episode.
+        self.assertIsNotNone(got)
+        self.assertIn("Islands", got)
+        self.assertNotIn("Mountains", got)
+
+    def test_the_named_file_wins_once_it_has_data(self):
+        # Same setup, except the right file now also answers -- confirming
+        # this isn't just "always prefer whichever times out".
+        self.m.discover_links = lambda base, timeout=5: (
+            [self.wrong_url, self.right_url] if base.endswith("/") else [])
+        self.m.probe_url = lambda url, timeout=4: {
+            "ok": True, "status": 200, "ranges": True, "length": "1292928557"}
+        self.m.validate_stream_url = lambda url, want_bytes=0: (
+            (None, None, None, None, None, None, None) if url == self.right_url
+            else None)
+        got = self.m.find_wt_url(self.job_, 9, self.chosen)
+        self.assertEqual(got, self.right_url)
+
+    def test_guesses_built_from_the_chosen_name_are_unaffected(self):
+        # The pre-built fallback guesses are exempt from the name filter --
+        # they are constructed from the chosen file's own name, so they
+        # cannot land on a neighbour the way a directory crawl can.
+        self.m.discover_links = lambda base, timeout=5: []
+        self.m.probe_url = lambda url, timeout=4: {
+            "ok": True, "status": 200, "ranges": True, "length": "1292928557"}
+        self.m.validate_stream_url = lambda url, want_bytes=0: (
+            None, None, None, None, None, None, None)
+        got = self.m.find_wt_url(self.job_, 9, self.chosen)
+        self.assertIsNotNone(got)
+        self.assertIn("Islands.mkv", got)
+
+
+# --------------------------------------------------------------------------
 class TestFeedParsing(Base):
     def test_pulls_title_and_year_out_of_a_release_name(self):
         for name, want in (

@@ -4952,7 +4952,21 @@ def discover_links(base, timeout=5):
 
 def find_wt_url(job, port, chosen):
     """webtorrent's server layout has moved between versions, so try the
-    documented shapes rather than assuming one."""
+    documented shapes rather than assuming one.
+
+    Every *crawled* candidate is checked against the chosen file's own name
+    before being trusted -- size alone is not enough. A Planet Earth II job
+    picked for "S01E01.Islands" once ended up actually streaming
+    "S01E02.Mountains" instead: the two episodes differ in size by under a
+    megabyte out of 1.29 GB, so the size floor below passed the wrong one
+    easily, and Mountains already had real bytes downloaded (it was a
+    sibling job in the same pack) while Islands' own URL still had none and
+    kept timing out. The subtitle mismatch this produced -- fetched and
+    scored for Islands, played against Mountains -- was a symptom, not the
+    bug. guesses/index addresses below are exempt from the name check: they
+    are built directly from the chosen file's own name or index, so they
+    cannot land on a neighbour the way a directory crawl can.
+    """
     ih = job.get("wt_ih") or infohash(job.get("magnet", ""))
     name = (chosen or {}).get("name", "")
     idx = (chosen or {}).get("index", 0)
@@ -4976,15 +4990,26 @@ def find_wt_url(job, port, chosen):
     indexes = [f"{base}/webtorrent/{ih}/", f"{base}/webtorrent/{ih}",
                f"{base}/webtorrent/", base + "/"]
     media = VIDEO_EXT + AUDIO_EXT
+    # What a crawled url has to end in to be trusted as the chosen file
+    # rather than a same-shaped neighbour discovered in the same listing.
+    target_names = {os.path.basename(urllib.parse.unquote(n)).lower()
+                    for n in [name, rel] if n}
+
+    def matches_target(u):
+        seg = os.path.basename(urllib.parse.unquote(u.rstrip("/")))
+        return seg.lower() in target_names
+
     tried = {}
     # The size of the file pick_file() settled on, when the .torrent gave us one.
     # Any candidate far smaller than this is not that file, whatever it decodes
     # as -- which is how a 100 KB cover image was accepted for a 1.99 GB film.
+    # Never sufficient on its own though (see above): it is a floor, not a match.
     want_bytes = int((chosen or {}).get("size") or 0)
     stalled = []                # right-looking urls with no data behind them yet
     deadline = time.time() + WT_SERVER_WAIT
     while time.time() < deadline and not job["cancel"].is_set():
-        # whatever the server actually publishes beats any guess of mine
+        # whatever the server actually publishes beats any guess of mine --
+        # but only among links actually named for the file we chose.
         found = []
         for ix in indexes:
             links = discover_links(ix)
@@ -4994,10 +5019,10 @@ def find_wt_url(job, port, chosen):
             for sub in links[:4]:
                 if not sub.lower().endswith(media):
                     found += discover_links(sub if sub.endswith("/") else sub + "/")
-        ranked = ([u for u in found if u.lower().endswith(media)] +
-                  [u for u in found if not u.lower().endswith(media)])
+        named_media = [u for u in found
+                      if u.lower().endswith(media) and matches_target(u)]
         seen_once = []
-        for u in ranked + guesses:
+        for u in named_media + guesses:
             if u not in seen_once:
                 seen_once.append(u)
         for url in seen_once:
@@ -5027,7 +5052,7 @@ def find_wt_url(job, port, chosen):
             job["url_log"] = "; ".join(f"{u} -> {why}" for u, why in tried.items())[:1200]
             job["wt_ranges"] = bool(info["ranges"])
             job["wt_probe"] = probed
-            if url in ranked:
+            if url in named_media:
                 job["note"] = (job.get("note", "") + "; found via index").strip("; ")
             return url
         time.sleep(1.0)

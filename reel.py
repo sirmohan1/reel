@@ -6375,11 +6375,22 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .shelf:not(:first-child){margin-top:22px}
   .shelfhead{font:500 11px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
     color:var(--brass);margin-bottom:10px}
-  .shelfstrip{display:flex;gap:12px;overflow-x:auto;padding:2px 2px 12px;
-    scroll-snap-type:x proximity;-webkit-overflow-scrolling:touch}
+  /* overflow-y is explicit, not left to default -- a lone overflow-x:auto
+     gets silently promoted to overflow-y:auto too (an "auto" axis paired
+     with a "visible" one forces the visible one to auto), turning each
+     strip into a vertical scroll box clipped to whatever height it
+     happened to compute first. Scrolling was meant to be horizontal only. */
+  .shelfstrip{display:flex;gap:12px;overflow-x:auto;overflow-y:hidden;
+    padding:2px 2px 12px;scroll-snap-type:x proximity;
+    -webkit-overflow-scrolling:touch}
   .shelfstrip::-webkit-scrollbar{height:6px}
   .shelfstrip::-webkit-scrollbar-thumb{background:var(--rule);border-radius:3px}
-  .card{flex:0 0 136px;display:flex;flex-direction:column;gap:6px;
+  /* min-width:0 overrides the flex-item default of min-width:auto, which
+     resolves to the content's min-content width -- without it, a card whose
+     title or meta has a long unbreakable token renders wider than 136px
+     regardless of flex-basis, while its neighbours stay exact, producing
+     uneven gaps down the row. */
+  .card{flex:0 0 136px;min-width:0;display:flex;flex-direction:column;gap:6px;
     text-align:left;background:none;border:none;padding:0;cursor:pointer;
     scroll-snap-align:start}
   .card:disabled{cursor:default}

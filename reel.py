@@ -6383,8 +6383,9 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     text-align:left;background:none;border:none;padding:0;cursor:pointer;
     scroll-snap-align:start}
   .card:disabled{cursor:default}
-  .cardart{position:relative;width:136px;aspect-ratio:2/3;border-radius:6px;
-    overflow:hidden;background:var(--panel);border:1px solid var(--rule)}
+  .cardart{position:relative;flex:0 0 204px;width:136px;height:204px;
+    aspect-ratio:2/3;border-radius:6px;overflow:hidden;background:var(--panel);
+    border:1px solid var(--rule)}
   .cardart img{width:100%;height:100%;object-fit:cover;display:block}
   /* no poster (a tracker-only shelf item) falls back to the title set as the
      card's own face, rather than an empty grey rectangle */
@@ -6393,7 +6394,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .cardbadge{position:absolute;top:5px;right:5px;font:500 10px/1 var(--mono);
     background:rgba(0,0,0,.72);color:var(--live);padding:3px 5px;border-radius:3px}
   .card:hover:not(:disabled) .cardart{border-color:var(--dim)}
-  .cardtitle{font-size:11.5px;color:var(--text);line-height:1.3;
+  .cardtitle{font-size:11.5px;color:var(--text);line-height:1.3;max-height:2.6em;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .cardmeta{font:400 10.5px/1.35 var(--mono);color:var(--faint);
     font-variant-numeric:tabular-nums}

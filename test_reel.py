@@ -1226,6 +1226,33 @@ class TestCatalogue(Base):
         self.assertIn("wuxia", note)
         self.assertNotIn("with_genres", self.calls[-1][1])
 
+    def test_language_becomes_a_discover_parameter(self):
+        self.stub({"results": []})
+        self.m.catalogue_search({"kind": "movie", "language": "JA"})
+        self.assertEqual(self.calls[-1][1]["with_original_language"], "ja")
+
+    def test_language_filters_free_text_locally(self):
+        # search/movie carries no with_original_language of its own, so a
+        # language filter combined with free text has to be applied to what
+        # came back rather than sent as a parameter.
+        self.stub({"results": [
+            dict(self.movie("Oldboy", 2003), original_language="ko"),
+            dict(self.movie("Oldboy", 2013), original_language="en"),
+        ]})
+        rows, _err, _ = self.m.catalogue_search({"text": "oldboy", "language": "ko"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["year"], 2003)
+
+    def test_the_quality_filter_reaches_find_torrent(self):
+        self.stub({"results": [self.movie("Ikiru", 1952)]})
+        calls = []
+        def fake_find(title, year=None, min_res=None):
+            calls.append(min_res)
+            return None
+        self.m.find_torrent = fake_find
+        self.m.catalogue_with_copies({"quality": "1080p"})
+        self.assertEqual(calls, ["1080p"])
+
     def test_free_text_searches_by_name_instead(self):
         # discover cannot take a title, so a query with text has to switch
         # endpoints rather than silently ignore it.
@@ -1294,6 +1321,46 @@ class TestCatalogue(Base):
              "magnet": "right"},
         ], {})
         self.assertEqual(self.m.find_torrent("Gabriel's Inferno", 2020)["magnet"], "right")
+
+    def test_a_quality_floor_rejects_a_lower_resolution(self):
+        # A worse-than-asked-for release is not what a quality filter means:
+        # this must report no copy, not settle for the one that exists.
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40, "name": "Ikiru.1952.720p.BluRay.x264-GRP",
+             "seeders": 60, "leechers": 1, "size": 3_000_000_000, "files": 1,
+             "magnet": "m"},
+        ], {})
+        self.assertIsNone(self.m.find_torrent("Ikiru", 1952, min_res="1080p"))
+
+    def test_a_quality_floor_accepts_the_matching_release(self):
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40, "name": "Ikiru.1952.720p.BluRay.x264-GRP",
+             "seeders": 60, "leechers": 1, "size": 3_000_000_000, "files": 1,
+             "magnet": "small"},
+            {"infohash": "b" * 40, "name": "Ikiru.1952.2160p.BluRay.x264-GRP",
+             "seeders": 20, "leechers": 1, "size": 7_000_000_000, "files": 1,
+             "magnet": "big"},
+        ], {})
+        hit = self.m.find_torrent("Ikiru", 1952, min_res="1080p")
+        self.assertEqual(hit["magnet"], "big")
+
+    def test_an_unknown_resolution_does_not_pass_a_floor(self):
+        # Unknown is treated as not meeting the bar, the same way an unknown
+        # codec is costed as needing a remux elsewhere in this file.
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40, "name": "Ikiru.1952.BluRay.x264-GRP",
+             "seeders": 60, "leechers": 1, "size": 3_000_000_000, "files": 1,
+             "magnet": "m"},
+        ], {})
+        self.assertIsNone(self.m.find_torrent("Ikiru", 1952, min_res="720p"))
+
+    def test_no_floor_is_unaffected(self):
+        self.m.search_all = lambda q: ([
+            {"infohash": "a" * 40, "name": "Ikiru.1952.720p.BluRay.x264-GRP",
+             "seeders": 60, "leechers": 1, "size": 3_000_000_000, "files": 1,
+             "magnet": "m"},
+        ], {})
+        self.assertIsNotNone(self.m.find_torrent("Ikiru", 1952))
 
     def test_camera_rips_and_packs_are_not_offered_as_the_copy(self):
         self.m.search_all = lambda q: ([

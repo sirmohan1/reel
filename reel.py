@@ -2461,8 +2461,8 @@ def tmdb_person(name):
 def catalogue_search(q):
     """Films and shows matching a set of filters, best first.
 
-    q keys: kind, genre, actor, year_from, year_to, rating_min, votes_min, text.
-    Returns (rows, error, note).
+    q keys: kind, genre, actor, language, year_from, year_to, rating_min,
+    votes_min, text. Returns (rows, error, note).
     """
     if not has_tmdb():
         return [], "no TMDb key, so genre and cast search is unavailable", ""
@@ -2497,14 +2497,22 @@ def catalogue_search(q):
         params["with_cast" if kind == "movie" else "with_people"] = pid
         note.append("cast: " + real)
 
+    lang = (q.get("language") or "").strip().lower()
+    if lang:
+        params["with_original_language"] = lang
+
     # Free text cannot be combined with discover's filters, so a query with both
-    # searches by name and then applies what it can locally.
+    # searches by name and then applies what it can locally -- which is also
+    # the only way to apply a language filter to it, since search carries no
+    # with_original_language of its own.
     if (q.get("text") or "").strip():
         data = tmdb_get("search/%s" % kind, query=q["text"].strip(),
                         include_adult="false")
         rows = (data or {}).get("results", [])
         lo = float(q.get("rating_min") or 0)
         rows = [r for r in rows if (r.get("vote_average") or 0) >= lo]
+        if lang:
+            rows = [r for r in rows if (r.get("original_language") or "") == lang]
     else:
         data = tmdb_get("discover/%s" % kind, **params)
         rows = (data or {}).get("results", [])
@@ -2528,14 +2536,23 @@ def catalogue_search(q):
     return [r for r in out if r["title"]], None, "; ".join(note)
 
 
-def find_torrent(title, year=None):
+RES_ORDER = {"480p": 1, "720p": 2, "1080p": 3, "2160p": 4}
+
+
+def find_torrent(title, year=None, min_res=None):
     """The best copy of a named film on any indexer, or None.
 
     The catalogue chose the film, so this only has to find it -- and has to
     refuse near misses, since a search for one title cheerfully returns others.
+
+    min_res is a hard floor, not a preference: a release whose resolution is
+    unknown is excluded when one is set, the same way an unknown codec is
+    costed as needing a remux elsewhere in this file -- better to say no copy
+    than to hand over one that quietly does not meet what was asked for.
     """
     rows, _per = search_all(("%s %s" % (title, year)) if year else title)
     want = _norm_title(title)
+    floor = RES_ORDER.get(min_res) if min_res else None
     keep = []
     for r in rows:
         if feed_cam(r["name"]) or feed_pack(r["name"], r.get("files")):
@@ -2547,6 +2564,10 @@ def find_torrent(title, year=None):
         # across territories more often than they agree exactly.
         if year and got_year and abs(got_year - year) > 1:
             continue
+        if floor is not None:
+            res = read_release(r["name"])["res"]
+            if RES_ORDER.get(res, 0) < floor:
+                continue
         keep.append(r)
     if not keep:
         return None
@@ -2700,14 +2721,21 @@ def poster_file(size, name):
 
 
 def catalogue_with_copies(q):
-    """Catalogue results, with a torrent attached to those that have one."""
+    """Catalogue results, with a torrent attached to those that have one.
+
+    q may also carry "quality" -- a resolution floor, applied to which copy
+    counts, not to which films are chosen. A film with only a 720p copy when
+    1080p was asked for is reported unavailable, the same as one with no copy
+    at all: a worse-than-asked-for release is not what quality filtering means.
+    """
     rows, err, note = catalogue_search(q)
     if not rows:
         return rows, err, note
+    min_res = (q.get("quality") or "").strip() or None
 
     def look(row):
         try:
-            hit = find_torrent(row["title"], row["year"])
+            hit = find_torrent(row["title"], row["year"], min_res=min_res)
         except Exception:
             hit = None
         if hit:
@@ -6442,6 +6470,27 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <label>Years <input id="fyfrom" type="number" min="1900" max="2100" placeholder="from">
                  <input id="fyto" type="number" min="1900" max="2100" placeholder="to"></label>
     <label>Rating at least <input id="frating" type="number" min="0" max="10" step="0.5" placeholder="any"></label>
+    <label>Language
+      <select id="flang">
+        <option value="">Any</option>
+        <option value="en">English</option><option value="hi">Hindi</option>
+        <option value="es">Spanish</option><option value="fr">French</option>
+        <option value="de">German</option><option value="it">Italian</option>
+        <option value="ja">Japanese</option><option value="ko">Korean</option>
+        <option value="zh">Chinese</option><option value="ru">Russian</option>
+        <option value="pt">Portuguese</option><option value="ar">Arabic</option>
+        <option value="tr">Turkish</option><option value="ta">Tamil</option>
+        <option value="te">Telugu</option><option value="th">Thai</option>
+      </select>
+    </label>
+    <label>Quality
+      <select id="fquality">
+        <option value="">Any</option>
+        <option value="720p">720p or better</option>
+        <option value="1080p">1080p or better</option>
+        <option value="2160p">4K only</option>
+      </select>
+    </label>
     <button id="findgo" type="button">Find</button>
   </div>
   <div class="results" id="results" hidden></div>
@@ -6733,6 +6782,7 @@ async function runFind() {
   const q = {kind: $('fkind').value, genre: $('fgenre').value,
              actor: $('factor').value.trim(), year_from: $('fyfrom').value,
              year_to: $('fyto').value, rating_min: $('frating').value,
+             language: $('flang').value, quality: $('fquality').value,
              text: ta.value.trim()};
   let r;
   try { r = await api('/find', q); }
@@ -6771,7 +6821,10 @@ async function runFind() {
       bits.push(res.direct ? 'plays directly' :
                 res.codec === 'hevc' ? 'needs remux' : 'may need remux');
     } else if (res.available === false) {
-      bits.push('no copy found');
+      // Distinguished because they call for different reactions: one says
+      // nothing exists, the other says something does, just not at the bar
+      // that was asked for -- worth knowing before loosening the filter.
+      bits.push($('fquality').value ? 'no copy at that quality' : 'no copy found');
     } else {
       bits.push('not looked for yet');
     }

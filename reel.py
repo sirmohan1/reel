@@ -6397,18 +6397,25 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
      poster hides exactly the thing someone's trying to see past it.
      Sitting beside it instead costs 2*30px of shelf width and hides
      nothing. */
-  .shelfnav{flex:0 0 26px;display:flex;align-items:center;justify-content:center;
-    background:var(--panel);border:1px solid var(--rule);border-radius:4px;
-    color:var(--dim);cursor:pointer;font-size:10px;padding:0}
+  /* height:auto for the same reason as .card -- it's a <button>, and align-
+     items:stretch on .shelfstripwrap can't stretch it to match the strip's
+     height unless its own height starts out auto rather than the global
+     button rule's fixed 40px. */
+  .shelfnav{flex:0 0 26px;height:auto;display:flex;align-items:center;
+    justify-content:center;background:var(--panel);border:1px solid var(--rule);
+    border-radius:4px;color:var(--dim);cursor:pointer;font-size:10px;padding:0}
   .shelfnav:hover:not(:disabled){color:var(--text);border-color:var(--dim)}
   .shelfnav:disabled{opacity:.3;cursor:default}
   /* min-width:0 overrides the flex-item default of min-width:auto, which
      resolves to the content's min-content width -- without it, a card whose
      title or meta has a long unbreakable token renders wider than 136px
      regardless of flex-basis, while its neighbours stay exact, producing
-     uneven gaps down the row. */
-  .card{flex:0 0 136px;min-width:0;display:flex;flex-direction:column;gap:6px;
-    text-align:left;background:none;border:none;padding:0;cursor:pointer;
+     uneven gaps down the row. height:auto overrides the global button rule
+     (button{height:40px}) below -- a card *is* a <button>, and without this
+     it silently inherits that fixed height instead of sizing to its poster,
+     which is what was clipping the strip to 40-ish px in the first place. */
+  .card{flex:0 0 136px;min-width:0;height:auto;display:flex;flex-direction:column;
+    gap:6px;text-align:left;background:none;border:none;padding:0;cursor:pointer;
     scroll-snap-align:start}
   .card:disabled{cursor:default}
   .cardart{position:relative;flex:0 0 204px;width:136px;height:204px;

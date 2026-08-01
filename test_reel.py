@@ -13,6 +13,7 @@ Run:  python3 test_reel.py          (or -v for the list)
 
 import gzip
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -2226,6 +2227,145 @@ class TestCatalogueShelves(Base):
         rows, err, per = self.m.build_shelves()
         self.assertEqual(rows, [])
         self.assertIn("could not reach", err)
+
+
+# --------------------------------------------------------------------------
+class TestShelfAssembly(Base):
+    """build_catalogue_shelves itself, which until now was only ever mocked --
+    so the widening to 20 a shelf, and the cross-shelf dedup that stops one
+    film filling half the page, had no coverage at all.
+
+    tmdb_rows and shelf_from_catalogue are stubbed so this tests the assembly
+    -- ordering, capping, dedup, omission -- rather than the catalogue or the
+    indexers, which have their own tests."""
+
+    def setUp(self):
+        super().setUp()
+        self.asked = []                       # the discover queries issued
+        self.finders = []                     # which copy-finder each shelf used
+        # Captured before stub() replaces the function, so the film path's
+        # reliance on the default is still checkable.
+        self.real_finder_default = inspect.signature(
+            self.m.shelf_from_catalogue).parameters["finder"].default
+
+    def stub(self, per_shelf, tv=False):
+        """per_shelf: {shelf name: [titles]} the catalogue offers for each.
+
+        The catalogue returns exactly those titles, and every candidate that
+        reaches shelf_from_catalogue is treated as having a copy -- so what
+        the shelf ends up holding is decided by build_catalogue_shelves' own
+        dedup and capping, which is the thing under test.
+        """
+        shelves = self.m.CAT_SHELVES_TV if tv else self.m.CAT_SHELVES
+        plan = [per_shelf.get(n, []) for n in (n for n, _, _ in shelves)]
+        def rows(**q):
+            self.asked.append(q)
+            titles = plan[len(self.asked) - 1] if len(self.asked) <= len(plan) else []
+            return [{"title": t, "year": 2020, "rating": 8.0, "votes": 5000}
+                    for t in titles]
+        self.m.tmdb_rows = rows
+        def shelf(rows_in, want, now, finder=None):
+            self.finders.append(finder)
+            return [{"title": r["title"], "name": r["title"], "size": 1,
+                     "seeders": 99} for r in rows_in][:want]
+        self.m.shelf_from_catalogue = shelf
+        self.m.feed_dress = lambda rows: rows
+
+    def names(self, out):
+        return [s["name"] for s in out]
+
+    def test_a_shelf_is_capped_at_the_configured_width(self):
+        # FEED_SHELF is the promise; more candidates surviving must not widen it.
+        wide = ["f%d" % i for i in range(50)]
+        self.stub({"Tonight": wide})
+        out, err, _ = self.m.build_catalogue_shelves()
+        self.assertIsNone(err)
+        self.assertEqual(len(out[0]["films"]), self.m.FEED_SHELF)
+
+    def test_a_film_is_not_repeated_on_a_later_shelf(self):
+        # Popular-and-well-reviewed films qualify for several shelves at once;
+        # without the dedup the same handful fills most of the page.
+        self.stub({"Tonight": ["Dune", "Arrival"], "Just landed": ["Dune", "Tenet"]})
+        out, _err, _ = self.m.build_catalogue_shelves()
+        seen = [f["title"] for s in out for f in s["films"]]
+        self.assertEqual(len(seen), len(set(seen)), seen)
+
+    def test_a_shelf_with_nothing_available_is_omitted_not_shown_bare(self):
+        self.stub({"Tonight": ["Dune"], "Top rated": []})
+        out, _err, _ = self.m.build_catalogue_shelves()
+        self.assertIn("Tonight", self.names(out))
+        self.assertNotIn("Top rated", self.names(out))
+
+    def test_shelves_come_back_in_the_configured_order(self):
+        # Filled in one order, displayed in another: what needs protecting and
+        # what belongs at the top of the page are different questions.
+        order = [n for n, _, _ in self.m.CAT_SHELVES]
+        self.stub({n: ["only-%s" % n] for n in order})
+        out, _err, _ = self.m.build_catalogue_shelves()
+        self.assertEqual(self.names(out), order)
+
+    def test_nothing_available_anywhere_is_an_error_not_an_empty_success(self):
+        # An empty page with no explanation reads as a broken app.
+        self.stub({})
+        out, err, _ = self.m.build_catalogue_shelves()
+        self.assertEqual(out, [])
+        self.assertIn("nothing with a copy", err)
+
+    def test_no_shelf_asks_for_films_released_in_the_future(self):
+        # Nothing released tomorrow can be watched tonight.
+        self.stub({"Tonight": ["Dune"]})
+        self.m.build_catalogue_shelves()
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        for q in self.asked:
+            self.assertLessEqual(q.get("primary_release_date.lte", "0"), today)
+
+    def test_just_landed_asks_for_a_recent_window_and_gems_an_old_one(self):
+        # The two shelves that are defined by *when*, not just by rating.
+        self.stub({"Tonight": ["Dune"]})
+        self.m.build_catalogue_shelves()
+        by = {}
+        for name, q in zip([n for n, _, _ in self.m.CAT_SHELVES], self.asked):
+            by[name] = q
+        self.assertIn("primary_release_date.gte", by["Just landed"])
+        # gems must be old enough that its rating has settled
+        self.assertLess(by["Hidden gems"]["primary_release_date.lte"],
+                        by["Tonight"]["primary_release_date.lte"])
+
+    def test_film_shelves_look_for_a_film_not_a_season(self):
+        # Films take shelf_from_catalogue's default finder rather than passing
+        # one, so this pins both halves: the film path overrides nothing, and
+        # the default it inherits is the film finder, not the season one.
+        self.assertIs(self.real_finder_default, self.m.cached_torrent)
+        self.stub({"Tonight": ["Dune"]})
+        self.m.build_catalogue_shelves()
+        self.assertTrue(self.finders)
+        self.assertTrue(all(f is None for f in self.finders), self.finders)
+
+    def test_tv_shelves_only_count_a_whole_season_as_available(self):
+        # The guarantee that keeps a show whose only copies are single
+        # episodes off the shelf entirely, rather than offered with a caveat.
+        self.stub({"Tonight": ["Severance"]}, tv=True)
+        out, _per = self.m.build_catalogue_shelves_tv()
+        self.assertTrue(self.finders)
+        self.assertTrue(all(f is self.m.cached_season for f in self.finders),
+                        self.finders)
+        self.assertEqual(out[0]["films"][0]["title"], "Severance")
+
+    def test_tv_shelves_ask_first_air_date_not_release_date(self):
+        # A different field on the catalogue side; asking the film one back
+        # would silently return nothing for every TV shelf.
+        self.stub({"Tonight": ["Severance"]}, tv=True)
+        self.m.build_catalogue_shelves_tv()
+        self.assertTrue(any("first_air_date.lte" in q for q in self.asked))
+        self.assertFalse(any("primary_release_date.lte" in q for q in self.asked))
+
+    def test_the_gems_shelf_still_demands_a_real_audience(self):
+        # The rating floor was loosened to 7.0; the vote floor is what stops
+        # a 9.4-from-500-votes film being called a hidden gem, and must stay.
+        gems = dict(next(p for n, _, p in self.m.CAT_SHELVES if n == "Hidden gems"))
+        self.assertGreaterEqual(gems["vote_count.gte"], 300)
+        self.assertIn("vote_count.lte", gems)      # "barely seen" is the point
+        self.assertLessEqual(gems["vote_average.gte"], 7.5)
 
 
 # --------------------------------------------------------------------------

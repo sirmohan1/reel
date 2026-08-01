@@ -8462,8 +8462,7 @@ function audioReady() {
     gainNode = actx.createGain();
     compNode = actx.createDynamicsCompressor();
     srcNode.connect(gainNode);
-    gainNode.connect(compNode);
-    compNode.connect(actx.destination);
+    route();               // gain -> (compressor) -> speakers, or straight out
   } catch (e) {
     // Leave actx set so this is not retried on every play; a failure here is
     // permanent for the page (the element can only be captured once).
@@ -8472,6 +8471,37 @@ function audioReady() {
   }
   applyNight();
   return true;
+}
+
+/* The compressor is routed around unless it has actual work to do, rather
+   than left in the chain on "transparent" settings -- because there are no
+   transparent settings. DynamicsCompressorNode applies its own automatic
+   makeup gain, which is not exposed and cannot be switched off: measured
+   here, a -20 dBFS tone with no gain and no limiting to perform still came
+   out of it at -19.15 dBFS. Left permanently in circuit it would colour
+   every title, including the ones needing no correction at all, and add an
+   uncalibrated ~0.85 dB on top of the very loudness match it sits behind.
+
+   So it is inserted only when something has to be caught: night mode, or a
+   boost, which really can drive peaks past full scale (the same measurement
+   put a +2.67 dB boost on a loud master at +2.47 dBFS bypassed, against
+   -0.31 dBFS through the compressor). Everywhere else the signal is a
+   constant multiply and nothing more. */
+let curDb = 0;
+
+function needsCompressor() {
+  return nightOn || curDb > 0;
+}
+
+function route() {
+  if (!gainNode) return;
+  try { gainNode.disconnect(); compNode.disconnect(); } catch (e) {}
+  if (needsCompressor()) {
+    gainNode.connect(compNode);
+    compNode.connect(actx.destination);
+  } else {
+    gainNode.connect(actx.destination);
+  }
 }
 
 function applyNight() {
@@ -8487,7 +8517,8 @@ function applyNight() {
     c.attack.setValueAtTime(0.003, t);
     c.release.setValueAtTime(0.30, t);
   } else {
-    // Transparent except on the peaks that would otherwise clip.
+    // A brickwall on the last 1.5 dB, reached only by a boost. Nothing that
+    // is not being boosted is routed through this at all -- see route().
     c.threshold.setValueAtTime(-1.5, t);
     c.knee.setValueAtTime(0, t);
     c.ratio.setValueAtTime(20, t);
@@ -8506,6 +8537,10 @@ function targetGain(j) {
 
 function applyGain(j) {
   if (!gainNode) return;
+  // Whether the compressor is needed at all depends on this title's own
+  // correction, so the routing is decided here, before the ramp.
+  curDb = (j && typeof j.gain_db === 'number') ? j.gain_db : 0;
+  route();
   // Ramped, not stepped: a jump in gain at the moment a title starts is an
   // audible click.
   const t = actx.currentTime;

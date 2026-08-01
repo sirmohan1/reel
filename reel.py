@@ -7220,11 +7220,13 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 
   /* Only shown when more than one section is actually present -- see
      loadPicks -- so this never adds a label above the only section there is.
-     Styled as an eyebrow (the same faint mono caps as QUEUE / CACHE / PICKS)
-     rather than competing with the shelf names below it: it labels a group,
-     where a shelf name titles one. */
-  .picksection{font:600 12.5px/1 var(--mono);letter-spacing:.14em;
-    text-transform:uppercase;color:var(--faint);margin:30px 0 6px}
+     The largest text on the page, over a brass rule: Movies and TV Shows are
+     the top of the hierarchy here (section > shelf > card), so this has to
+     outrank the 17px shelf headings under it by an obvious margin rather
+     than a subtle one, or the two read as the same level. */
+  .picksection{font:700 25px/1.1 var(--sans);letter-spacing:-.02em;
+    color:var(--text);margin:44px 0 20px;padding-top:16px;
+    border-top:2px solid var(--brass)}
   .picksection:first-child{margin-top:0}
 
   /* shelves -- one horizontally-scrolling strip per shelf, card-based rather

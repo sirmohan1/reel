@@ -1080,6 +1080,65 @@ class TestLibtorrentBackend(Base):
         self.assertFalse(j["wt_direct"])
         self.assertFalse(self.m.public(j)["seekable"])
 
+    # ---- live_seek: what it will and will not read ------------------------
+
+    def test_live_seek_needs_something_that_answers_ranges(self):
+        j = self.job()
+        j["duration"] = 600
+        self.assertFalse(self.m.live_seek(j, 100))        # no source at all
+        j["wt_url"] = "http://127.0.0.1:9/x.mkv"          # but no ranges
+        self.assertFalse(self.m.live_seek(j, 100))
+
+    def test_live_seek_refuses_a_point_past_the_end(self):
+        j = self.job()
+        j["duration"] = 600
+        j["path"] = os.path.join(self.dl, "f.mp4")
+        self.assertFalse(self.m.live_seek(j, 599.5))
+        self.assertFalse(self.m.live_seek(j, 10_000))
+
+    def test_live_seek_reads_webtorrents_endpoint_when_there_is_no_local_file(self):
+        # The gap this closes: on the default backend there is no file to
+        # read, but webtorrent's own server answers ranges perfectly well.
+        seen = {}
+        self.m.start_live_from_url = lambda job, url, kind, **kw: seen.update(
+            url=url, start_at=kw.get("start_at"))
+        j = self.job()
+        j["duration"] = 600
+        j["wt_url"] = "http://127.0.0.1:8801/webtorrent/abc/f.mkv"
+        j["wt_ranges"] = True
+        self.assertTrue(self.m.live_seek(j, 120))
+        self.assertEqual(seen["url"], j["wt_url"])
+        self.assertEqual(seen["start_at"], 120)
+        self.assertEqual(j["live_offset"], 120)
+
+    def test_live_seek_reads_reels_own_route_for_a_local_file(self):
+        # So the reads pass through the range handler and pull pieces on the
+        # way; pointed at the file it would read preallocated zeros.
+        seen = {}
+        self.m.start_live_from_url = lambda job, url, kind, **kw: seen.update(
+            url=url, start_at=kw.get("start_at"))
+        j = self.job()
+        j["duration"] = 600
+        j["lt_file"] = os.path.join(self.dl, "f.mkv")
+        self.assertTrue(self.m.live_seek(j, 60))
+        self.assertIn("/stream/" + j["id"], seen["url"])
+
+    def test_live_seek_clears_the_stream_it_replaces(self):
+        # Two streams writing the same file would interleave; the viewer on
+        # the old one has to be given a clean end instead.
+        old = os.path.join(self.dl, "old.live.mp4")
+        with open(old, "wb") as f:
+            f.write(b"x" * 32)
+        self.m.start_live_from_url = lambda *a, **k: None
+        j = self.job()
+        j["duration"] = 600
+        j["path"] = os.path.join(self.dl, "f.mp4")
+        j["live_file"] = old
+        j["live_ready"] = True
+        self.assertTrue(self.m.live_seek(j, 30))
+        self.assertFalse(os.path.exists(old))
+        self.assertFalse(j["live_ready"])
+
     # ---- ensure_range: the reason for the whole migration ----------------
 
     def test_webtorrent_admits_it_cannot_prioritise(self):

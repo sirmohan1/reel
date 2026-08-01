@@ -6842,8 +6842,17 @@ def live_seek(job, at):
     the way (ensure_range). Pointing it straight at the file would have it
     read preallocated zeros wherever the download has not reached.
     """
-    if not job.get("lt_file") and not job.get("path"):
-        return False                      # nothing with random access to read
+    # Any source that answers ranges will do. A local backend's file is read
+    # back through reel's own route so the pieces under each read are fetched
+    # on the way; webtorrent's server is read directly, since it is already
+    # http and reel has no piece control over it either way. Without one of
+    # those there is nothing to seek in.
+    if job.get("lt_file") or job.get("path"):
+        src = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
+    elif job.get("wt_url") and job.get("wt_ranges"):
+        src = job["wt_url"]
+    else:
+        return False
     try:
         at = max(0.0, float(at))
     except (TypeError, ValueError):
@@ -6871,8 +6880,7 @@ def live_seek(job, at):
             os.remove(old_file)
         except OSError:
             pass
-    url = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
-    start_live_from_url(job, url, job.get("kind", "video"),
+    start_live_from_url(job, src, job.get("kind", "video"),
                         vcodec=job.get("vcodec"), pix=job.get("vpix"),
                         start_at=at)
     job["live_offset"] = at

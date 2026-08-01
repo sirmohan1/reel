@@ -5482,6 +5482,9 @@ class WebTorrentBackend:
     server. What reel has always done."""
 
     name = "webtorrent"
+    # Bytes are read back over http from the client's own server, not off
+    # disk -- see stream_url.
+    serves_locally = False
 
     @staticmethod
     def available():
@@ -5625,6 +5628,10 @@ class LibtorrentBackend:
     """
 
     name = "libtorrent"
+    # There is no second server to read from: the session writes into out_dir
+    # and reel serves that file directly, fetching the pieces under each read
+    # as it goes (ensure_range).
+    serves_locally = True
 
     def __init__(self):
         self._ses = None
@@ -5982,7 +5989,27 @@ def run_torrent(job):
         cleanup()
         job["status"] = cancel_status(job)
         return
-    if not url:
+    if not url and getattr(bk, "serves_locally", False):
+        # Nothing to proxy: this backend writes into out_dir and the file is
+        # read straight off disk. Everything downstream takes a path just as
+        # happily as a url -- ffprobe and ffmpeg do not care which -- so the
+        # rest of this function is unchanged.
+        t_file = time.time()
+        while time.time() - t_file < WT_SERVER_WAIT and not job["cancel"].is_set():
+            url = locate_downloaded_file(out_dir, chosen)
+            if url:
+                break
+            time.sleep(0.3)
+        if not url:
+            cleanup()
+            return fail(job, "libtorrent wrote nothing to read in %ds. %s"
+                             % (WT_SERVER_WAIT, bk.recent_output(job)))
+        # Read back through the same range handler a finished file uses; the
+        # file is preallocated to its full length, so a seek anywhere is a
+        # legitimate request and ensure_range fetches what it lands on.
+        job["lt_file"] = url
+        job["wt_direct"] = True
+    elif not url:
         # No usable endpoint. Rather than give up, fall back to piping the file
         # out of webtorrent sequentially -- documented, and independent of
         # whatever url layout this build uses. Costs seeking, not playback.
@@ -6002,7 +6029,11 @@ def run_torrent(job):
                     else "No playable endpoint on port %d and piping failed. %s"
                          % (port, detail))
 
-    job["wt_url"] = url
+    # Only a real url belongs here: it is what the range handler proxies to,
+    # and a local path put through that would be fetched as if it were a
+    # server. A local backend is served from lt_file instead.
+    if not job.get("lt_file"):
+        job["wt_url"] = url
 
     # Wait for the swarm to actually deliver something before asking anything to
     # read this url. The endpoint can be correct while entirely empty -- that is
@@ -7383,6 +7414,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 return self._live(jid, live_file=job.get("compat_file"),
                                   ready_key="compat_ready",
                                   done_key="compat_done")
+        # A torrent still downloading under a local backend: the file is
+        # preallocated to its full length, so ranges are answered normally and
+        # the pieces under each read are fetched on the way past. Checked
+        # before wt_url so a finished copy still wins if there is one.
+        if not path and job.get("lt_file") and os.path.isfile(job["lt_file"]):
+            path = job["lt_file"]
         if not path and job.get("wt_direct") and job.get("wt_url"):
             return self._proxy(jid, job, job["wt_url"])
         if not path or not os.path.isfile(path):
@@ -7408,6 +7445,24 @@ class H(http.server.BaseHTTPRequestHandler):
             end = min(end, size - 1)
             length = max(end - start + 1, 0)
 
+            # Ask for the front of what was requested before answering at all.
+            # A player seeking into a part that has not arrived would otherwise
+            # be handed the preallocated zeros sitting there. Only the first
+            # chunk is waited on -- the rest is fetched as the loop reaches it,
+            # so a whole-file request still starts streaming immediately.
+            live_bytes = job.get("lt_file") and not job.get("path")
+            if live_bytes and length:
+                if not backend().ensure_range(job, start, min(length, 262144)):
+                    # The pieces did not arrive. The file is preallocated, so
+                    # reading anyway would hand the player a block of zeros and
+                    # call it video -- worse than saying no, because it decodes
+                    # as corruption rather than as "not ready". Ask it back.
+                    self.send_response(503)
+                    self.send_header("Retry-After", "2")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
             self.send_response(206 if rng else 200)
             self.send_header("Content-Type", ctype_for(path))
             self.send_header("Accept-Ranges", "bytes")
@@ -7419,7 +7474,17 @@ class H(http.server.BaseHTTPRequestHandler):
                 f.seek(start)
                 left = length
                 while left > 0:
-                    chunk = f.read(min(262144, left))
+                    want = min(262144, left)
+                    # Cheap when the pieces are already held, which is the
+                    # common case once playback has caught up with the fill.
+                    # Mid-body there is no way to signal a failure -- the
+                    # status line is long gone -- so a range that stops
+                    # arriving ends the response rather than padding it with
+                    # zeros, and the player reconnects.
+                    if live_bytes and not backend().ensure_range(
+                            job, start + (length - left), want):
+                        break
+                    chunk = f.read(want)
                     if not chunk:
                         break
                     try:

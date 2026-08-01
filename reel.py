@@ -1659,6 +1659,38 @@ def build_magnet(infohash, name):
     return "&".join(parts)
 
 
+def merge_trackers(magnet):
+    """Add the verified trackers to a magnet without taking away its own.
+
+    A magnet reel built itself already carries them, so this changes nothing
+    there. What it is for is one pasted in by hand: that arrives with
+    whatever trackers the site that produced it chose, which may be few,
+    stale, or none at all -- and reel already maintains a list it re-checks
+    weekly by actually handshaking each one.
+
+    A union rather than a replacement, for the same reason fetch_tracker_list
+    keeps what it already trusts: the ones already in the magnet may include
+    a private or torrent-specific tracker holding peers that no public list
+    knows about, and swapping them out would lose exactly the peers most
+    likely to have this file.
+
+    Applied when a download starts rather than when it is queued, so a job
+    that has been sitting in the queue picks up the current list rather than
+    the one from whenever it was added.
+    """
+    if not magnet or not magnet.startswith("magnet:"):
+        return magnet                     # a .torrent path, left alone
+    try:
+        have = {urllib.parse.unquote(t)
+                for t in re.findall(r"[?&]tr=([^&]+)", magnet)}
+        extra = [t for t in SEARCH_TRACKERS if t not in have]
+        if not extra:
+            return magnet
+        return magnet + "".join("&tr=" + urllib.parse.quote(t) for t in extra)
+    except Exception:
+        return magnet
+
+
 def udp_scrape(infohash, tracker, timeout=4.0):
     """Ask a tracker how many seeders a torrent actually has.
 
@@ -5866,7 +5898,10 @@ def backend():
 
 
 def run_torrent(job):
-    magnet = job["magnet"]
+    # The job keeps whatever magnet it was given -- that is what a refetch or
+    # a restart replays. Only the download uses the widened one, and it is
+    # widened here so it reflects the tracker list as of now.
+    magnet = merge_trackers(job["magnet"])
     out_dir = os.path.join(DL, job["id"] + "_wt")
 
     def cleanup():

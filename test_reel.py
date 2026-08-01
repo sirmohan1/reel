@@ -17,6 +17,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -552,6 +553,74 @@ class TestTorrentBackend(Base):
         got = bk.recent_output(j)
         self.assertIn("Peers: 12/40", got)
         self.assertIn("connecting", got)
+
+
+# --------------------------------------------------------------------------
+class TestMergeTrackers(Base):
+    """Widening a magnet's tracker list without narrowing it. The union is
+    the point: a magnet's own trackers may include one holding peers no
+    public list knows about."""
+
+    def setUp(self):
+        super().setUp()
+        self.m.SEARCH_TRACKERS = ("udp://a.example:1/announce",
+                                  "udp://b.example:2/announce")
+
+    def trs(self, magnet):
+        import urllib.parse
+        return [urllib.parse.unquote(t)
+                for t in re.findall(r"[?&]tr=([^&]+)", magnet)]
+
+    def test_a_bare_magnet_gains_the_verified_list(self):
+        # The case this exists for: pasted by hand, no trackers at all.
+        got = self.m.merge_trackers("magnet:?xt=urn:btih:" + "a" * 40)
+        self.assertEqual(self.trs(got), list(self.m.SEARCH_TRACKERS))
+
+    def test_a_magnets_own_trackers_are_kept_not_replaced(self):
+        # The whole reason this is a union: that tracker may be the only one
+        # that knows about this torrent.
+        mine = "udp://private.example:9/announce"
+        got = self.m.merge_trackers(
+            "magnet:?xt=urn:btih:%s&tr=%s" % ("a" * 40, mine))
+        self.assertIn(mine, self.trs(got))
+        for t in self.m.SEARCH_TRACKERS:
+            self.assertIn(t, self.trs(got))
+
+    def test_a_tracker_already_present_is_not_duplicated(self):
+        dup = self.m.SEARCH_TRACKERS[0]
+        import urllib.parse
+        got = self.m.merge_trackers("magnet:?xt=urn:btih:%s&tr=%s"
+                                    % ("a" * 40, urllib.parse.quote(dup)))
+        self.assertEqual(self.trs(got).count(dup), 1)
+
+    def test_a_magnet_reel_built_itself_is_unchanged(self):
+        # build_magnet already embeds the list, so this must be a no-op --
+        # not a second copy of every tracker on every start.
+        built = self.m.build_magnet("b" * 40, "Some Film")
+        self.assertEqual(self.m.merge_trackers(built), built)
+
+    def test_a_torrent_file_path_is_left_alone(self):
+        # run_torrent may hand this a local .torrent instead of a magnet.
+        p = "/tmp/whatever.torrent"
+        self.assertEqual(self.m.merge_trackers(p), p)
+
+    def test_nothing_is_not_turned_into_something(self):
+        self.assertIsNone(self.m.merge_trackers(None))
+        self.assertEqual(self.m.merge_trackers(""), "")
+
+    def test_the_result_is_still_a_usable_magnet(self):
+        # Parsed by the real thing rather than trusted to look right.
+        got = self.m.merge_trackers("magnet:?xt=urn:btih:" + "c" * 40)
+        self.assertTrue(got.startswith("magnet:?xt=urn:btih:"))
+        self.assertEqual(self.m.infohash(got), "c" * 40)
+
+    def test_the_current_list_is_used_not_the_one_from_queue_time(self):
+        # Applied at download time on purpose: a job may have sat in the
+        # queue across a weekly refresh.
+        bare = "magnet:?xt=urn:btih:" + "d" * 40
+        self.m.SEARCH_TRACKERS = ("udp://fresh.example:7/announce",)
+        self.assertEqual(self.trs(self.m.merge_trackers(bare)),
+                         ["udp://fresh.example:7/announce"])
 
 
 # --------------------------------------------------------------------------

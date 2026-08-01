@@ -487,9 +487,9 @@ FEED_LIMIT = 24
 # top of a shelf is checked: the rest show a tilde, exactly as search does, since
 # 5 shelves fully verified would be 40 scrapes to draw one page.
 try:
-    FEED_SHELF = max(1, int(os.environ.get("REEL_SHELF", "12")))
+    FEED_SHELF = max(1, int(os.environ.get("REEL_SHELF", "20")))
 except ValueError:
-    FEED_SHELF = 12              # a typo in an env var must not stop the server
+    FEED_SHELF = 20              # a typo in an env var must not stop the server
 # Candidates measured per shelf, which is more than are shown. Indexer counts
 # are inflated, and on the gems shelf -- where every row is thinly seeded by
 # definition -- rows claiming 100+ measured out at 2 and 4. Verifying only what
@@ -500,7 +500,7 @@ FEED_VERIFY = 12
 # shelf being left thin -- Bollywood swarms are a fraction of a global
 # release's, so nine of its first twelve were too thin to stream and it drew
 # three films. This bounds how many any one shelf may check before giving up.
-FEED_MAX_VERIFY = 36
+FEED_MAX_VERIFY = 60
 # A film is one film. Anything with this many files is a boxset, a season, or a
 # 400-file cartoon collection -- all of which were really in the list, and none
 # of which is something to press play on. Measured: legitimate single films top
@@ -522,7 +522,7 @@ FEED_SEED_FULL = 3000.0          # seeders at which the swarm score saturates
 # votes back it is the standard fix, and it costs one line.
 RATING_PRIOR, RATING_PRIOR_VOTES = 6.6, 2000.0
 # Shelf thresholds.
-GEM_RATING, GEM_SEEDERS = 7.2, 150   # well reviewed, barely seeded
+GEM_RATING, GEM_SEEDERS = 7.0, 150   # well reviewed, barely seeded
 LANDED_DAYS = 30                     # and released this year or last
 # Films rated this badly are not recommended. Only applied where a rating
 # exists: an unrated film is an unknown, not a bad one. Without it the "just
@@ -2499,8 +2499,8 @@ CAT_SHELVES = (
      {"sort_by": "primary_release_date.desc", "vote_count.gte": 120}),
     ("Top rated", "the best there is",
      {"sort_by": "vote_average.desc", "vote_count.gte": 5000}),
-    ("Hidden gems", "excellent, and barely seen",
-     {"sort_by": "vote_average.desc", "vote_average.gte": 7.5,
+    ("Hidden gems", "well reviewed, and barely seen",
+     {"sort_by": "vote_average.desc", "vote_average.gte": 7.0,
       "vote_count.gte": 800, "vote_count.lte": 4000}),
     ("Bollywood", "Hindi-language cinema",
      {"with_original_language": "hi", "vote_count.gte": 300,
@@ -2561,8 +2561,8 @@ CAT_SHELVES_TV = (
      {"sort_by": "first_air_date.desc", "vote_count.gte": 80}),
     ("Top rated", "the best there is",
      {"sort_by": "vote_average.desc", "vote_count.gte": 2000}),
-    ("Hidden gems", "excellent, and barely seen",
-     {"sort_by": "vote_average.desc", "vote_average.gte": 8.0,
+    ("Hidden gems", "well reviewed, and barely seen",
+     {"sort_by": "vote_average.desc", "vote_average.gte": 7.0,
       "vote_count.gte": 300, "vote_count.lte": 2000}),
 )
 
@@ -2733,6 +2733,12 @@ TMDB_TIMEOUT = 12
 TMDB_LIMIT = 20                  # catalogue rows kept
 TMDB_AVAIL = 12                  # of those, how many get looked for on a tracker
 TMDB_MIN_VOTES = 200             # below this a rating is noise, as on the shelves
+# Candidates fetched per shelf, before anything is dropped for having no copy
+# on any indexer. Deliberately well above FEED_SHELF: the TV shelves lose most
+# of their candidates to that filter (a show with no whole-season pack counts
+# as unavailable), so a pool the size of the shelf produced a shelf of three.
+TMDB_ROWS = 40
+TMDB_MAX_PAGES = 3               # discover pages walked to reach TMDB_ROWS (20/page)
 _TMDB = {}
 
 
@@ -3069,31 +3075,50 @@ def cached_season(title, year=None):
     return hit
 
 
-def tmdb_rows(kind="movie", limit=24, **params):
+def tmdb_rows(kind="movie", limit=TMDB_ROWS, **params):
     """Catalogue rows for a shelf, normalised into the shape the ranking wants.
 
     Never trusts the catalogue's own ordering. TMDb's top_rated returns films
     rated 9.4 from 497 votes -- brand new, barely seen -- so the same
     vote-weighting the IMDb ratings get is applied here and everything is
     re-ranked on it.
+
+    Paged, because discover returns exactly 20 rows however large a limit is
+    asked for -- so a limit above that was silently capped, and every shelf
+    started from the same 20 candidates no matter how many survived the
+    "is there actually a copy" filter downstream. Pages are fetched only
+    while more are wanted, and a page that fails ends the walk with what it
+    already has rather than losing the shelf.
     """
-    data = tmdb_get("discover/%s" % kind, include_adult="false", **params) or {}
     names = {v: k.title() for k, v in tmdb_genres(kind).items()}
-    out = []
-    for r in data.get("results", [])[:limit]:
-        date = (r.get("release_date") or r.get("first_air_date") or "")[:4]
-        title = r.get("title") or r.get("name")
-        if not title:
-            continue
-        out.append({"title": title, "year": int(date) if date.isdigit() else None,
-                    "rating": round(float(r.get("vote_average") or 0), 1) or None,
-                    "votes": int(r.get("vote_count") or 0),
-                    "overview": (r.get("overview") or "")[:300],
-                    "poster_path": r.get("poster_path"),
-                    "genres": [names[g] for g in (r.get("genre_ids") or [])
-                              if g in names],
-                    "tmdb_id": r.get("id")})
-    return out
+    out, seen = [], set()
+    for page in range(1, TMDB_MAX_PAGES + 1):
+        data = tmdb_get("discover/%s" % kind, include_adult="false",
+                        page=page, **params) or {}
+        results = data.get("results", [])
+        for r in results:
+            date = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+            title = r.get("title") or r.get("name")
+            if not title:
+                continue
+            # Paging is only worth doing if the pages differ; a catalogue that
+            # repeats one would otherwise put the same film on a shelf twice.
+            if r.get("id") is not None:
+                if r["id"] in seen:
+                    continue
+                seen.add(r["id"])
+            out.append({"title": title, "year": int(date) if date.isdigit() else None,
+                        "rating": round(float(r.get("vote_average") or 0), 1) or None,
+                        "votes": int(r.get("vote_count") or 0),
+                        "overview": (r.get("overview") or "")[:300],
+                        "poster_path": r.get("poster_path"),
+                        "genres": [names[g] for g in (r.get("genre_ids") or [])
+                                  if g in names],
+                        "tmdb_id": r.get("id")})
+        # Out of rows, out of pages, or already have what was asked for.
+        if len(out) >= limit or not results or page >= (data.get("total_pages") or 1):
+            break
+    return out[:limit]
 
 
 def shelf_from_catalogue(rows, want, now, finder=cached_torrent):

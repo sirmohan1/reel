@@ -2082,6 +2082,62 @@ class TestCatalogueShelves(Base):
         got = self.m.shelf_from_catalogue(rows, 8, time.time())
         self.assertEqual(got[0]["title"], "The Godfather")
 
+    def page(self, ids, total_pages=3):
+        return {"total_pages": total_pages,
+                "results": [{"id": i, "title": "Film %d" % i,
+                             "release_date": "2020-01-01", "vote_average": 8.0,
+                             "vote_count": 5000, "genre_ids": [], "overview": ""}
+                            for i in ids]}
+
+    def paged(self, per_page, asked=None):
+        """A fake tmdb_get that only answers discover, so the genre lookup
+        tmdb_rows makes first is not mistaken for a page of results."""
+        def fake(path, **p):
+            if not path.startswith("discover"):
+                return {"genres": []}
+            if asked is not None:
+                asked.append(p.get("page"))
+            return per_page(p.get("page"))
+        return fake
+
+    def test_more_than_one_page_is_walked_to_fill_a_shelf(self):
+        # discover returns exactly 20 rows per page however large a limit is
+        # asked for, so the old single request silently capped every shelf's
+        # candidate pool at 20 -- which is what left the TV shelves at three
+        # films once the "has a whole-season copy" filter had taken its cut.
+        asked = []
+        self.m.tmdb_get = self.paged(
+            lambda n: self.page(range((n - 1) * 20, n * 20)), asked)
+        rows = self.m.tmdb_rows(limit=40)
+        self.assertEqual(len(rows), 40)
+        self.assertEqual(asked, [1, 2])          # stops as soon as it has enough
+        self.assertEqual(len({r["tmdb_id"] for r in rows}), 40)
+
+    def test_paging_stops_at_the_last_page_rather_than_looping(self):
+        # A query with only one page of matches must not keep asking for more.
+        asked = []
+        self.m.tmdb_get = self.paged(
+            lambda n: self.page(range(5), total_pages=1), asked)
+        rows = self.m.tmdb_rows(limit=40)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(asked, [1])
+
+    def test_a_page_that_fails_keeps_what_was_already_fetched(self):
+        # A catalogue hiccup on page 2 should cost the extra candidates, not
+        # the whole shelf -- the same principle tmdb_get's own retry follows.
+        self.m.tmdb_get = self.paged(
+            lambda n: self.page(range(20)) if n == 1 else None)
+        rows = self.m.tmdb_rows(limit=40)
+        self.assertEqual(len(rows), 20)
+
+    def test_a_repeated_page_is_not_shown_twice(self):
+        # Defensive: if the catalogue ever returns the same page again, the
+        # same film must not appear twice on one shelf.
+        self.m.tmdb_get = self.paged(lambda n: self.page(range(20)))
+        rows = self.m.tmdb_rows(limit=40)
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(len({r["tmdb_id"] for r in rows}), 20)
+
     def test_no_key_falls_back_to_the_tracker_shelves(self):
         self.m._TMDB.clear()
         self.m._TMDB["key"] = ""

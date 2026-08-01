@@ -99,6 +99,11 @@ WT_DATA_MIN = 2 * 1024 * 1024
 # to cover a thin swarm, short enough that a hopeless read fails visibly
 # instead of hanging the player.
 LT_SEEK_WAIT = 20
+# How often a running download checkpoints its resume data. A hard kill then
+# costs at most this much re-fetching rather than the whole download, and the
+# blob is a few KB, so the interval is about not writing pointlessly rather
+# than about the cost of writing.
+LT_RESUME_EVERY = 30.0
 # When the first probe learns nothing, how long to keep waiting and how much of
 # the file to want before asking again. Not a format threshold -- the first 4 MB
 # of that mp4 identifies itself perfectly once those bytes exist. The problem is
@@ -5618,6 +5623,13 @@ class WebTorrentBackend:
         """
         return 0
 
+    def save_state(self, job, out_dir, timeout=5.0):
+        """Nothing to save: webtorrent keeps its own state inside its own
+        output directory and reel has no handle on it. This backend goes on
+        relying on the .reel.json sidecar and restore()'s reconstruction.
+        """
+        return False
+
 
 class _TorrentProc:
     """A libtorrent handle wearing enough of Popen's shape to pass for one.
@@ -5680,6 +5692,7 @@ class LibtorrentBackend:
     def __init__(self):
         self._ses = None
         self._lock = threading.Lock()
+        self._resume = {}                # infohash -> latest resume blob
 
     @staticmethod
     def available():
@@ -5689,15 +5702,42 @@ class LibtorrentBackend:
         except Exception:
             return False
 
+    @staticmethod
+    def resume_path(out_dir):
+        return os.path.join(out_dir, ".resume")
+
     def _session(self, port=None):
         import libtorrent as lt
         with self._lock:
             if self._ses is None:
                 self._ses = lt.session({
                     "listen_interfaces": "0.0.0.0:%d" % (port or 0),
-                    "alert_mask": 0,
+                    # save_resume_data answers by alert, so the category has to
+                    # be on. One pump drains them for the whole session --
+                    # letting each job poll would have them stealing each
+                    # other's, since pop_alerts empties the queue for everyone.
+                    "alert_mask": lt.alert.category_t.storage_notification,
                 })
+                threading.Thread(target=self._pump, daemon=True).start()
             return self._ses
+
+    def _pump(self):
+        """Drains alerts and files any resume data by infohash. Also stops the
+        queue growing without bound, which an enabled category would otherwise
+        do with nobody reading it."""
+        import libtorrent as lt
+        while True:
+            try:
+                for a in self._ses.pop_alerts():
+                    if isinstance(a, lt.save_resume_data_alert):
+                        try:
+                            ih = str(a.params.info_hashes.v1)
+                            self._resume[ih] = lt.write_resume_data_buf(a.params)
+                        except Exception:
+                            pass
+            except Exception:
+                return
+            time.sleep(0.25)
 
     # -- metadata ---------------------------------------------------------
 
@@ -5772,11 +5812,20 @@ class LibtorrentBackend:
         import libtorrent as lt
         ses = self._session(port)
         try:
-            if source and os.path.isfile(source):
-                p = lt.add_torrent_params()
+            # Previous state first, if there is any: it carries the piece map
+            # and the file priorities, so a restart picks up where it stopped
+            # instead of re-fetching and re-verifying from zero.
+            p = self._resume_params(out_dir)
+            resumed = p is not None
+            if p is None:
+                if source and os.path.isfile(source):
+                    p = lt.add_torrent_params()
+                else:
+                    p = lt.parse_magnet_uri(source)
+            if source and os.path.isfile(source) and getattr(p, "ti", None) is None:
+                # Resume data does not carry the metadata, so it still needs
+                # the .torrent (or the magnet's own lookup) to know the files.
                 p.ti = lt.torrent_info(source)
-            else:
-                p = lt.parse_magnet_uri(source)
             p.save_path = out_dir
             # Front-to-back, so the live phase has a contiguous prefix to
             # hand ffmpeg -- the same shape rclone's sparse writes produce,
@@ -5793,7 +5842,11 @@ class LibtorrentBackend:
             time.sleep(0.2)
         try:
             ti = h.torrent_file()
-            if ti and chosen is not None:
+            # Not re-applied when resuming: the blob already carries the
+            # priorities, and asserting them again would overwrite a pin that
+            # libtorrent has been enforcing correctly all along -- the exact
+            # move that used to re-pick file 0 and fan a pack back out.
+            if ti and chosen is not None and not resumed:
                 # Only the file this item is for; a pack's siblings are
                 # separate jobs and fetch their own.
                 want = int(chosen.get("index") or 0)
@@ -5801,6 +5854,7 @@ class LibtorrentBackend:
                                     for i in range(ti.num_files())])
         except Exception:
             pass
+        job["lt_resumed"] = resumed
         if rate_kbps:
             try:
                 h.set_download_limit(int(rate_kbps) * 1024)
@@ -5810,12 +5864,13 @@ class LibtorrentBackend:
         job["procs"].append(proc)
         job["wt_proc"] = proc
         job["_lt"] = h
-        self._watch(job, h)
+        self._watch(job, h, out_dir)
         return proc
 
-    def _watch(self, job, h):
+    def _watch(self, job, h, save_dir=None):
         """Peers and upload figures, polled instead of scraped out of a
         terminal UI -- the numbers webtorrent only ever printed."""
+        last = [time.time()]
         def go():
             while not job["cancel"].is_set():
                 try:
@@ -5828,6 +5883,13 @@ class LibtorrentBackend:
                     job["wt_tail"] = ("%s  %.1f%%  %d peers  %.0f KB/s down"
                                       % (st.state, st.progress * 100,
                                          st.num_peers, st.download_rate / 1024))
+                    # Checkpointed as it goes, so a hard kill costs at most
+                    # the last interval rather than the whole download. The
+                    # save is cheap and the file is small.
+                    if time.time() - last[0] > LT_RESUME_EVERY:
+                        last[0] = time.time()
+                        self.save_state(job, os.path.dirname(
+                            job.get("lt_file") or "") or save_dir)
                 except Exception:
                     return
                 time.sleep(1.0)
@@ -5835,6 +5897,71 @@ class LibtorrentBackend:
 
     def recent_output(self, job, lines=4, chars=200):
         return (job.get("wt_tail") or "")[:chars]
+
+    def save_state(self, job, out_dir, timeout=5.0):
+        """Write libtorrent's own resume data beside the download. -> saved?
+
+        What this replaces is reel reconstructing torrent state by hand from a
+        .reel.json sidecar -- which is where three separate duplicate-cascade
+        incidents came from, all of them a lost wt_index letting a pack
+        sibling re-pick file 0 and fan the whole season out again.
+
+        libtorrent's blob carries the piece map and the file priorities, so
+        the pin is kept by the thing that actually enforces it rather than by
+        a field reel remembered to write down. The .reel.json stays for what
+        libtorrent has no idea about: the title, and whether it came from the
+        catalogue.
+        """
+        h = job.get("_lt")
+        if not (h is not None and h.is_valid()):
+            return False
+        try:
+            ih = str(h.status().info_hashes.v1)
+        except Exception:
+            try:
+                ih = str(h.info_hash())
+            except Exception:
+                return False
+        self._resume.pop(ih, None)
+        try:
+            h.save_resume_data()
+        except Exception:
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            buf = self._resume.get(ih)
+            if buf:
+                p = self.resume_path(out_dir)
+                tmp = p + ".part"
+                try:
+                    with open(tmp, "wb") as f:
+                        f.write(buf)
+                    os.replace(tmp, p)
+                    return True
+                except OSError:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    return False
+            time.sleep(0.05)
+        return False           # asked and never answered; not worth blocking on
+
+    def _resume_params(self, out_dir):
+        """Previous state for this download, or None. Never fatal: a blob from
+        an older libtorrent, or a half-written one, means starting over
+        rather than refusing to start."""
+        p = self.resume_path(out_dir)
+        try:
+            with open(p, "rb") as f:
+                buf = f.read()
+        except OSError:
+            return None
+        try:
+            import libtorrent as lt
+            return lt.read_resume_data(buf)
+        except Exception:
+            return None
 
     def add_trackers(self, job, trackers):
         """Extend a running download's announce list. -> how many were new.

@@ -763,7 +763,7 @@ class TestLibtorrentBackend(Base):
         try:
             h = j["_lt"]
             self.assertTrue(h.is_valid())
-            prios = h.get_file_priorities()
+            prios = self.wait_prios(h, [4])
             self.assertGreater(prios[0], 0)
             self.assertEqual([p for p in prios[1:] if p], [])
         finally:
@@ -859,6 +859,165 @@ class TestLibtorrentBackend(Base):
             self.assertTrue(before <= after)      # nothing was taken away
             # and a second pass adds nothing, rather than duplicating
             self.assertEqual(bk.add_trackers(j, [new]), 0)
+        finally:
+            proc.kill(); j["cancel"].set()
+
+    # ---- resume data: what replaces reconstructing state by hand ---------
+
+    def wait_prios(self, h, want, timeout=5):
+        """prioritize_files is asynchronous -- reading straight back can hand
+        you the values from before it was applied."""
+        deadline = time.time() + timeout
+        got = None
+        while time.time() < deadline:
+            got = list(h.get_file_priorities())
+            if got == want:
+                return got
+            time.sleep(0.05)
+        return got
+
+    def settled_prios(self, h, hold=0.6, timeout=5):
+        """What the priorities end up as, not what they pass through.
+
+        Waiting for a value to merely appear is not enough: resume data and a
+        later prioritize_files call both land asynchronously, so the correct
+        list can show up and then be overwritten a moment later -- which a
+        first-match check would happily report as a pass.
+        """
+        deadline = time.time() + timeout
+        last, stable_since = None, time.time()
+        while time.time() < deadline:
+            got = list(h.get_file_priorities())
+            if got != last:
+                last, stable_since = got, time.time()
+            elif time.time() - stable_since >= hold:
+                return got
+            time.sleep(0.05)
+        return last
+
+    def multi_file_torrent(self):
+        """A three-file torrent, so a file pin is a thing that can be lost."""
+        import libtorrent as lt
+        d = os.path.join(self.dl, "pack")
+        os.makedirs(d, exist_ok=True)
+        for i in range(3):
+            with open(os.path.join(d, "ep%d.bin" % i), "wb") as f:
+                f.write(os.urandom(32 * 1024))
+        fs = lt.file_storage()
+        lt.add_files(fs, d)
+        ct = lt.create_torrent(fs, piece_size=16 * 1024)
+        lt.set_piece_hashes(ct, os.path.dirname(d))
+        p = os.path.join(self.dl, "pack.torrent")
+        with open(p, "wb") as f:
+            f.write(lt.bencode(ct.generate()))
+        return p
+
+    def test_webtorrent_has_no_resume_data_to_save(self):
+        bk = self.m.WebTorrentBackend()
+        self.assertFalse(bk.save_state(self.job(), self.dl))
+
+    def test_a_job_with_no_handle_saves_nothing(self):
+        bk = self.m.LibtorrentBackend()
+        self.assertFalse(bk.save_state(self.job(), self.dl))
+
+    @needs_libtorrent
+    def test_state_is_written_and_read_back(self):
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        out = os.path.join(self.dl, "out"); os.makedirs(out, exist_ok=True)
+        proc = bk.start(j, self.torrent_file(), out, {"index": 0}, 0)
+        try:
+            self.assertTrue(bk.save_state(j, out))
+            self.assertTrue(os.path.isfile(bk.resume_path(out)))
+            self.assertIsNotNone(bk._resume_params(out))
+        finally:
+            proc.kill(); j["cancel"].set()
+
+    @needs_libtorrent
+    def test_a_pack_siblings_file_pin_survives_in_libtorrents_own_state(self):
+        # The bug this whole stage exists for. Three duplicate-cascade
+        # incidents came from wt_index being lost on restart, letting a
+        # sibling re-pick file 0 and fan the pack out again. Here the pin is
+        # kept by the thing that enforces it, not by a field reel had to
+        # remember to write down -- and crucially it comes back even when the
+        # restart has no idea which file was chosen.
+        bk = self.m.LibtorrentBackend()
+        tf = self.multi_file_torrent()
+        out = os.path.join(self.dl, "packout"); os.makedirs(out, exist_ok=True)
+        j = self.job()
+        proc = bk.start(j, tf, out, {"index": 2}, 0)     # the third episode
+        try:
+            self.assertEqual(self.wait_prios(j["_lt"], [0, 0, 4]), [0, 0, 4])
+            self.assertTrue(bk.save_state(j, out))
+        finally:
+            proc.kill(); j["cancel"].set()
+
+        # A fresh backend, because a restart is a new process with a new
+        # session -- and reusing this one would re-add the same infohash to a
+        # session that has not finished removing it.
+        bk = self.m.LibtorrentBackend()
+        j2 = self.job()
+        # chosen=None: the restart does not know which file this job was for.
+        proc2 = bk.start(j2, tf, out, None, 0)
+        try:
+            self.assertTrue(j2["lt_resumed"])
+            self.assertEqual(self.settled_prios(j2["_lt"]), [0, 0, 4])
+        finally:
+            proc2.kill(); j2["cancel"].set()
+
+    @needs_libtorrent
+    def test_resumed_priorities_beat_a_wrong_guess_from_the_restart(self):
+        # The precise shape of the three cascade incidents: a restart that
+        # has lost which file this job was for falls back to index 0, and
+        # re-asserting that would overwrite the pin libtorrent had been
+        # enforcing correctly -- re-fetching the wrong episode and fanning
+        # the pack back out. Saved state has to win over the guess.
+        bk = self.m.LibtorrentBackend()
+        tf = self.multi_file_torrent()
+        out = os.path.join(self.dl, "wrongguess"); os.makedirs(out, exist_ok=True)
+        j = self.job()
+        proc = bk.start(j, tf, out, {"index": 2}, 0)
+        try:
+            self.assertEqual(self.wait_prios(j["_lt"], [0, 0, 4]), [0, 0, 4])
+            self.assertTrue(bk.save_state(j, out))
+        finally:
+            proc.kill(); j["cancel"].set()
+
+        bk2 = self.m.LibtorrentBackend()
+        j2 = self.job()
+        # The restart thinks it is file 0. It is wrong, and must not win.
+        proc2 = bk2.start(j2, tf, out, {"index": 0}, 0)
+        try:
+            self.assertTrue(j2["lt_resumed"])
+            self.assertEqual(self.settled_prios(j2["_lt"]), [0, 0, 4])
+        finally:
+            proc2.kill(); j2["cancel"].set()
+
+    @needs_libtorrent
+    def test_a_fresh_download_is_not_marked_resumed(self):
+        bk = self.m.LibtorrentBackend()
+        out = os.path.join(self.dl, "fresh"); os.makedirs(out, exist_ok=True)
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), out, {"index": 0}, 0)
+        try:
+            self.assertFalse(j["lt_resumed"])
+        finally:
+            proc.kill(); j["cancel"].set()
+
+    @needs_libtorrent
+    def test_unreadable_resume_data_starts_over_rather_than_refusing(self):
+        # A blob from an older libtorrent, or one half-written by a hard kill,
+        # must cost the resume and nothing more.
+        bk = self.m.LibtorrentBackend()
+        out = os.path.join(self.dl, "bad"); os.makedirs(out, exist_ok=True)
+        with open(bk.resume_path(out), "wb") as f:
+            f.write(b"not resume data at all")
+        self.assertIsNone(bk._resume_params(out))
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), out, {"index": 0}, 0)
+        try:
+            self.assertIsNotNone(proc)
+            self.assertFalse(j["lt_resumed"])
         finally:
             proc.kill(); j["cancel"].set()
 

@@ -581,6 +581,258 @@ class TestRestore(Base):
         self.assertEqual(calls, [])
         self.assertEqual(self.m.JOBS["abc"]["audio_tracks"], [])
 
+    def test_a_pack_siblings_file_pin_survives_a_restart(self):
+        # The real bug: a pack sibling interrupted mid-download came back
+        # from restore() with wt_index lost, indistinguishable from a fresh
+        # unpinned magnet -- it re-picked file 0 and fanned the whole pack
+        # back out as duplicates of episodes already sitting done elsewhere.
+        # The fix is round-tripping index/files through .reel.json, which is
+        # exactly what this proves rather than just asserting the write side
+        # or the read side alone.
+        wt = os.path.join(self.dl, "abc123_wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".reel.json"), "w") as f:
+            json.dump({"magnet": "magnet:?xt=urn:btih:" + "a" * 40,
+                       "index": 8, "title": "S01E08", "total": 700_000_000,
+                       "files": 25}, f)
+        self.m.JOBS.clear()
+        self.m.restore()
+        job = self.m.JOBS["abc123"]
+        self.assertEqual(job["wt_index"], 8)
+        self.assertEqual(job["wt_files"], 25)
+
+    def test_a_sidecar_written_before_this_fix_still_restores(self):
+        # An in-flight download from before this fix shipped has no "index"
+        # or "files" key at all -- must not crash, and degrades to exactly
+        # today's (already-accepted) unpinned behaviour rather than a KeyError.
+        wt = os.path.join(self.dl, "old456_wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".reel.json"), "w") as f:
+            json.dump({"magnet": "magnet:?xt=urn:btih:" + "b" * 40,
+                       "title": "Something", "total": 100}, f)
+        self.m.JOBS.clear()
+        self.m.restore()
+        job = self.m.JOBS["old456"]
+        self.assertIsNone(job["wt_index"])
+        self.assertEqual(job["wt_files"], 0)
+
+    # ---- scratch / dead-weight directories --------------------------------
+
+    def test_scratch_directories_are_always_swept(self):
+        # _raw, _meta and _probe are working directories for an in-flight
+        # conversion -- never something to resume from, only cleanup.
+        for suffix in ("_raw", "_meta", "_probe"):
+            d = os.path.join(self.dl, "job1" + suffix)
+            os.makedirs(d)
+            with open(os.path.join(d, "junk.bin"), "wb") as f:
+                f.write(b"x" * 10)
+        self.m.JOBS.clear()
+        self.m.restore()
+        for suffix in ("_raw", "_meta", "_probe"):
+            self.assertFalse(os.path.exists(os.path.join(self.dl, "job1" + suffix)))
+
+    def test_a_wt_dir_with_no_sidecar_at_all_is_swept(self):
+        # Never got far enough to write .reel.json -- nothing to identify it
+        # by, so it is exactly as useless as an orphaned _raw folder.
+        wt = os.path.join(self.dl, "nosidecar_wt")
+        os.makedirs(wt)
+        self.m.JOBS.clear()
+        self.m.restore()
+        self.assertFalse(os.path.exists(wt))
+        self.assertNotIn("nosidecar", self.m.JOBS)
+
+    def test_a_wt_dir_with_unparseable_json_is_swept_not_crashed_on(self):
+        wt = os.path.join(self.dl, "badjson_wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".reel.json"), "w") as f:
+            f.write("{ this is not valid json at all")
+        self.m.JOBS.clear()
+        self.m.restore()                       # must not raise
+        self.assertFalse(os.path.exists(wt))
+        self.assertNotIn("badjson", self.m.JOBS)
+
+    def test_a_wt_dir_whose_sidecar_has_no_magnet_is_swept(self):
+        # A magnet is the one thing that makes a _wt folder resumable at
+        # all -- json.dump succeeded but this run never got that far.
+        wt = os.path.join(self.dl, "nomagnet_wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".reel.json"), "w") as f:
+            json.dump({"index": 0, "title": "Something"}, f)
+        self.m.JOBS.clear()
+        self.m.restore()
+        self.assertFalse(os.path.exists(wt))
+        self.assertNotIn("nomagnet", self.m.JOBS)
+
+    # ---- stray files --------------------------------------------------------
+
+    def test_compat_fragments_are_discarded_like_live_ones(self):
+        p = os.path.join(self.dl, "x.compat.mp4")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 10)
+        self.m.JOBS.clear()
+        self.m.restore()
+        self.assertFalse(os.path.exists(p))
+
+    def test_a_zero_byte_finished_file_is_discarded(self):
+        p = os.path.join(self.dl, "zerojob__driveid__Nothing.mp4")
+        open(p, "wb").close()
+        self.m.JOBS.clear()
+        self.m.restore()
+        self.assertFalse(os.path.exists(p))
+        self.assertNotIn("zerojob", self.m.JOBS)
+
+    def test_a_foreign_file_is_left_alone(self):
+        # .DS_Store and friends: no "__" to split on, so it is neither a job
+        # nor recognised junk -- restore() must not touch it either way.
+        p = os.path.join(self.dl, ".DS_Store")
+        with open(p, "wb") as f:
+            f.write(b"whatever finder puts here")
+        self.m.JOBS.clear()
+        self.m.restore()
+        self.assertTrue(os.path.exists(p))
+        self.assertEqual(len(self.m.JOBS), 0)
+
+    # ---- torrent-sourced finished files -------------------------------------
+
+    def test_a_finished_torrent_file_loads_its_magnet_from_the_sidecar(self):
+        p = os.path.join(self.dl, "tjob__torrent__A Show.mp4")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 100)
+        magnet = "magnet:?xt=urn:btih:" + "c" * 40
+        with open(os.path.join(self.dl, "tjob.magnet"), "w") as f:
+            f.write(magnet)
+        self.m.JOBS.clear()
+        self.m.playable = lambda _p: True
+        self.m.restore()
+        job = self.m.JOBS["tjob"]
+        self.assertEqual(job["source"], "torrent")
+        self.assertEqual(job["magnet"], magnet)
+        self.assertEqual(job["status"], "done")
+
+    def test_a_finished_torrent_file_survives_a_missing_magnet_sidecar(self):
+        # The .magnet sidecar can go missing (a mis-click, a partial cleanup)
+        # without the row itself vanishing -- it just can't be refetched
+        # until re-added from scratch, which replayable=False communicates.
+        p = os.path.join(self.dl, "orphantorrent__torrent__A Show.mp4")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 100)
+        self.m.JOBS.clear()
+        self.m.playable = lambda _p: True
+        self.m.restore()                       # must not raise
+        job = self.m.JOBS["orphantorrent"]
+        self.assertIsNone(job["magnet"])
+        self.assertFalse(self.m.public(job)["replayable"])
+
+    # ---- unplayable (cut short by a hard exit) ------------------------------
+
+    def test_an_unplayable_file_becomes_evicted_and_is_deleted(self):
+        p = os.path.join(self.dl, "brokendrive__driveid__A Film.mp4")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 100)
+        self.m.JOBS.clear()
+        self.m.playable = lambda _p: False
+        self.m.restore()
+        self.assertFalse(os.path.exists(p))
+        job = self.m.JOBS["brokendrive"]
+        self.assertEqual(job["status"], "evicted")
+        self.assertFalse(job["hold"])
+        self.assertEqual(job["title"], "A Film")
+
+    def test_an_unplayable_torrent_file_keeps_its_magnet_for_a_refetch(self):
+        p = os.path.join(self.dl, "brokentorrent__torrent__A Show.mp4")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 100)
+        magnet = "magnet:?xt=urn:btih:" + "d" * 40
+        with open(os.path.join(self.dl, "brokentorrent.magnet"), "w") as f:
+            f.write(magnet)
+        self.m.JOBS.clear()
+        self.m.playable = lambda _p: False
+        self.m.restore()
+        self.assertFalse(os.path.exists(p))
+        job = self.m.JOBS["brokentorrent"]
+        self.assertEqual(job["status"], "evicted")
+        self.assertEqual(job["source"], "torrent")
+        self.assertEqual(job["magnet"], magnet)
+        self.assertTrue(self.m.public(job)["replayable"])
+
+    # ---- subtitle edge cases -------------------------------------------------
+
+    def test_a_subtitle_with_no_language_segment_falls_back_to_default(self):
+        p = os.path.join(self.dl, "langless__driveid__A Film.mp4")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 100)
+        with open(os.path.join(self.dl, "langless.subs..vtt"), "w") as f:
+            f.write("WEBVTT\n\n")
+        self.m.JOBS.clear()
+        self.m.playable = lambda _p: True
+        self.m.restore()
+        job = self.m.JOBS["langless"]
+        self.assertEqual(job["subs_status"], "ready")
+        self.assertEqual(job["subs_lang"], self.m.SUBS_LANG)
+
+    # ---- everything at once --------------------------------------------------
+
+    def test_a_mixed_directory_restores_each_item_independently(self):
+        # Real startup scans one directory holding every kind of leftover at
+        # once, in whatever order the filesystem hands them back -- nothing
+        # here should depend on scan order, and one malformed entry must not
+        # take any other, unrelated entry down with it.
+        os.makedirs(os.path.join(self.dl, "scratch_raw"))
+
+        pinned_wt = os.path.join(self.dl, "pinned_wt")
+        os.makedirs(pinned_wt)
+        with open(os.path.join(pinned_wt, ".reel.json"), "w") as f:
+            json.dump({"magnet": "magnet:?xt=urn:btih:" + "e" * 40,
+                       "index": 3, "files": 10, "title": "Mid-pack"}, f)
+
+        os.makedirs(os.path.join(self.dl, "dead_wt"))   # no sidecar
+
+        open(os.path.join(self.dl, "zero__driveid__X.mp4"), "wb").close()
+
+        with open(os.path.join(self.dl, ".DS_Store"), "wb") as f:
+            f.write(b"junk")
+
+        with open(os.path.join(self.dl, "gooddrive__driveid__Good.mp4"), "wb") as f:
+            f.write(b"\0" * 100)
+        with open(os.path.join(self.dl, "gooddrive.subs.eng.vtt"), "w") as f:
+            f.write("WEBVTT\n\n")
+
+        with open(os.path.join(self.dl, "badtorrent__torrent__Bad.mp4"), "wb") as f:
+            f.write(b"\0" * 100)
+        with open(os.path.join(self.dl, "badtorrent.magnet"), "w") as f:
+            f.write("magnet:?xt=urn:btih:" + "f" * 40)
+
+        with open(os.path.join(self.dl, "goodtorrent__torrent__Good2.mp4"), "wb") as f:
+            f.write(b"\0" * 100)
+        good_magnet = "magnet:?xt=urn:btih:" + "1" * 40
+        with open(os.path.join(self.dl, "goodtorrent.magnet"), "w") as f:
+            f.write(good_magnet)
+
+        self.m.JOBS.clear()
+        self.m.playable = lambda p: "badtorrent" not in p
+        self.m.restore()                       # must not raise
+
+        self.assertFalse(os.path.exists(os.path.join(self.dl, "scratch_raw")))
+        self.assertFalse(os.path.exists(os.path.join(self.dl, "dead_wt")))
+        self.assertNotIn("dead", self.m.JOBS)
+        self.assertNotIn("zero", self.m.JOBS)
+        self.assertTrue(os.path.exists(os.path.join(self.dl, ".DS_Store")))
+
+        self.assertEqual(self.m.JOBS["pinned"]["wt_index"], 3)
+        self.assertEqual(self.m.JOBS["pinned"]["wt_files"], 10)
+
+        self.assertEqual(self.m.JOBS["gooddrive"]["status"], "done")
+        self.assertEqual(self.m.JOBS["gooddrive"]["subs_status"], "ready")
+
+        self.assertEqual(self.m.JOBS["badtorrent"]["status"], "evicted")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.dl, "badtorrent__torrent__Bad.mp4")))
+
+        self.assertEqual(self.m.JOBS["goodtorrent"]["status"], "done")
+        self.assertEqual(self.m.JOBS["goodtorrent"]["magnet"], good_magnet)
+
+        self.assertEqual(len(self.m.JOBS), 4)   # pinned, gooddrive, badtorrent, goodtorrent
+
 
 # --------------------------------------------------------------------------
 class TestLanAddress(Base):
@@ -1226,11 +1478,21 @@ class TestPacks(Base):
         sibs = [self.m.JOBS[i] for i in made]
         self.assertEqual([s["wt_index"] for s in sibs], [1, 2])
         self.assertEqual([s["title"] for s in sibs], ["Show.S01E02", "Show.S01E03"])
-        # Each is an ordinary torrent job the scheduler will start in turn.
+        # Each is an ordinary torrent job, held until a person starts it by
+        # hand -- auto=False is what keeps the scheduler from cascading
+        # through the rest of the series on its own. See scheduler_tick().
         for s in sibs:
             self.assertEqual(s["magnet"], parent["magnet"])
             self.assertEqual(s["status"], "queued")
             self.assertTrue(s["hold"])
+            self.assertFalse(s["auto"])
+
+    def test_the_chosen_episode_itself_still_auto_starts(self):
+        # Only the siblings fan_out() creates are auto=False -- the episode
+        # actually picked when the series was added is an ordinary job, made
+        # by new_job() the same way anything else is, and starts normally.
+        j = self.job(source="torrent", magnet="m")
+        self.assertTrue(j["auto"])
 
     def test_a_sibling_never_fans_out_again(self):
         # Pinned jobs must not re-expand, or a three-file pack breeds one item
@@ -1246,6 +1508,162 @@ class TestPacks(Base):
         self.m.PACK_MAX = 1
         files = [self.f(i, "Show.S01E%02d.mkv" % i, 2.0) for i in range(3)]
         self.assertEqual(len(self.m.pack_files(files)), 1)
+
+
+# --------------------------------------------------------------------------
+class TestPauseResume(Base):
+    """pause_job/resume_job send SIGSTOP/SIGCONT to whichever process is
+    actually driving a job, verified against a real child process for the
+    part worth not taking on faith -- that a 'paused' process genuinely
+    stops doing work rather than just being labelled paused in the UI."""
+
+    def test_pause_proc_actually_stops_and_resumes_real_work(self):
+        path = os.path.join(self.dl, "ticks.txt")
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import time\n"
+             "f = open(%r, 'w')\n"
+             "for i in range(80):\n"
+             "    f.write('x'); f.flush(); time.sleep(0.05)\n" % path])
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and not os.path.exists(path):
+                time.sleep(0.02)
+            time.sleep(0.2)
+            self.assertTrue(self.m.pause_proc(proc, True))
+            size_paused = os.path.getsize(path)
+            time.sleep(0.4)
+            self.assertEqual(os.path.getsize(path), size_paused,
+                             "the file grew while the process was supposedly stopped")
+            self.assertTrue(self.m.pause_proc(proc, False))
+            time.sleep(0.4)
+            self.assertGreater(os.path.getsize(path), size_paused,
+                               "no growth after resuming -- SIGCONT didn't take")
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_pause_proc_on_a_finished_process_is_false(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.assertFalse(self.m.pause_proc(proc, True))
+
+    def test_pause_proc_on_nothing_is_false(self):
+        self.assertFalse(self.m.pause_proc(None, True))
+
+    # ---- pause_job / resume_job: job-state transitions, pause_proc mocked
+    # for determinism -- the real signalling is proven above.
+
+    def test_pause_job_marks_it_paused_by_hand(self):
+        j = self.job(status="downloading", proc=object())
+        self.m.pause_proc = lambda proc, on: True
+        self.assertTrue(self.m.pause_job(j["id"]))
+        self.assertTrue(j["paused"])
+        self.assertTrue(j["user_paused"])
+
+    def test_pause_job_refuses_a_job_that_is_not_active(self):
+        j = self.job(status="queued", hold=True)
+        self.m.pause_proc = lambda proc, on: True
+        self.assertFalse(self.m.pause_job(j["id"]))
+        self.assertFalse(j["paused"])
+
+    def test_pause_job_refuses_one_already_paused(self):
+        j = self.job(status="downloading", paused=True)
+        self.m.pause_proc = lambda proc, on: True
+        self.assertFalse(self.m.pause_job(j["id"]))
+
+    def test_pause_job_refuses_an_unknown_id(self):
+        self.assertFalse(self.m.pause_job("no-such-job"))
+
+    def test_pause_job_does_not_claim_success_if_the_signal_failed(self):
+        # A dead or already-gone process: pause_proc's own honest "no" must
+        # not get turned into a job the UI thinks is safely paused.
+        j = self.job(status="downloading", proc=object())
+        self.m.pause_proc = lambda proc, on: False
+        self.assertFalse(self.m.pause_job(j["id"]))
+        self.assertFalse(j["paused"])
+        self.assertFalse(j["user_paused"])
+
+    def test_resume_job_clears_both_flags(self):
+        j = self.job(status="downloading", paused=True, user_paused=True,
+                     proc=object())
+        self.m.pause_proc = lambda proc, on: True
+        self.assertTrue(self.m.resume_job(j["id"]))
+        self.assertFalse(j["paused"])
+        self.assertFalse(j["user_paused"])
+
+    def test_resume_job_refuses_one_that_was_not_paused(self):
+        j = self.job(status="downloading", paused=False)
+        self.m.pause_proc = lambda proc, on: True
+        self.assertFalse(self.m.resume_job(j["id"]))
+
+    def test_resume_job_refuses_an_unknown_id(self):
+        self.assertFalse(self.m.resume_job("no-such-job"))
+
+
+# --------------------------------------------------------------------------
+class TestSchedulerTick(Base):
+    """The behaviour actually asked for: opening a 25-episode series starts
+    the one episode picked, not the other 24 behind it. auto=False (set by
+    fan_out(), see TestPacks) is what scheduler_tick() must respect in both
+    of the places it would otherwise start something on its own."""
+
+    def test_an_auto_false_job_is_never_started_while_idle(self):
+        j = self.job(status="queued", hold=True, auto=False)
+        self.m.scheduler_tick()
+        self.assertEqual(j["status"], "queued")
+        self.assertTrue(j["hold"])
+
+    def test_an_auto_true_job_still_starts_while_idle(self):
+        # The regression guard: a single ordinary item -- the overwhelming
+        # common case -- must keep starting itself exactly as before.
+        j = self.job(status="queued", hold=True, auto=True)
+        self.m.scheduler_tick()
+        self.assertFalse(j["hold"])
+
+    def test_an_auto_false_job_is_never_prefetched_while_watching(self):
+        playing = self.job(status="streaming", path="/x", total=100, received=50)
+        sibling = self.job(status="queued", hold=True, auto=False)
+        self.m.note_playing("dev1", playing["id"], 10.0)
+        self.m.stream_health = lambda j: "ok"
+        self.m.scheduler_tick()
+        self.assertTrue(sibling["hold"])
+        self.assertFalse(sibling.get("prefetch"))
+
+    def test_an_auto_true_job_is_still_prefetched_while_watching(self):
+        playing = self.job(status="streaming", path="/x", total=100, received=50)
+        nxt = self.job(status="queued", hold=True, auto=True)
+        self.m.note_playing("dev1", playing["id"], 10.0)
+        self.m.stream_health = lambda j: "ok"
+        self.m.scheduler_tick()
+        self.assertFalse(nxt["hold"])
+        self.assertTrue(nxt.get("prefetch"))
+
+    def test_a_manual_pause_survives_an_improving_stream(self):
+        # Rule 2 would ordinarily resume a paused prefetch once the margin
+        # is fine again -- must not, when a person paused it on purpose.
+        playing = self.job(status="streaming", path="/x", total=100, received=50)
+        pf = self.job(status="downloading", prefetch=True,
+                      paused=True, user_paused=True, proc=object())
+        self.m.note_playing("dev1", playing["id"], 10.0)
+        self.m.stream_health = lambda j: "ok"       # would normally un-pause
+        calls = []
+        self.m.pause_proc = lambda proc, on: calls.append(on) or True
+        self.m.scheduler_tick()
+        self.assertEqual(calls, [])                 # never touched at all
+        self.assertTrue(pf["paused"])
+
+    def test_an_unpaused_prefetch_still_gets_throttled_by_health(self):
+        # The regression guard for rule 2 itself: ordinary (non-manual)
+        # prefetch throttling must be unaffected by the user_paused check.
+        playing = self.job(status="streaming", path="/x", total=100, received=50)
+        pf = self.job(status="downloading", prefetch=True, proc=object())
+        self.m.note_playing("dev1", playing["id"], 10.0)
+        self.m.stream_health = lambda j: "behind"
+        self.m.pause_proc = lambda proc, on: True
+        self.m.scheduler_tick()
+        self.assertTrue(pf["paused"])
+        self.assertFalse(pf["user_paused"])          # the scheduler's own doing
 
 
 # --------------------------------------------------------------------------
@@ -1946,6 +2364,204 @@ class TestUndoRemove(Base):
 
 
 # --------------------------------------------------------------------------
+class TestRefetch(Base):
+    """The 'refetch' button: for a file that came down wrong -- corrupt
+    source data, same as the real Invincible episode this was built for --
+    where /retry's refusal to touch anything but error/evicted/removed means
+    a 'done' row with bad bytes has no way back short of a terminal."""
+
+    def finished(self, **extra):
+        j = self.job(source="torrent", magnet="magnet:?xt=urn:btih:" + "a" * 40,
+                     wt_index=3, wt_files=25, **extra)
+        j["status"] = "done"
+        j["path"] = os.path.join(self.dl, "film.mp4")
+        j["received"] = j["total"] = 4096
+        j["audio_tracks"] = [{"index": 0, "codec": "aac", "lang": "eng", "default": True}]
+        j["subs_status"] = "ready"
+        with open(j["path"], "wb") as f:
+            f.write(b"x" * 4096)
+        return j
+
+    def test_works_on_a_done_job_unlike_retry(self):
+        # The actual gap this closes: /retry's own status check would refuse
+        # this exact case.
+        j = self.finished()
+        self.assertNotIn(j["status"], ("error", "evicted", "removed"))
+        self.assertTrue(self.m.refetch_job(j["id"]))
+
+    def test_the_bad_file_is_gone_and_the_row_starts_clean(self):
+        j = self.finished()
+        jid, path = j["id"], j["path"]
+        self.assertTrue(self.m.refetch_job(jid))
+        self.assertFalse(os.path.exists(path))
+        back = self.m.JOBS[jid]
+        self.assertEqual(back["id"], jid)                # same row
+        self.assertEqual(back["status"], "queued")
+        self.assertEqual(back["received"], 0)
+        self.assertIsNone(back["path"])
+        self.assertEqual(back["audio_tracks"], [])        # not carried over stale
+        self.assertIsNone(back["subs_status"])
+        self.assertFalse(back["hold"])                    # handed to the scheduler
+
+    def test_identity_needed_to_redownload_survives(self):
+        # The id staying the same is what keeps this the same queue row; the
+        # magnet and pack pin are what a pack sibling needs to fetch the
+        # right file again rather than rediscovering the whole pack.
+        j = self.finished()
+        jid, magnet = j["id"], j["magnet"]
+        self.m.refetch_job(jid)
+        back = self.m.JOBS[jid]
+        self.assertEqual(back["magnet"], magnet)
+        self.assertEqual(back["wt_index"], 3)
+        self.assertEqual(back["title"], j["title"])
+
+    def test_a_drive_job_keeps_its_drive_id(self):
+        j = self.job(drive_id="1AbCdEfGhIjKlMnOpQrStUvWxYz0123456")
+        j["status"] = "done"
+        j["path"] = os.path.join(self.dl, "drivefilm.mp4")
+        with open(j["path"], "wb") as f:
+            f.write(b"y" * 2048)
+        jid, did = j["id"], j["drive_id"]
+        self.assertTrue(self.m.refetch_job(jid))
+        self.assertEqual(self.m.JOBS[jid]["drive_id"], did)
+        self.assertEqual(self.m.JOBS[jid]["source"], "drive")
+
+    def test_running_processes_are_stopped_first(self):
+        j = self.finished()
+        killed = []
+        class FakeProc:
+            def poll(self): return None
+            def kill(self): killed.append(True)
+        j["procs"] = [FakeProc()]
+        self.m.refetch_job(j["id"])
+        self.assertEqual(killed, [True])
+
+    def test_nothing_to_refetch_from_is_refused(self):
+        j = self.job()             # neither drive_id nor magnet
+        self.assertFalse(self.m.refetch_job(j["id"]))
+        self.assertIn(j["id"], self.m.JOBS)     # left untouched, not silently dropped
+
+    def test_an_unknown_id_is_refused(self):
+        self.assertFalse(self.m.refetch_job("no-such-job"))
+
+
+# --------------------------------------------------------------------------
+class TestIntegrityCheck(Base):
+    """The check built from the two real corrupt Invincible episodes: ffprobe
+    reported both as clean, complete files -- duration, codecs, everything --
+    and only an actual decode pass caught the bad frames. scan_for_corruption
+    is tested against a real ffmpeg decode of a real corrupted file, not
+    asserted from a mocked stderr string."""
+
+    def _video(self, name, seconds=2):
+        src = os.path.join(self.dl, name)
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=%d" % seconds,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-movflags", "+faststart", src], check=True, capture_output=True)
+        return src
+
+    def _corrupt(self, path):
+        # Well past the ftyp/moov header (faststart puts it at the front), so
+        # the container still opens -- this breaks a frame's compressed data,
+        # the same shape of damage the real files had.
+        size = os.path.getsize(path)
+        with open(path, "r+b") as f:
+            f.seek(int(size * 0.6))
+            f.write(os.urandom(min(4096, size // 4)))
+
+    @needs_ffmpeg
+    def test_a_clean_file_scans_clean(self):
+        src = self._video("clean.mp4")
+        self.assertEqual(self.m.scan_for_corruption(src), 0)
+
+    @needs_ffmpeg
+    def test_a_corrupted_file_is_actually_caught(self):
+        src = self._video("bad.mp4", seconds=4)
+        self._corrupt(src)
+        hits = self.m.scan_for_corruption(src)
+        self.assertIsNotNone(hits)
+        self.assertGreater(hits, 0)
+
+    def test_a_path_that_cannot_be_read_is_inconclusive_not_corrupt(self):
+        # None has to mean "couldn't tell," never get treated as either
+        # verdict -- see check_integrity's guard against writing it as ok.
+        got = self.m.scan_for_corruption("/no/such/file.mp4")
+        self.assertIsNone(got)
+
+    def test_no_path_anywhere_is_a_no_op(self):
+        j = self.job()
+        self.m.check_integrity(j)
+        self.assertIsNone(j["integrity"])
+
+    def test_checking_state_is_set_immediately(self):
+        # Before the background thread has had any chance to run at all --
+        # the row should say *something* the instant a scan starts.
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.scan_for_corruption = lambda path, timeout=None: (
+            time.sleep(0.2) or 0)
+        self.m.check_integrity(j)
+        self.assertEqual(j["integrity"], "checking")
+
+    def _wait(self, job, timeout=5):
+        deadline = time.time() + timeout
+        while time.time() < deadline and job["integrity"] == "checking":
+            time.sleep(0.02)
+        return job["integrity"]
+
+    def test_a_clean_verdict_lands_on_the_job(self):
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.scan_for_corruption = lambda path, timeout=None: 0
+        self.m.check_integrity(j)
+        self.assertEqual(self._wait(j), "ok")
+
+    def test_a_corrupt_verdict_lands_on_the_job_with_a_count(self):
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.scan_for_corruption = lambda path, timeout=None: 2
+        self.m.check_integrity(j)
+        self.assertEqual(self._wait(j), "corrupt")
+        self.assertEqual(j["integrity_hits"], 2)
+
+    def test_an_inconclusive_scan_is_not_reported_as_either_verdict(self):
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.scan_for_corruption = lambda path, timeout=None: None
+        self.m.check_integrity(j)
+        deadline = time.time() + 5
+        while time.time() < deadline and j["integrity"] == "checking":
+            time.sleep(0.02)
+        self.assertIsNone(j["integrity"])
+
+    def test_an_explicit_path_overrides_the_jobs_own(self):
+        # What a direct-stream torrent needs: it never gets job["path"] set
+        # at all, so the caller has to say where the file actually is.
+        j = self.job()
+        seen = []
+        self.m.scan_for_corruption = lambda path, timeout=None: (
+            seen.append(path) or 0)
+        self.m.check_integrity(j, path="/explicit/path.mp4")
+        self._wait(j)
+        self.assertEqual(seen, ["/explicit/path.mp4"])
+
+    def test_a_cancelled_job_is_never_overwritten_after_the_fact(self):
+        # refetch_job() sets cancel on the job it is discarding; a scan
+        # already in flight for that exact copy must not resurrect a verdict
+        # about bytes that no longer exist.
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.scan_for_corruption = lambda path, timeout=None: (
+            time.sleep(0.15) or 3)
+        self.m.check_integrity(j)
+        j["cancel"].set()
+        time.sleep(0.4)
+        self.assertNotIn(j["integrity"], ("ok", "corrupt"))
+
+
+# --------------------------------------------------------------------------
 class TestResume(Base):
     def test_a_position_comes_back(self):
         self.m.note_resume("job1", 1830.0, 7200.0)
@@ -2151,6 +2767,103 @@ class TestAudioTracks(Base):
 
     def test_no_tracks_is_a_no_op(self):
         self.assertEqual(self.m.audio_remap_args([]), ([], [], []))
+
+
+# --------------------------------------------------------------------------
+class TestLiveAudioRemap(Base):
+    """The bug found debugging Enola Holmes 3: audio_remap_args fixed the
+    FINISHED file (finalize_torrent, restore, the browser_ready shortcuts),
+    but the live phase -- what actually plays while a file is still
+    downloading -- built its ffmpeg command with no -map at all. Without one,
+    ffmpeg's automatic stream selection just takes whichever track the
+    container itself flags default, which for a MULTi release is whoever
+    packaged it, not English. ffmpeg -i also happily accepts a local path,
+    so this proves it against a real conversion rather than just the argv."""
+
+    def _multi_track_src(self, name):
+        # Polish flagged default and first, exactly like the real release
+        # ("[AUDIO #0 POLISH] [AUDIO #1 ENGLISH]") that surfaced this.
+        src = os.path.join(self.dl, name)
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=5:d=1",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+             "-f", "lavfi", "-i", "sine=frequency=880:duration=1",
+             "-map", "0:v", "-map", "1:a", "-map", "2:a",
+             "-c:v", "libx264", "-c:a", "aac",
+             "-metadata:s:a:0", "language=pol", "-disposition:a:0", "default",
+             "-metadata:s:a:1", "language=eng", "-disposition:a:1", "0",
+             src], check=True, capture_output=True)
+        return src
+
+    @needs_ffmpeg
+    def test_start_live_from_url_keeps_and_reorders_every_track(self):
+        src = self._multi_track_src("live_multi.mkv")
+        job = self.job(id="livejob")
+        self.m.start_live_from_url(job, src, "video", vcodec="h264",
+                                   height=240, hdr=False, pix="yuv420p")
+        out = os.path.join(self.dl, "livejob.live.mp4")
+        deadline = time.time() + 15
+        while time.time() < deadline and not job.get("live_done"):
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                break
+            time.sleep(0.1)
+        # Give ffmpeg a moment to flush and exit so the file is readable.
+        proc = job.get("live_proc")
+        if proc:
+            proc.wait(timeout=10)
+        self.assertTrue(os.path.exists(out), job.get("live_note"))
+
+        kept = self.m.audio_tracks(out)
+        self.assertEqual(len(kept), 2,
+                         "both tracks must survive, not just the default one")
+        self.assertEqual([t["lang"] for t in kept], ["eng", "pol"],
+                         "English must be first regardless of container order")
+        self.assertEqual(job["audio_tracks"][0]["lang"], "eng")
+        self.assertEqual(job["audio_default"], 0)
+
+    @needs_ffmpeg
+    def test_run_torrent_pipe_keeps_and_reorders_every_track(self):
+        src = self._multi_track_src("pipe_multi.mkv")
+        out_dir = os.path.join(self.dl, "pipedir")
+        os.makedirs(out_dir, exist_ok=True)
+        # run_torrent_pipe spawns webtorrent itself; standing in for it with
+        # cat keeps this a real ffmpeg run without a real torrent swarm. The
+        # partial-file probe it does for language tags reads out_dir, so the
+        # source is placed there under the name it already expects.
+        on_disk = os.path.join(out_dir, "pipe_multi.mkv")
+        shutil.copy(src, on_disk)
+        job = self.job(id="pipejob")
+        real_popen = self.m.subprocess.Popen
+        real_disk_bytes = self.m.disk_bytes
+
+        def fake_popen(cmd, **kw):
+            if cmd and cmd[0] == "webtorrent":
+                return real_popen(["cat", src], **kw)
+            return real_popen(cmd, **kw)
+        # The tiny synthetic clip never reaches the 512KB floor run_torrent_pipe
+        # waits for before it will probe codecs -- a real torrent's own
+        # preallocated file clears that immediately, so faking the same result
+        # here is standing in for scale, not skipping something meaningful.
+        self.m.subprocess.Popen = fake_popen
+        self.m.disk_bytes = lambda p: 10**7
+        try:
+            self.m.run_torrent_pipe(job, "magnet:?xt=urn:btih:" + "a" * 40,
+                                    {"index": 0}, out_dir)
+        finally:
+            self.m.subprocess.Popen = real_popen
+            self.m.disk_bytes = real_disk_bytes
+
+        out = os.path.join(self.dl, "pipejob.live.mp4")
+        deadline = time.time() + 15
+        while time.time() < deadline and not job.get("live_done"):
+            time.sleep(0.1)
+        self.assertTrue(os.path.exists(out) and os.path.getsize(out) > 0,
+                        job.get("live_note"))
+
+        kept = self.m.audio_tracks(out)
+        self.assertEqual([t["lang"] for t in kept], ["eng", "pol"])
+        self.assertEqual(job["audio_tracks"][0]["lang"], "eng")
 
 
 # --------------------------------------------------------------------------
@@ -2432,6 +3145,194 @@ class TestRatingsCache(Base):
         self.offline()
         self.assertIsNone(self.m.ratings_file())
         self.assertEqual(self.m.ratings_for({"tt1"}), {})
+
+
+# --------------------------------------------------------------------------
+class TestTrackerRefresh(Base):
+    """SEARCH_TRACKERS was a hardcoded list, manually refreshed by hand from
+    ngosang/trackerslist and tested before adopting -- the comment above it
+    said so. This is that same process automated: fetched weekly, filtered to
+    udp:// (the only scheme live_seeders' raw BEP 15 socket can talk to), and
+    each candidate actually pinged before being trusted, never just parsed
+    off the page and believed."""
+
+    def urls(self, mapping):
+        """mapping: url -> text, or url -> an exception instance to raise."""
+        class FakeResponse(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def fake_urlopen(req, timeout=None):
+            body = mapping.get(req.full_url)
+            if isinstance(body, Exception):
+                raise body
+            if body is None:
+                raise OSError("unmapped url: " + req.full_url)
+            return FakeResponse(body.encode("utf-8"))
+        self.m.urllib = types.SimpleNamespace(
+            request=types.SimpleNamespace(urlopen=fake_urlopen,
+                                          Request=urllib.request.Request),
+            parse=urllib.parse)
+
+    def test_non_udp_trackers_are_dropped_before_anything_is_pinged(self):
+        pinged = []
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: (pinged.extend(cands) or cands)
+        text = "\n".join([
+            "udp://a.example:80/announce",
+            "https://b.example/announce",     # live_seeders can't speak this
+            "wss://c.example/announce",
+            "udp://d.example:80/announce",
+            "udp://e.example:80/announce",
+            "udp://f.example:80/announce",
+            "udp://g.example:80/announce",
+        ])
+        self.urls({self.m.TRACKER_LIST_URLS[0]: text})
+        got = self.m.fetch_tracker_list()
+        self.assertTrue(all(t.startswith("udp://") for t in pinged), pinged)
+        self.assertEqual(len(pinged), 5)
+        self.assertEqual(list(got), pinged)
+
+    def test_duplicates_are_collapsed(self):
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: cands
+        text = "\n".join(["udp://a.example:80/announce"] * 3 +
+                         ["udp://b.example:80/announce",
+                          "udp://c.example:80/announce",
+                          "udp://d.example:80/announce",
+                          "udp://e.example:80/announce"])
+        self.urls({self.m.TRACKER_LIST_URLS[0]: text})
+        got = self.m.fetch_tracker_list()
+        self.assertEqual(len(got), 5)
+
+    def test_only_the_ones_that_actually_answer_are_adopted(self):
+        # Parsed fine, but a scrape only confirms five of the eight as live --
+        # the other three must never reach SEARCH_TRACKERS just for being listed.
+        text = "\n".join("udp://t%d.example:80/announce" % i for i in range(8))
+        self.urls({self.m.TRACKER_LIST_URLS[0]: text})
+        live = {"udp://t0.example:80/announce", "udp://t2.example:80/announce",
+                "udp://t4.example:80/announce", "udp://t6.example:80/announce",
+                "udp://t7.example:80/announce"}
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: tuple(
+            c for c in cands if c in live)
+        got = self.m.fetch_tracker_list()
+        self.assertEqual(set(got), live)
+
+    def test_a_kept_tracker_absent_from_the_fetch_still_survives(self):
+        # The real bug: tracker.torrent.eu.org answered in 0.03s with the
+        # highest seeder count of anything tried, but a wholesale replace
+        # dropped it anyway because ngosang's shortlist doesn't include it.
+        # keep= is how a known-good tracker gets a chance to prove itself
+        # again instead of being discarded for a reason that has nothing to
+        # do with whether it still works.
+        text = "\n".join("udp://new%d.example:80/announce" % i for i in range(5))
+        self.urls({self.m.TRACKER_LIST_URLS[0]: text})
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: cands   # all alive
+        got = self.m.fetch_tracker_list(keep=("udp://kept.example:80/announce",))
+        self.assertIn("udp://kept.example:80/announce", got)
+        self.assertEqual(len(got), 6)
+
+    def test_a_kept_tracker_that_has_actually_gone_dark_is_dropped(self):
+        text = "\n".join("udp://new%d.example:80/announce" % i for i in range(5))
+        self.urls({self.m.TRACKER_LIST_URLS[0]: text})
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: tuple(
+            c for c in cands if c != "udp://dead.example:80/announce")
+        got = self.m.fetch_tracker_list(keep=("udp://dead.example:80/announce",))
+        self.assertNotIn("udp://dead.example:80/announce", got)
+
+    def test_kept_trackers_alone_are_enough_when_the_fetch_fails(self):
+        self.urls({})   # every url raises "unmapped"
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: cands
+        keep = tuple("udp://k%d.example:80/announce" % i for i in range(5))
+        got = self.m.fetch_tracker_list(keep=keep)
+        self.assertEqual(set(got), set(keep))
+
+    def test_too_few_candidates_falls_through_to_the_mirror(self):
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: cands
+        primary, mirror = self.m.TRACKER_LIST_URLS
+        good = "\n".join("udp://t%d.example:80/announce" % i for i in range(6))
+        self.urls({primary: "udp://only-one.example:80/announce", mirror: good})
+        got = self.m.fetch_tracker_list()
+        self.assertEqual(len(got), 6)
+
+    def test_a_network_failure_falls_through_to_the_mirror(self):
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: cands
+        primary, mirror = self.m.TRACKER_LIST_URLS
+        good = "\n".join("udp://t%d.example:80/announce" % i for i in range(5))
+        self.urls({primary: OSError("unreachable"), mirror: good})
+        got = self.m.fetch_tracker_list()
+        self.assertEqual(len(got), 5)
+
+    def test_too_few_live_answers_overall_is_reported_as_nothing_found(self):
+        # Every mirror parses fine but barely anything actually answers --
+        # this must not hand back a near-empty list for apply_trackers to adopt.
+        self.m.verify_trackers_live = lambda cands, timeout=3.0: cands[:1]
+        text = "\n".join("udp://t%d.example:80/announce" % i for i in range(6))
+        self.urls({u: text for u in self.m.TRACKER_LIST_URLS})
+        self.assertIsNone(self.m.fetch_tracker_list())
+
+    def test_apply_trackers_keeps_verify_trackers_in_sync(self):
+        new = tuple("udp://t%d.example:80/announce" % i for i in range(8))
+        self.m.apply_trackers(new)
+        self.assertEqual(self.m.SEARCH_TRACKERS, new)
+        self.assertEqual(self.m.VERIFY_TRACKERS, new[:5])
+
+    def test_cache_round_trips(self):
+        trackers = tuple("udp://t%d.example:80/announce" % i for i in range(5))
+        self.m.save_cached_trackers(trackers, 12345.0)
+        got, at = self.m.load_cached_trackers()
+        self.assertEqual(got, trackers)
+        self.assertEqual(at, 12345.0)
+
+    def test_a_missing_cache_is_not_an_error(self):
+        got, at = self.m.load_cached_trackers()
+        self.assertIsNone(got)
+        self.assertEqual(at, 0.0)
+
+    def test_a_short_cached_list_is_refused(self):
+        # Fewer than five is suspicious enough to distrust rather than adopt --
+        # the same floor a live fetch is held to.
+        self.m.save_cached_trackers(("udp://only.example:80/announce",), 1.0)
+        got, _at = self.m.load_cached_trackers()
+        self.assertIsNone(got)
+
+    def test_tick_is_a_no_op_inside_the_refresh_window(self):
+        recent = tuple("udp://t%d.example:80/announce" % i for i in range(5))
+        self.m.save_cached_trackers(recent, time.time())
+        self.m.fetch_tracker_list = lambda timeout=10, keep=(): self.fail(
+            "must not fetch again inside the refresh window")
+        self.assertFalse(self.m.tracker_refresh_tick())
+
+    def test_tick_refreshes_once_the_window_has_passed(self):
+        stale = ("udp://old.example:80/announce",) * 5
+        self.m.save_cached_trackers(stale, time.time() - self.m.TRACKER_REFRESH_INTERVAL - 1)
+        fresh = tuple("udp://new%d.example:80/announce" % i for i in range(5))
+        self.m.fetch_tracker_list = lambda timeout=10, keep=(): fresh
+        self.assertTrue(self.m.tracker_refresh_tick())
+        self.assertEqual(self.m.SEARCH_TRACKERS, fresh)
+        self.assertEqual(self.m.VERIFY_TRACKERS, fresh[:5])
+        got, _at = self.m.load_cached_trackers()
+        self.assertEqual(got, fresh)
+
+    def test_tick_passes_the_trackers_already_in_use_to_be_kept(self):
+        # The actual bug this guards: a wholesale replace silently dropped a
+        # known-good tracker (tracker.torrent.eu.org) just for being outside
+        # whatever the upstream source happened to curate that week.
+        stale = tuple("udp://old%d.example:80/announce" % i for i in range(5))
+        self.m.save_cached_trackers(stale, time.time() - self.m.TRACKER_REFRESH_INTERVAL - 1)
+        self.m.apply_trackers(stale)
+        seen = {}
+        def fake_fetch(timeout=10, keep=()):
+            seen["keep"] = keep
+            return keep
+        self.m.fetch_tracker_list = fake_fetch
+        self.m.tracker_refresh_tick()
+        self.assertEqual(set(seen["keep"]), set(stale))
+
+    def test_a_failed_tick_never_overwrites_the_previous_list(self):
+        stale = tuple("udp://old%d.example:80/announce" % i for i in range(5))
+        self.m.save_cached_trackers(stale, time.time() - self.m.TRACKER_REFRESH_INTERVAL - 1)
+        self.m.apply_trackers(stale)
+        self.m.fetch_tracker_list = lambda timeout=10, keep=(): None
+        self.assertFalse(self.m.tracker_refresh_tick())
+        self.assertEqual(self.m.SEARCH_TRACKERS, stale)
 
 
 if __name__ == "__main__":

@@ -73,7 +73,7 @@ GB = 1_000_000_000  # decimal GB, matching what Finder displays
 # Rolling cache. When the folder goes over the cap, finished files are deleted
 # oldest-first (by last play, falling back to mtime). The file currently being
 # streamed and any file whose job is still working are never touched.
-CACHE_CAP_GB = 15.0
+CACHE_CAP_GB = 30.0
 CAP_LOCK = threading.Lock()
 
 # How many downloads run at once. Pasting 50 links should not spawn 50 rclones.
@@ -236,15 +236,17 @@ SEARCH_VERIFY = 8
 # Every tracker here was scraped and confirmed to answer, rather than trusted
 # because it appears on a list: of 47 in the maintained public list, 31 replied
 # and 16 did not, and three of the four originally hardcoded here were among the
-# dead. Refresh occasionally from github.com/ngosang/trackerslist, testing before
-# adopting -- trackers go dark quietly and a dead one costs a timeout every time.
+# dead. This was that check, done once by hand -- tracker_refresher() below now
+# repeats it weekly in the background, so the list this process actually uses
+# drifts away from this fallback over time. This tuple only matters again if
+# every fetch attempt has failed: the permanent floor, never overwritten.
 #
 # Two lists, because they are used for two different things. Announcing wants
 # breadth: each tracker knows only its own slice of a swarm, so the peers found
 # are the union, and one reporting six seeders may still hold the six nobody else
 # has. Measuring wants the few big ones that answer fastest, since the number we
 # want is the largest and a slow tracker just delays the search.
-SEARCH_TRACKERS = (
+FALLBACK_TRACKERS = (
     "udp://tracker.torrent.eu.org:451/announce",
     "udp://open.demonii.com:1337/announce",
     "udp://leet-tracker.moe:1337/announce",
@@ -265,8 +267,183 @@ SEARCH_TRACKERS = (
     "udp://tracker.gmi.gd:6969/announce",
 )
 
+# Reassigned wholesale by apply_trackers() once a weekly refresh succeeds --
+# every reader below re-reads the global at call time, so nothing needs to be
+# threaded through. Starts out identical to the fallback and only ever
+# improves on it, never regresses below it.
+SEARCH_TRACKERS = FALLBACK_TRACKERS
+
 # The subset asked when checking a seeder count: biggest and quickest to reply.
 VERIFY_TRACKERS = SEARCH_TRACKERS[:5]
+
+TRACKER_REFRESH_INTERVAL = 7 * 86400
+# ngosang/trackerslist's own curated shortlist, not the full multi-hundred-line
+# dump -- that one is exactly the "trusted because it's on a list" mistake the
+# comment above warns about, and would need far more liveness checking to be
+# worth the bandwidth. jsdelivr mirrors the same file for when GitHub's raw
+# host is rate-limited or blocked.
+TRACKER_LIST_URLS = (
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+    "https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_best.txt",
+)
+
+
+def tracker_alive(tracker, timeout=3.0):
+    """A bare BEP 15 connect handshake: confirms something is actually
+    listening and speaking the protocol, without paying for a full scrape.
+    The same check the trackers above were run through by hand before being
+    adopted -- this is that step, automated."""
+    host, _, port = tracker.partition("://")[2].partition("/")[0].rpartition(":")
+    try:
+        addr = (host, int(port))
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            tid = random.randint(0, 2 ** 31)
+            s.sendto(struct.pack(">QII", 0x41727101980, 0, tid), addr)
+            data, _ = s.recvfrom(512)
+            action, rtid, _cid = struct.unpack(">IIQ", data[:16])
+            return action == 0 and rtid == tid
+        finally:
+            s.close()
+    except Exception:
+        return False
+
+
+def verify_trackers_live(candidates, timeout=3.0):
+    """Which candidates actually answer, checked in parallel -- most trackers
+    on any public list are dead, and timing them out one at a time would make
+    a weekly refresh of ~20 candidates take a minute instead of a few seconds."""
+    lock = threading.Lock()
+    alive = set()
+    def check(tr):
+        if tracker_alive(tr, timeout):
+            with lock:
+                alive.add(tr)
+    threads = [threading.Thread(target=check, args=(tr,), daemon=True)
+               for tr in candidates]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 1)
+    return tuple(tr for tr in candidates if tr in alive)   # source order kept
+
+
+def fetch_tracker_list(timeout=10, keep=()):
+    """The current best UDP trackers, tested rather than trusted -- or None if
+    nothing usable came back, in which case the caller keeps whatever it has.
+
+    `keep` is unioned in before verifying, not after: a tracker already
+    trusted (the hardcoded fallback on the first run, last week's result on
+    every one after) is re-tested alongside whatever's freshly fetched, so it
+    is never dropped just for being outside whatever a third party's list
+    happens to curate this week -- only for actually having gone dark. First
+    found this way: ngosang's shortlist doesn't include tracker.torrent.eu.org,
+    and a wholesale replace silently lost it despite it answering in 0.03s
+    with the single highest seeder count of any tracker tried.
+
+    Filtered to udp:// before anything else: live_seeders() speaks the raw
+    BEP 15 protocol straight off the scheme, so an http/https/wss tracker in
+    the mix would just be a handshake nobody on the other end understands.
+    """
+    fetched = None
+    for url in TRACKER_LIST_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                text = r.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        candidates = tuple(dict.fromkeys(         # de-duped, source order kept
+            line.strip() for line in text.splitlines()
+            if line.strip().startswith("udp://")))
+        if len(candidates) >= 5:
+            fetched = candidates
+            break                                  # malformed response otherwise, try the mirror
+    if fetched is None and not keep:
+        return None
+    pool = tuple(dict.fromkeys(list(keep) + list(fetched or ())))
+    if len(pool) < 5:
+        return None
+    alive = verify_trackers_live(pool)
+    return alive if len(alive) >= 5 else None
+
+
+def apply_trackers(trackers):
+    """The one place both lists change, so VERIFY_TRACKERS -- a slice taken
+    once above -- can never drift out of sync with a refreshed SEARCH_TRACKERS."""
+    global SEARCH_TRACKERS, VERIFY_TRACKERS
+    SEARCH_TRACKERS = trackers
+    VERIFY_TRACKERS = SEARCH_TRACKERS[:5]
+
+
+def load_cached_trackers():
+    """A previous run's verified list, so a restart does not sit on the
+    hardcoded fallback until the next weekly fetch happens to complete.
+
+    The path is built here rather than cached in a module-level constant --
+    CACHE_DIR is the kind of thing a test points elsewhere, and a constant
+    computed once at import time would miss that entirely, the same trap
+    ratings_file() avoids by doing the same.
+    """
+    path = os.path.join(CACHE_DIR, "trackers.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = _json.load(f)
+        trackers = tuple(t for t in (data.get("trackers") or []) if isinstance(t, str))
+        if len(trackers) >= 5:
+            return trackers, float(data.get("fetched_at") or 0)
+    except (OSError, ValueError, TypeError):
+        pass
+    return None, 0.0
+
+
+def save_cached_trackers(trackers, fetched_at):
+    path = os.path.join(CACHE_DIR, "trackers.json")
+    tmp = path + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump({"trackers": list(trackers), "fetched_at": fetched_at}, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def tracker_refresh_tick():
+    """One refresh attempt if a week has passed since the last good one, else
+    a no-op. Split out from the loop below so a test can call it once; "due"
+    is decided by what's on disk rather than a variable carried between loop
+    iterations, which a restart would lose anyway. Returns whether it refreshed.
+    """
+    _cached, fetched_at = load_cached_trackers()
+    if time.time() - fetched_at < TRACKER_REFRESH_INTERVAL:
+        return False
+    # SEARCH_TRACKERS, not the cached list just read above: whatever is
+    # actually in use right now, which on the very first tick is the
+    # hardcoded fallback and on every tick after is last week's result.
+    fresh = fetch_tracker_list(keep=SEARCH_TRACKERS)
+    if not fresh:
+        return False        # try again next tick -- never overwrite a good list
+    apply_trackers(fresh)
+    save_cached_trackers(fresh, time.time())
+    return True
+
+
+def tracker_refresher():
+    """Keeps SEARCH_TRACKERS current in the background, at most once a week,
+    without ever running with fewer or less-verified trackers than the
+    hardcoded fallback: a fetch that fails, or a source that comes back empty
+    or unreachable, just leaves the previous list in place until the next tick.
+    """
+    cached, _fetched_at = load_cached_trackers()
+    if cached:
+        apply_trackers(cached)
+    while True:
+        tracker_refresh_tick()
+        time.sleep(3600)
 
 # Recommendations. Search answers "do you have this?"; this answers "what should
 # I watch?", which needs a source that is browsable rather than queryable.
@@ -804,68 +981,88 @@ def buffered_seconds(job):
     return max(0.0, round(have - playhead(job["id"]), 1))
 
 
+def scheduler_tick():
+    """One pass of the scheduler's decisions -- split out from the loop below
+    so a test can call it once and inspect the result, the same reasoning as
+    tracker_refresh_tick(). The `continue`s of a loop body become `return`s
+    now that there is no enclosing loop to continue.
+    """
+    with LOCK:
+        order = list(JOBS.values())
+    # Everything being watched right now, freshest viewer first. A
+    # client that has gone quiet drops out of viewers() on its own.
+    seen_ids, watched = [], []
+    for vw in viewers():
+        if vw["id"] and vw["id"] not in seen_ids:
+            seen_ids.append(vw["id"])
+            j = next((x for x in order if x["id"] == vw["id"]), None)
+            if j:
+                watched.append(j)
+    playing = watched[0] if watched else None
+    active = [j for j in order if j["status"] in ACTIVE]
+    # auto=False excludes a pack sibling: it goes through /start (a
+    # click) only, never this loop, whether the queue is idle (rule 1)
+    # or there's spare bandwidth to prefetch into (rule 3). Opening a
+    # 25-episode series starts the one episode asked for, not the
+    # other 24 behind it, one after another, unasked.
+    queued = [j for j in order if j["status"] == "queued" and j.get("hold")
+             and j.get("auto", True)]
+    # The worst of what anyone is watching. A prefetch that would be fine
+    # for one viewer can still be what stalls the other.
+    grades = [stream_health(j) for j in watched] or ["unknown"]
+    health = next((g for g in ("behind", "tight", "ok", "unknown")
+                   if g in grades), "unknown")
+
+    # 1. nothing playing and nothing running: start the first item
+    if not active and queued:
+        release(queued[0])
+        return
+
+    # 2. suspend or resume prefetches according to the stream's margin.
+    # Never for a job a person paused by hand -- rule 2 is about the
+    # scheduler's own prefetch throttling, and must not silently
+    # resume something paused on purpose just because the margin
+    # improved, or fight a manual pause it never issued.
+    for j in order:
+        if not j.get("prefetch") or j["status"] not in ACTIVE or j.get("user_paused"):
+            continue
+        want_paused = health in ("tight", "behind")
+        if want_paused and not j.get("paused"):
+            if pause_proc(j.get("wt_proc") or j.get("proc"), True):
+                j["paused"] = True
+                j["note"] = "paused so the stream keeps up"
+        elif not want_paused and j.get("paused"):
+            if pause_proc(j.get("wt_proc") or j.get("proc"), False):
+                j["paused"] = False
+                j["note"] = "prefetching"
+
+    # 3. start the next item once the stream has room to spare
+    if playing is None or health not in ("ok", "unknown"):
+        return
+    running_pf = sum(1 for j in order
+                     if j.get("prefetch") and j["status"] in ACTIVE)
+    if running_pf >= PREFETCH:
+        return
+    try:
+        after = order.index(playing)
+    except ValueError:
+        after = -1
+    nxt = next((j for j in order[after + 1:]
+                if j["status"] == "queued" and j.get("hold")
+                and j.get("auto", True)), None)
+    if nxt:
+        nxt["prefetch"] = True
+        nxt["note"] = "prefetching"
+        release(nxt)
+
+
 def scheduler():
     """Starts queued items, keeps PREFETCH of them warm ahead of the one being
     watched, and suspends a prefetch whenever the stream needs the bandwidth."""
     while True:
         time.sleep(1.0)
         try:
-            with LOCK:
-                order = list(JOBS.values())
-            # Everything being watched right now, freshest viewer first. A
-            # client that has gone quiet drops out of viewers() on its own.
-            seen_ids, watched = [], []
-            for vw in viewers():
-                if vw["id"] and vw["id"] not in seen_ids:
-                    seen_ids.append(vw["id"])
-                    j = next((x for x in order if x["id"] == vw["id"]), None)
-                    if j:
-                        watched.append(j)
-            playing = watched[0] if watched else None
-            active = [j for j in order if j["status"] in ACTIVE]
-            queued = [j for j in order if j["status"] == "queued" and j.get("hold")]
-            # The worst of what anyone is watching. A prefetch that would be fine
-            # for one viewer can still be what stalls the other.
-            grades = [stream_health(j) for j in watched] or ["unknown"]
-            health = next((g for g in ("behind", "tight", "ok", "unknown")
-                           if g in grades), "unknown")
-
-            # 1. nothing playing and nothing running: start the first item
-            if not active and queued:
-                release(queued[0])
-                continue
-
-            # 2. suspend or resume prefetches according to the stream's margin
-            for j in order:
-                if not j.get("prefetch") or j["status"] not in ACTIVE:
-                    continue
-                want_paused = health in ("tight", "behind")
-                if want_paused and not j.get("paused"):
-                    if pause_proc(j.get("wt_proc") or j.get("proc"), True):
-                        j["paused"] = True
-                        j["note"] = "paused so the stream keeps up"
-                elif not want_paused and j.get("paused"):
-                    if pause_proc(j.get("wt_proc") or j.get("proc"), False):
-                        j["paused"] = False
-                        j["note"] = "prefetching"
-
-            # 3. start the next item once the stream has room to spare
-            if playing is None or health not in ("ok", "unknown"):
-                continue
-            running_pf = sum(1 for j in order
-                             if j.get("prefetch") and j["status"] in ACTIVE)
-            if running_pf >= PREFETCH:
-                continue
-            try:
-                after = order.index(playing)
-            except ValueError:
-                after = -1
-            nxt = next((j for j in order[after + 1:]
-                        if j["status"] == "queued" and j.get("hold")), None)
-            if nxt:
-                nxt["prefetch"] = True
-                nxt["note"] = "prefetching"
-                release(nxt)
+            scheduler_tick()
         except Exception:
             pass
 
@@ -3285,7 +3482,24 @@ def new_job(drive_id, jid=None, **extra):
            "compat_done": False, "compat_pct": None, "compat_note": "",
            "streamable": None, "live_file": None, "live_kind": None,
            "live_ready": False, "live_done": False, "live_note": "", "note": "",
-           "dl_done": False}
+           "dl_done": False,
+           # None until check_integrity() runs a decode pass over the finished
+           # file; 'checking' while that pass is in flight; then 'ok' or
+           # 'corrupt'. Never set for a job restored from disk on startup --
+           # scanning an entire existing library on every restart is a cost
+           # nobody asked to pay just for reopening the app.
+           "integrity": None, "integrity_hits": 0,
+           # False for a pack sibling: the scheduler will never start or
+           # prefetch it on its own, only /start (a click) can. The episode
+           # actually chosen when the series was added keeps the normal
+           # True -- opening a 25-episode series should start the one
+           # episode asked for, not silently queue up the other 24 behind it.
+           "auto": True,
+           # True once a person has explicitly paused this job, as opposed to
+           # the scheduler's own prefetch throttling (see scheduler() rule 2)
+           # -- which must never silently resume something a person stopped
+           # on purpose just because the stream's margin improved.
+           "user_paused": False}
     job.update(extra)
     return job
 
@@ -3367,7 +3581,9 @@ def public(job):
             # what *we* serve, not what upstream supports: a transcoded torrent
             # goes out as fragments and cannot be seeked
             "seekable": bool(job.get("path") or job.get("wt_direct")),
-            "codecs": job.get("wt_codecs", "")}
+            "codecs": job.get("wt_codecs", ""),
+            "integrity": job.get("integrity"),
+            "integrity_hits": job.get("integrity_hits") or 0}
 
 
 # ---- restore across restarts -------------------------------------------------
@@ -3401,10 +3617,17 @@ def restore():
                     info = None
                 if info and info.get("magnet"):
                     jid = name[:-3]
+                    # index is the pin that keeps this the one file it always
+                    # was. Without it, a pack sibling resumes indistinguishable
+                    # from a brand new unpinned magnet -- picks file 0 again
+                    # and fans the whole pack back out as duplicates of
+                    # episodes that may already be sitting done elsewhere.
                     JOBS[jid] = new_job(None, jid=jid, source="torrent",
                                         magnet=info["magnet"], restored=True,
                                         total=int(info.get("total") or 0),
-                                        title=info.get("title") or "torrent")
+                                        title=info.get("title") or "torrent",
+                                        wt_index=info.get("index"),
+                                        wt_files=int(info.get("files") or 0))
                 else:
                     shutil.rmtree(p, ignore_errors=True)
             continue
@@ -3940,6 +4163,78 @@ def probe_media(path, timeout=25):
     return (v.get("codec_name"), a[0] if a else None, v.get("height"), hdr,
             num(fmt.get("bit_rate"), int), num(fmt.get("duration"), float),
             v.get("pix_fmt"))
+
+
+# Substrings ffmpeg's own decoder prints to stderr (at -v error) when it hits
+# bytes that don't parse as valid video -- not warnings, actual decode
+# failures. Derived from what two real corrupt files in this app's own
+# library produced: "corrupt decoded frame" and "error while decoding MB".
+CORRUPTION_RE = re.compile(r"corrupt|error while decoding|invalid data found",
+                           re.I)
+
+
+def scan_for_corruption(path, timeout=None):
+    """A full decode pass over a finished file, counting frames ffmpeg's own
+    decoder refused as unparseable.
+
+    ffprobe already confirms the container and streams parse -- that was
+    never the gap. Both real corrupt files this was built from reported
+    clean metadata and a complete duration; the damage was in the encoded
+    pixel data itself, invisible to anything short of actually decoding it.
+
+    Returns the number of decode errors found (0 means clean), or None if
+    the scan itself couldn't be completed -- inconclusive, not a verdict, so
+    a caller must never treat None as either ok or corrupt.
+    """
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-f", "null", "-"],
+            capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    hits = len(CORRUPTION_RE.findall(r.stderr or ""))
+    # A decode error is non-fatal -- ffmpeg conceals the bad frame and keeps
+    # going, so a real corrupt file still exits 0. A nonzero exit with zero
+    # hits means the opposite problem: it never got to decode anything at
+    # all (missing file, unreadable permissions, unrecognised format), which
+    # is not the same as "decoded cleanly" and must not be reported as such.
+    if hits == 0 and r.returncode != 0:
+        return None
+    return hits
+
+
+def check_integrity(job, path=None):
+    """Kicks off scan_for_corruption() in the background and records the
+    verdict on the job once it lands, without making anything wait for it.
+
+    A multi-minute decode pass over a large film would otherwise hold a
+    'done' item back from being playable for exactly the reason it just
+    finished downloading -- someone wanting to watch it now. The scan is a
+    warning layered on afterward, never a gate in front of playback.
+
+    `path` is taken explicitly rather than always read off the job, because a
+    direct-stream torrent never gets one -- it's served straight from
+    webtorrent's own output, so job["path"] stays None by design and the
+    caller has to say where the finished bytes actually are.
+    """
+    path = path or job.get("path")
+    if not path:
+        return
+    job["integrity"] = "checking"
+    def go():
+        hits = scan_for_corruption(path)
+        if job["cancel"].is_set():
+            return           # removed, refetched, or replaced since this started
+        if hits is None:
+            job["integrity"] = None
+        elif hits > 0:
+            job["integrity"] = "corrupt"
+            job["integrity_hits"] = hits
+            record(job, "integrity check found %d likely-corrupt frame(s) -- "
+                        "refetch recommended" % hits)
+        else:
+            job["integrity"] = "ok"
+    threading.Thread(target=go, daemon=True).start()
 
 
 _ENCODER = None
@@ -4619,6 +4914,7 @@ def run_job(job):
         if job.get("live_file"):
             sweep_live(job)
         enforce_cache_cap()
+        check_integrity(job)
     except Exception as e:
         cleanup()
         fail(job, f"{type(e).__name__}: {e}")
@@ -4775,13 +5071,15 @@ def fan_out(job, magnet, files, extras):
 
     Each sibling is an ordinary torrent job pinned to one file index, so it goes
     through the same download, probe, convert and subtitle path as anything
-    else, and the scheduler decides when it starts -- which is what keeps a
-    twelve-episode pack from opening twelve webtorrent processes at once.
+    else. auto=False, not the scheduler's own judgement, is what keeps a
+    twelve-episode pack from opening twelve webtorrent processes at once --
+    every sibling sits inert until a person starts it by hand, the same way
+    the one episode actually asked for already did.
     """
     made = []
     for f in extras:
         sib = new_job(None, source="torrent", magnet=magnet,
-                      caps=job.get("caps"), wt_index=f["index"],
+                      caps=job.get("caps"), wt_index=f["index"], auto=False,
                       title=os.path.splitext(os.path.basename(f["name"]))[0])
         sib["total"] = f.get("size") or 0
         sib["wt_files"] = len(files)
@@ -5213,7 +5511,8 @@ def run_torrent(job):
     try:
         with open(os.path.join(out_dir, ".reel.json"), "w") as f:
             _json.dump({"magnet": magnet, "index": chosen["index"],
-                        "title": job["title"], "total": job["total"]}, f)
+                        "title": job["title"], "total": job["total"],
+                        "files": job["wt_files"]}, f)
     except OSError:
         pass
 
@@ -5446,6 +5745,7 @@ def run_torrent(job):
         done_src = locate_downloaded_file(out_dir, chosen)
         if done_src:
             start_subs(job, done_src, name=os.path.basename(done_src))
+            check_integrity(job, path=done_src)
 
     # ---- 5. finalize into a seekable file, if this one needed transcoding ---
     # A direct stream is already seekable -- webtorrent's own ranged proxy,
@@ -5537,6 +5837,7 @@ def adopt_finalized(job, out_dir, src, out):
     if job.get("live_file"):
         sweep_live(job)
     enforce_cache_cap()
+    check_integrity(job)
 
 
 def finalize_torrent(job, out_dir, chosen):
@@ -5723,9 +6024,20 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
               "-f", "mp3", out]
     else:
         out = os.path.join(DL, job["id"] + ".live.mp4")
+        # f is the same file webtorrent is writing to disk as it feeds the pipe,
+        # so its stream order matches pipe:0's -- probing it is the only way to
+        # see language tags here, since ffprobe can't also read the pipe itself
+        # without stealing bytes ffmpeg needs. Same reasoning as the equivalent
+        # fix in start_live_from_url: without -map, ffmpeg keeps only whichever
+        # track the container flags default, dropping the rest.
+        atracks = audio_tracks(f) if f else []
+        amaps, ameta, ordered = audio_remap_args(atracks)
+        if ordered:
+            job["audio_tracks"] = ordered
+            job["audio_default"] = 0
         ff = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
               "-progress", "pipe:1", "-nostats", "-i", "pipe:0", *vfilter, *vargs,
-              "-c:a", "aac", "-ac", "2", "-f", "mp4",
+              "-map", "0:v:0", *amaps, *ameta, "-c:a", "aac", "-ac", "2", "-f", "mp4",
               "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
               "-frag_duration", "1500000", "-flush_packets", "1", out]
     try:
@@ -5798,9 +6110,21 @@ def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
         vargs, vfilter, vnote = video_args(vcodec, height, hdr, pix=pix)
         if vnote:
             job["note"] = (job.get("note", "") + "; " + vnote).strip("; ")
+        # Without an explicit -map, ffmpeg's automatic stream selection takes
+        # whichever audio track the container itself flags as default -- for a
+        # MULTi release that is whoever packaged it, not the viewer, and it
+        # silently drops every other track rather than just picking one badly.
+        # This is the same fix audio_remap_args gives the finished file, just
+        # applied while the file is still arriving instead of after.
+        atracks = audio_tracks(url)
+        amaps, ameta, ordered = audio_remap_args(atracks)
+        if ordered:
+            job["audio_tracks"] = ordered
+            job["audio_default"] = 0
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                "-progress", "pipe:1", "-nostats",
-               "-i", url, *vfilter, *vargs, "-c:a", "aac", "-ac", "2", "-f", "mp4",
+               "-i", url, *vfilter, *vargs, "-map", "0:v:0", *amaps, *ameta,
+               "-c:a", "aac", "-ac", "2", "-f", "mp4",
                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                "-frag_duration", "1500000", "-flush_packets", "1", out]
     try:
@@ -6072,6 +6396,78 @@ def drop(jid, delete_file=True):
     purge_files(jid, job, delete_file)
 
 
+def refetch_job(jid):
+    """Start an item completely over: same row, same id, but everything
+    downloaded discarded and every derived field reset, not just the ones
+    /retry resets for a job that never got as far as finishing.
+
+    /retry exists for a job that failed to arrive; this is for one that
+    arrived and turned out to be wrong anyway -- corrupt source data, a piece
+    a peer sent that shouldn't have passed, whatever. No status check on
+    entry, unlike /retry: a bad file is bad regardless of what state the job
+    is currently sitting in, including done, and a person watching it happen
+    should not have to wait for it to fail on its own first.
+
+    Rebuilt via new_job() rather than resetting fields on the existing dict
+    -- a 'done' job accumulates state (audio tracks, subtitle status, compat
+    renditions, timings) that a freshly-added one never had, and hand-listing
+    every field to clear is exactly the kind of checklist that gets missed.
+    """
+    with LOCK:
+        job = JOBS.get(jid)
+        ok = bool(job and (job.get("drive_id") or job.get("magnet")))
+    if not ok:
+        return False
+    job["cancel"].set()
+    stop_procs(job)
+    purge_files(jid, job, delete_file=True)
+    fresh = new_job(job.get("drive_id"), jid=jid, source=job.get("source", "drive"),
+                    magnet=job.get("magnet"), wt_index=job.get("wt_index"),
+                    wt_files=job.get("wt_files") or 0, caps=job.get("caps"),
+                    title=job.get("title"))
+    with LOCK:
+        JOBS[jid] = fresh
+    record(fresh, "refetching from scratch -- the previous copy is gone")
+    release(fresh)
+    return True
+
+
+def pause_job(jid):
+    """Stops the underlying process (SIGSTOP), not the job -- it stays active
+    and keeps its place in the queue, just not moving, so resuming picks up
+    mid-piece rather than needing to start over.
+
+    user_paused marks this as a person's decision, not the scheduler's own
+    prefetch throttling (scheduler_tick() rule 2), which must never silently
+    override it.
+    """
+    with LOCK:
+        job = JOBS.get(jid)
+        ok = bool(job and job["status"] in ACTIVE and not job.get("paused"))
+        if not ok:
+            return False
+    ok = pause_proc(job.get("wt_proc") or job.get("proc"), True)
+    if ok:
+        job["paused"] = True
+        job["user_paused"] = True
+        job["note"] = "paused by hand"
+    return ok
+
+
+def resume_job(jid):
+    with LOCK:
+        job = JOBS.get(jid)
+        ok = bool(job and job.get("paused"))
+        if not ok:
+            return False
+    ok = pause_proc(job.get("wt_proc") or job.get("proc"), False)
+    if ok:
+        job["paused"] = False
+        job["user_paused"] = False
+        job["note"] = "resumed by hand"
+    return ok
+
+
 # ---- http --------------------------------------------------------------------
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -6305,6 +6701,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 WORK_Q.put(jid)
             self._json(200, {"ok": ok})
 
+        elif p == "/refetch":
+            # Unlike /retry, works from any status -- see refetch_job()'s
+            # docstring for why a finished-but-wrong file can't wait for the
+            # job to fail on its own before it's allowed to start over.
+            self._json(200, {"ok": refetch_job(body.get("id"))})
+
         elif p == "/start":
             jid = body.get("id")
             with LOCK:
@@ -6315,6 +6717,12 @@ class H(http.server.BaseHTTPRequestHandler):
                     job["note"] = "started by hand"
                     release(job)
             self._json(200, {"ok": ok})
+
+        elif p == "/pause":
+            self._json(200, {"ok": pause_job(body.get("id"))})
+
+        elif p == "/resume":
+            self._json(200, {"ok": resume_job(body.get("id"))})
 
         elif p == "/playing":
             jid = body.get("id")
@@ -6879,8 +7287,15 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .section{display:flex;align-items:baseline;gap:10px;margin:30px 0 2px}
   .section .count{font:400 11px/1 var(--mono);color:var(--faint)}
   ul{list-style:none}
-  li.row{display:grid;grid-template-columns:26px 1fr auto 26px;align-items:center;
-    gap:12px;padding:11px 4px;border-bottom:1px solid var(--rule);cursor:pointer;
+  /* Two rows, not one: the title used to share its row with every badge and
+     button (cc, integrity, log, refetch, pause, kind, status), each new one
+     eating further into the title's own column until a long release name had
+     nowhere left to go. flags is unpositioned here on purpose -- grid auto-
+     flow drops it into a new row spanning the full width on its own, the
+     same trick logpanel/morepanel already used to sit below the row rather
+     than beside it. */
+  li.row{display:grid;grid-template-columns:26px 1fr 26px;align-items:center;
+    gap:6px 12px;padding:11px 4px;border-bottom:1px solid var(--rule);cursor:pointer;
     transition:background .1s}
   li.row:hover{background:var(--panel)}
   /* the log lives inside the row's grid, spanning it, so opening one does not
@@ -6901,6 +7316,19 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     padding:3px 7px}
   .moreBtn:hover{color:var(--text);border-color:var(--dim)}
   .moreBtn.on{color:var(--brass);border-color:var(--brass)}
+  /* Always present, not conditional like logbtn/moreBtn -- a copy can turn
+     out to be wrong regardless of what state the row is in, so there is no
+     status this should be hidden for. */
+  .refetchbtn{font:400 10px/1 var(--mono);letter-spacing:.08em;
+    text-transform:uppercase;color:var(--faint);background:none;
+    border:1px solid var(--rule);border-radius:3px;padding:3px 5px}
+  .refetchbtn:hover:not(:disabled){color:var(--warn);border-color:var(--warn)}
+  .refetchbtn:disabled{color:var(--faint);opacity:.5}
+  .pausebtn{font:400 10px/1 var(--mono);letter-spacing:.08em;
+    text-transform:uppercase;color:var(--faint);background:none;
+    border:1px solid var(--rule);border-radius:3px;padding:3px 5px}
+  .pausebtn:hover:not(:disabled){color:var(--brass);border-color:var(--brass)}
+  .pausebtn:disabled{color:var(--faint);opacity:.5}
   .morepanel{grid-column:1/-1;margin:8px 0 2px;padding:8px 10px;
     background:var(--ink);border:1px solid var(--rule);border-radius:4px;
     font:400 11.5px/1.6 var(--mono);color:var(--dim)}
@@ -6926,9 +7354,6 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
     font-size:13px;color:var(--dim);overflow:hidden;white-space:normal;
     overflow-wrap:anywhere;line-height:1.4}
-  /* The status column must keep its width rather than be squeezed by a long
-     title: it is the one part of the row that has to stay readable. */
-  .flags{flex:none}
   .track{height:2px;margin-top:7px;background:var(--rule);border-radius:1px;
     overflow:hidden;display:none}
   .track.show{display:block}
@@ -6939,7 +7364,11 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .note.quiet{color:var(--faint)}
   .note{font-size:11.5px;color:var(--bad);margin-top:6px;
     white-space:pre-wrap;word-break:break-word}
-  .flags{display:flex;align-items:center;gap:10px}
+  /* grid-column:1/-1 -- unpositioned, this would auto-flow into row 1's
+     empty third cell instead of a row of its own, undoing the whole point.
+     flex-wrap so a long run of badges wraps onto a third line rather than
+     overflowing the row's width, same as any other text would. */
+  .flags{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
   .kind{font:400 10px/1 var(--mono);letter-spacing:.1em;color:var(--faint);
     text-transform:uppercase}
   .kind.now{color:var(--brass)}
@@ -6953,8 +7382,19 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .cc.on{display:inline-block}
   .cc.found{color:var(--brass);border-color:rgba(198,162,101,.4)}
   .cc.rough{color:var(--warn);border-color:rgba(192,138,74,.4)}
-  .stat{font:400 11.5px/1 var(--mono);color:var(--dim);
-    font-variant-numeric:tabular-nums;text-align:right;min-width:74px}
+  /* Only shown for a verdict worth acting on -- see paint(). A clean file or
+     one still mid-scan says nothing here, same as .eyes when no one else is
+     watching. */
+  .integrity{font:500 9.5px/1 var(--mono);letter-spacing:.1em;
+    text-transform:uppercase;color:var(--bad);
+    border:1px solid rgba(196,117,106,.4);border-radius:3px;padding:3px 4px;
+    display:none;cursor:help}
+  .integrity.on{display:inline-block}
+  /* Pushed to the end of the (now full-width) flags row with margin-left:auto
+     rather than a fixed-width column -- the one part of the row that should
+     always read as the last word on it. */
+  .stat{font:400 11.5px/1 var(--mono);color:var(--dim);margin-left:auto;
+    font-variant-numeric:tabular-nums;text-align:right}
   .stat.ready{color:var(--live)}
   .stat.bad{color:var(--bad)}
   .stat.idle{color:var(--faint)}
@@ -6986,9 +7426,10 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   @media (max-width:600px){
     .transport{flex-wrap:wrap}
     .cue{order:3;flex-basis:100%;padding:0}
-    li.row{grid-template-columns:20px 1fr auto 20px;gap:9px}
-    .stat{min-width:0}
-    .flags{flex-direction:column;align-items:flex-end;gap:3px}
+    /* flags already wraps and sits on its own full-width row above this
+       breakpoint -- narrower still just tightens what's already correct,
+       nothing left here needs its own layout. */
+    li.row{grid-template-columns:20px 1fr 20px;gap:6px 9px}
   }
   @media (prefers-reduced-motion:reduce){
     *{animation:none!important;transition:none!important}
@@ -7209,6 +7650,13 @@ const ta = $('links');
 const grow = () => { ta.style.height = 'auto';
                      ta.style.height = Math.min(ta.scrollHeight, 130) + 'px'; };
 ta.addEventListener('input', grow);
+// On a narrow screen the placeholder itself wraps to two lines, and without
+// this the box stays sized for one -- clipping the second line of the
+// placeholder on every phone until the user's first keystroke. scrollHeight
+// already accounts for wrapped placeholder text with no value present, so
+// the same grow() used for typed input fixes this too.
+grow();
+window.addEventListener('resize', grow);
 /* Anything that looks like a link or a magnet is added, as before. Anything
    else is treated as something to search for, which is why typing a film's
    name now finds it instead of reporting that it wasn't a Drive link. */
@@ -7813,8 +8261,23 @@ v.addEventListener('error', () => {
   retries++;
   const j = byId(order[cur]);
   if (!j) return;
-  setTimeout(() => { v.src = srcOf(j) + '?r=' + Date.now(); v.load();
-                     v.play().catch(() => {}); }, 900 * retries);
+  // Same position-preserving reload as swapToSeekable, and for the same
+  // reason: without it, a single corrupt frame forty minutes in reloads the
+  // element fresh, which starts back at 0 -- indistinguishable, to whoever
+  // is watching, from the whole file restarting rather than a moment of it
+  // glitching. currentTime is 0 by the time 'error' fires in some browsers,
+  // so the position has to be captured now, before load() throws it away.
+  const at = v.currentTime;
+  setTimeout(() => {
+    v.src = srcOf(j) + '?r=' + Date.now();
+    v.load();
+    const once = () => {
+      v.removeEventListener('loadedmetadata', once);
+      if (at > 0.25 && isFinite(at)) { try { v.currentTime = at; } catch (e) {} }
+      v.play().catch(() => {});
+    };
+    v.addEventListener('loadedmetadata', once);
+  }, 900 * retries);
 });
 v.addEventListener('ended', () => {
   if (live) return;              // reached the end of what's downloaded so far
@@ -7860,8 +8323,13 @@ function makeRow(id) {
     '<span class="body"><span class="title"></span>' +
     '<span class="track"><i></i></span><span class="note"></span></span>' +
     '<span class="flags"><span class="cc"></span><span class="eyes"></span>' +
+    '<span class="integrity" title=""></span>' +
     '<button class="logbtn" type="button" hidden aria-label="Show this item\'s log">log</button>' +
     '<button class="moreBtn" type="button" hidden aria-label="More options">&#8942;</button>' +
+    '<button class="refetchbtn" type="button" ' +
+      'aria-label="Discard this copy and download it again from scratch" ' +
+      'title="Discard this copy and download it again from scratch">refetch</button>' +
+    '<button class="pausebtn" type="button" hidden>pause</button>' +
     '<span class="kind"></span><span class="stat"></span></span>' +
     '<button class="kill" type="button" aria-label="Remove">&times;</button>' +
     '<div class="logpanel" hidden></div>' +
@@ -7870,11 +8338,14 @@ function makeRow(id) {
               track: li.querySelector('.track'), fill: li.querySelector('.track i'),
               note: li.querySelector('.note'), kind: li.querySelector('.kind'),
               eyes: li.querySelector('.eyes'), cc: li.querySelector('.cc'),
+              integrity: li.querySelector('.integrity'),
               stat: li.querySelector('.stat'), kill: li.querySelector('.kill'),
               logbtn: li.querySelector('.logbtn'),
               logpanel: li.querySelector('.logpanel'),
               moreBtn: li.querySelector('.moreBtn'),
-              morepanel: li.querySelector('.morepanel')};
+              morepanel: li.querySelector('.morepanel'),
+              refetchbtn: li.querySelector('.refetchbtn'),
+              pausebtn: li.querySelector('.pausebtn')};
   el.logbtn.addEventListener('click', ev => {
     ev.stopPropagation();                 // the row itself means "play"
     const open = el.logpanel.hidden;
@@ -7888,6 +8359,34 @@ function makeRow(id) {
     el.morepanel.hidden = !open;
     el.moreBtn.classList.toggle('on', open);
     if (open) fillAudioMenu(id, el);
+  });
+  // Same row, same id -- refetch_job() resets the job in place -- so unlike
+  // remove() there is no order/cur bookkeeping, just stopping playback if
+  // this is the thing on screen right now, since its file is about to stop
+  // existing out from under it.
+  el.refetchbtn.addEventListener('click', ev => {
+    ev.stopPropagation();
+    if (el.refetchbtn.disabled) return;
+    el.refetchbtn.disabled = true;
+    el.refetchbtn.textContent = '…';
+    if (order[cur] === id) stopPlayback();
+    api('/refetch', {id}).then(refresh).finally(() => {
+      el.refetchbtn.disabled = false;
+      el.refetchbtn.textContent = 'refetch';
+    });
+  });
+  // Real SIGSTOP/SIGCONT on the underlying process, not a status the UI just
+  // pretends about -- see /pause and /resume. Reads j fresh at click time
+  // rather than trusting the button's own label, since paint() is what kept
+  // that label right up to the second before the click landed.
+  el.pausebtn.addEventListener('click', ev => {
+    ev.stopPropagation();
+    if (el.pausebtn.disabled) return;
+    const j = byId(id);
+    if (!j) return;
+    el.pausebtn.disabled = true;
+    api(j.paused ? '/resume' : '/pause', {id}).then(refresh)
+      .finally(() => { el.pausebtn.disabled = false; });
   });
   li.addEventListener('click', ev => {
     if (ev.target === el.kill) return;
@@ -7937,6 +8436,10 @@ async function loadLog(id, el) {
 const LABEL = {queued: 'waiting', converting: 'converting', evicted: 'evicted',
                removed: 'stopped', error: 'failed', 'fetching metadata': 'finding peers',
                starting: 'starting', connecting: 'connecting', streaming: 'ready'};
+// Mirrors the server's own ACTIVE tuple: only a job in one of these states
+// has a real process behind it worth sending SIGSTOP to.
+const JOB_ACTIVE = new Set(['downloading', 'converting', 'fetching metadata',
+                            'starting', 'connecting', 'streaming']);
 
 function paint() {
   const L = $('list');
@@ -7982,6 +8485,21 @@ function paint() {
                           + (j.subs_why ? ' (' + j.subs_why + ')' : ''))
         : j.subs_status === 'searching' ? 'looking for subtitles'
         : j.subs_status === 'unavailable' ? (j.subs_note || 'no subtitles found') : '';
+    /* Only shown once a scan has actually found something wrong -- a clean
+       or still-checking file has nothing here worth saying, same principle
+       as .eyes only appearing when someone else is watching too. */
+    el.integrity.textContent = j.integrity === 'corrupt' ? 'corrupt' : '';
+    el.integrity.classList.toggle('on', j.integrity === 'corrupt');
+    el.integrity.title = j.integrity === 'corrupt'
+        ? 'A decode check found ' + j.integrity_hits + ' likely-corrupt '
+          + 'frame(s) in this file -- try Refetch' : '';
+    // Only present when there is an actual process to stop -- a queued item
+    // has nothing running yet (that's what /start is for), and a finished
+    // one has nothing left to pause.
+    el.pausebtn.hidden = !JOB_ACTIVE.has(j.status);
+    el.pausebtn.textContent = j.paused ? 'resume' : 'pause';
+    el.pausebtn.title = j.paused
+        ? 'Resume downloading' : 'Pause downloading, keeping progress so far';
     el.logbtn.hidden = !j.log_n;
     // Refresh an open panel as the job goes on, so a stall can be watched
     // rather than reopened.
@@ -8347,6 +8865,7 @@ def main():
         threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=janitor, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=tracker_refresher, daemon=True).start()
     with Server((HOST, PORT), H) as s:
         print(f"\n  reel  ->  http://localhost:{PORT}")
         lan = lan_ip()

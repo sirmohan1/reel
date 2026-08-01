@@ -1068,6 +1068,49 @@ class TestLibtorrentBackend(Base):
             proc.kill()
 
     @needs_libtorrent
+    def test_a_miss_fetches_a_window_not_just_the_bytes_asked_for(self):
+        # The fix for the ~30s seek. Serving a range calls this once per
+        # 256 KB; if each call fetched only its own chunk, every one of them
+        # would miss and suspend the fill again. Prioritising a window means
+        # the reads behind this one are already satisfied and take the cheap
+        # path instead.
+        import libtorrent as lt
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        j["wt_index"] = 0
+        # A big torrent, so a window spans many pieces. No peers, so nothing
+        # arrives and the priorities stay observable.
+        tf = os.path.join(os.path.dirname(__file__), "_big.torrent")
+        d = os.path.join(self.dl, "big"); os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "payload.bin"), "wb") as f:
+            f.write(os.urandom(4 * 1024 * 1024))
+        fs = lt.file_storage(); lt.add_files(fs, d)
+        ct = lt.create_torrent(fs, piece_size=16 * 1024)
+        lt.set_piece_hashes(ct, os.path.dirname(d))
+        with open(tf, "wb") as f:
+            f.write(lt.bencode(ct.generate()))
+        out = os.path.join(self.dl, "bigout"); os.makedirs(out, exist_ok=True)
+        # Somewhere else entirely, so the data cannot already be there.
+        proc = bk.start(j, tf, out, {"index": 0}, 0)
+        try:
+            h = j["_lt"]
+            deadline = time.time() + 5
+            while time.time() < deadline and h.torrent_file() is None:
+                time.sleep(0.05)
+            ti = h.torrent_file()
+            self.assertGreater(ti.num_pieces(), 32, "need a torrent with room")
+            bk.ensure_range(j, 0, 1024, timeout=0.3)
+            prios = [h.piece_priority(p) for p in range(ti.num_pieces())]
+            raised = [i for i, v in enumerate(prios) if v == 7]
+            # More than the single piece the 1024 bytes needed.
+            self.assertGreater(len(raised), 1, prios[:12])
+        finally:
+            proc.kill(); j["cancel"].set()
+            for p in (tf,):
+                try: os.remove(p)
+                except OSError: pass
+
+    @needs_libtorrent
     def test_sequential_fill_is_restored_after_a_seek(self):
         # It is suspended while waiting -- measured, the fill competes with
         # the deadline for the same peers -- and must come back afterwards or

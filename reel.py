@@ -106,6 +106,13 @@ LT_SEEK_WAIT = 20
 # interval lost about 520 MB. Ten seconds keeps the write trivial and the
 # re-fetch small.
 LT_RESUME_EVERY = 10.0
+# How far ahead of a read to fetch when it misses. A seek that fetched only
+# the 256 KB actually asked for would have every following read miss too, each
+# one suspending and restoring the sequential fill again -- the thrash that
+# made a measured seek take ~30s. Fetching a window instead means the reads
+# after it are already satisfied and take the cheap path, and it doubles as
+# the buffer that keeps playback going at the new position.
+LT_READAHEAD = 8 * 1024 * 1024
 # When the first probe learns nothing, how long to keep waiting and how much of
 # the file to want before asking again. Not a format threshold -- the first 4 MB
 # of that mp4 identifies itself perfectly once those bytes exist. The problem is
@@ -6037,13 +6044,32 @@ class LibtorrentBackend:
         want = range(first, last + 1)
         if all(h.have_piece(p) for p in want):
             return True                      # already here; nothing to ask for
+
+        # A miss means the viewer has jumped somewhere the fill has not
+        # reached. Fetch a window rather than the few hundred KB actually
+        # asked for: the reads that follow this one are the same jump
+        # continuing, and satisfying them here means they take the cheap path
+        # above instead of each suspending and restoring the fill again. That
+        # repetition -- once per 256 KB -- is what made a measured seek take
+        # about 30s against the 1.4s the same fetch takes on its own.
+        try:
+            ahead = ti.map_file(idx, max(0, int(offset)) + LT_READAHEAD, 1).piece
+            ahead = min(ti.num_pieces() - 1, max(last, ahead))
+        except Exception:
+            ahead = last
         try:
             h.unset_flags(lt.torrent_flags.sequential_download)
-            for p in want:
-                h.piece_priority(p, 7)
-                h.set_piece_deadline(p, 0)
+            # Deadlines in order across the window, so it arrives front to
+            # back and playback can start on the first pieces while the rest
+            # of the buffer is still filling.
+            for n, p in enumerate(range(first, ahead + 1)):
+                if not h.have_piece(p):
+                    h.piece_priority(p, 7)
+                    h.set_piece_deadline(p, n * 100)
             deadline = time.time() + timeout
             while time.time() < deadline and not job["cancel"].is_set():
+                # Only the bytes actually being served are waited on. The rest
+                # of the window keeps arriving behind them.
                 if all(h.have_piece(p) for p in want):
                     return True
                 time.sleep(0.05)
@@ -6051,11 +6077,12 @@ class LibtorrentBackend:
         except Exception:
             return False
         finally:
-            # Back to filling forward, so the part being watched keeps
-            # growing once the viewer has what they jumped to.
+            # Sequential goes back on: the live phase feeds ffmpeg by reading
+            # the file directly, without passing through here, so it depends
+            # on the front of the file continuing to fill. The window above
+            # keeps its deadlines and arrives alongside it.
             try:
                 h.set_flags(lt.torrent_flags.sequential_download)
-                h.clear_piece_deadlines()
             except Exception:
                 pass
 

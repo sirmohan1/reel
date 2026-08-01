@@ -5554,7 +5554,222 @@ class WebTorrentBackend:
                     lines, chars)
 
 
-TORRENT_BACKENDS = {"webtorrent": WebTorrentBackend}
+class _TorrentProc:
+    """A libtorrent handle wearing enough of Popen's shape to pass for one.
+
+    Worth the small deceit: everything in reel that touches a torrent client
+    -- stop_procs, pause_proc, run_torrent's own completion checks -- uses
+    only poll(), kill() and send_signal(). Implementing those three means the
+    in-process backend needs no special case anywhere else, rather than every
+    one of those call sites growing a branch on which client is in use.
+    """
+
+    def __init__(self, ses, handle):
+        self.ses, self.handle = ses, handle
+        self.returncode = None
+
+    def poll(self):
+        """None while the torrent is still ours -- matching --keep-seeding,
+        which likewise does not exit when the download finishes."""
+        if self.returncode is None and not self.handle.is_valid():
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        try:
+            self.ses.remove_torrent(self.handle)
+        except Exception:
+            pass
+        self.returncode = 0
+
+    def send_signal(self, sig):
+        # A real pause rather than SIGSTOP: the process is reel itself, and
+        # stopping it would stop everything.
+        try:
+            if sig == getattr(signal, "SIGSTOP", None):
+                self.handle.pause()
+            elif sig == getattr(signal, "SIGCONT", None):
+                self.handle.resume()
+        except Exception:
+            pass
+
+
+class LibtorrentBackend:
+    """libtorrent, in this process, instead of webtorrent-cli in another.
+
+    The reason for it is piece control: webtorrent's cli can be told which
+    file to take and nothing more, which is why a partially-downloaded item
+    cannot be seeked. Here the pieces under a byte offset can be asked for
+    directly, which is what Stage 3 builds on.
+
+    One session serves every torrent, unlike webtorrent's one process (and
+    one port) per item.
+    """
+
+    name = "libtorrent"
+
+    def __init__(self):
+        self._ses = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def available():
+        try:
+            import libtorrent            # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _session(self, port=None):
+        import libtorrent as lt
+        with self._lock:
+            if self._ses is None:
+                self._ses = lt.session({
+                    "listen_interfaces": "0.0.0.0:%d" % (port or 0),
+                    "alert_mask": 0,
+                })
+            return self._ses
+
+    # -- metadata ---------------------------------------------------------
+
+    def fetch_metadata(self, job, magnet, port, limit):
+        """-> (files, torrent_file_path, log), same contract as webtorrent's.
+
+        The .torrent is written out and then read back through the existing
+        torrent_files() parser rather than reading libtorrent's own file
+        list. One parser means the two backends cannot disagree about what
+        is inside a torrent -- and file dicts differing by a key or an index
+        is exactly the kind of drift that produced wrong-episode bugs before.
+        """
+        import libtorrent as lt
+        meta_dir = os.path.join(DL, job["id"] + "_meta")
+        os.makedirs(meta_dir, exist_ok=True)
+        ses = self._session(port)
+        try:
+            p = lt.parse_magnet_uri(magnet)
+        except Exception as e:
+            return None, None, "bad magnet: %s" % e
+        p.save_path = meta_dir
+        # Metadata only: no piece of the payload is wanted yet.
+        p.flags |= lt.torrent_flags.upload_mode
+        try:
+            h = ses.add_torrent(p)
+        except Exception as e:
+            return None, None, "couldn't add torrent: %s" % e
+        deadline = time.time() + limit
+        while time.time() < deadline and not job["cancel"].is_set():
+            if h.status().has_metadata:
+                break
+            time.sleep(0.2)
+        st = h.status()
+        log = "peers %d, metadata %s" % (st.num_peers, bool(st.has_metadata))
+        if not st.has_metadata:
+            try:
+                ses.remove_torrent(h)
+            except Exception:
+                pass
+            return None, None, log
+        try:
+            ti = h.torrent_file()
+            data = lt.bencode(lt.create_torrent(ti).generate())
+            tfile = os.path.join(meta_dir, "%s.torrent" % ti.info_hash())
+            with open(tfile, "wb") as f:
+                f.write(data)
+            job["wt_ih"] = str(ti.info_hash())
+        except Exception as e:
+            return None, None, log + "; couldn't save .torrent: %s" % e
+        finally:
+            try:
+                ses.remove_torrent(h)
+            except Exception:
+                pass
+        return torrent_files(tfile), tfile, log
+
+    def list_files(self, job, magnet, port, limit):
+        """The fallback path webtorrent needs when downloadmeta is missing.
+        There is no such split here, so this is the same operation."""
+        files, _t, log = self.fetch_metadata(job, magnet, port, limit)
+        return files or [], log
+
+    # -- the download -----------------------------------------------------
+
+    def stream_url(self, job, port, chosen):
+        """None, always: there is no separate server to read from. The bytes
+        are in out_dir, and run_torrent falls through to serving them from
+        disk the way a Drive download already is."""
+        return None
+
+    def start(self, job, source, out_dir, chosen, port, rate_kbps=None):
+        import libtorrent as lt
+        ses = self._session(port)
+        try:
+            if source and os.path.isfile(source):
+                p = lt.add_torrent_params()
+                p.ti = lt.torrent_info(source)
+            else:
+                p = lt.parse_magnet_uri(source)
+            p.save_path = out_dir
+            # Front-to-back, so the live phase has a contiguous prefix to
+            # hand ffmpeg -- the same shape rclone's sparse writes produce,
+            # which contiguous_end() already knows how to read safely.
+            p.flags |= lt.torrent_flags.sequential_download
+            h = ses.add_torrent(p)
+        except Exception as e:
+            job["error"] = "Couldn't start libtorrent: %s" % e
+            return None
+        deadline = time.time() + WT_META_TIMEOUT
+        while time.time() < deadline and not h.status().has_metadata:
+            if job["cancel"].is_set():
+                break
+            time.sleep(0.2)
+        try:
+            ti = h.torrent_file()
+            if ti and chosen is not None:
+                # Only the file this item is for; a pack's siblings are
+                # separate jobs and fetch their own.
+                want = int(chosen.get("index") or 0)
+                h.prioritize_files([4 if i == want else 0
+                                    for i in range(ti.num_files())])
+        except Exception:
+            pass
+        if rate_kbps:
+            try:
+                h.set_download_limit(int(rate_kbps) * 1024)
+            except Exception:
+                pass
+        proc = _TorrentProc(ses, h)
+        job["procs"].append(proc)
+        job["wt_proc"] = proc
+        job["_lt"] = h
+        self._watch(job, h)
+        return proc
+
+    def _watch(self, job, h):
+        """Peers and upload figures, polled instead of scraped out of a
+        terminal UI -- the numbers webtorrent only ever printed."""
+        def go():
+            while not job["cancel"].is_set():
+                try:
+                    if not h.is_valid():
+                        return
+                    st = h.status()
+                    job["peers"] = st.num_peers
+                    job["uploaded"] = st.total_upload
+                    job["up_rate"] = st.upload_rate
+                    job["wt_tail"] = ("%s  %.1f%%  %d peers  %.0f KB/s down"
+                                      % (st.state, st.progress * 100,
+                                         st.num_peers, st.download_rate / 1024))
+                except Exception:
+                    return
+                time.sleep(1.0)
+        threading.Thread(target=go, daemon=True).start()
+
+    def recent_output(self, job, lines=4, chars=200):
+        return (job.get("wt_tail") or "")[:chars]
+
+
+TORRENT_BACKENDS = {"webtorrent": WebTorrentBackend,
+                    "libtorrent": LibtorrentBackend, "lt": LibtorrentBackend}
 # Named rather than auto-detected: which client is in use changes how a
 # download behaves, and that is not something to decide silently per machine.
 TORRENT_BACKEND = os.environ.get("REEL_TORRENT", "webtorrent").strip().lower()

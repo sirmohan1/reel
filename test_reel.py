@@ -53,6 +53,13 @@ def load_reel(dl=None):
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 needs_ffmpeg = unittest.skipUnless(HAVE_FFMPEG, "ffmpeg/ffprobe not installed")
 
+try:
+    import libtorrent as _lt                       # noqa: F401
+    HAVE_LT = True
+except Exception:
+    HAVE_LT = False
+needs_libtorrent = unittest.skipUnless(HAVE_LT, "libtorrent not installed")
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -545,6 +552,182 @@ class TestTorrentBackend(Base):
         got = bk.recent_output(j)
         self.assertIn("Peers: 12/40", got)
         self.assertIn("connecting", got)
+
+
+# --------------------------------------------------------------------------
+class TestLibtorrentBackend(Base):
+    """The second backend. The parts that need no swarm are tested outright;
+    the parts that do are exercised against a real libtorrent session with a
+    real .torrent, since a mocked torrent client proves nothing about whether
+    this one is driven correctly."""
+
+    def torrent_file(self):
+        """A real single-file .torrent, built on the spot -- no network."""
+        import libtorrent as lt
+        data = os.path.join(self.dl, "payload.bin")
+        with open(data, "wb") as f:
+            f.write(os.urandom(64 * 1024))
+        fs = lt.file_storage()
+        lt.add_files(fs, data)
+        ct = lt.create_torrent(fs, piece_size=16 * 1024)
+        lt.set_piece_hashes(ct, os.path.dirname(data))
+        p = os.path.join(self.dl, "made.torrent")
+        with open(p, "wb") as f:
+            f.write(lt.bencode(ct.generate()))
+        return p
+
+    # ---- selection and contract, no swarm needed -------------------------
+
+    def test_it_is_selectable_by_name(self):
+        self.m._BACKEND = None
+        self.m.TORRENT_BACKEND = "lt"
+        try:
+            self.assertEqual(self.m.backend().name, "libtorrent")
+        finally:
+            self.m.TORRENT_BACKEND = "webtorrent"
+            self.m._BACKEND = None
+
+    def test_webtorrent_is_still_the_default(self):
+        # The migration must not switch anyone over by existing.
+        self.m._BACKEND = None
+        self.assertEqual(self.m.backend().name, "webtorrent")
+
+    def test_it_implements_the_same_interface_as_webtorrent(self):
+        lt_bk, wt_bk = self.m.LibtorrentBackend(), self.m.WebTorrentBackend()
+        for name in ("available", "fetch_metadata", "list_files",
+                     "stream_url", "start", "recent_output"):
+            self.assertTrue(callable(getattr(lt_bk, name, None)), name)
+            self.assertTrue(callable(getattr(wt_bk, name, None)), name)
+
+    def test_it_serves_from_disk_so_there_is_no_url(self):
+        # None here is what makes run_torrent fall through to reading the
+        # file, rather than proxying another server.
+        bk = self.m.LibtorrentBackend()
+        self.assertIsNone(bk.stream_url(self.job(), 9, {"index": 0}))
+
+    def test_a_bad_magnet_is_reported_not_raised(self):
+        bk = self.m.LibtorrentBackend()
+        if not bk.available():
+            self.skipTest("libtorrent not installed")
+        files, tfile, log = bk.fetch_metadata(self.job(), "not-a-magnet", 0, 1)
+        self.assertIsNone(files)
+        self.assertIsNone(tfile)
+        self.assertIn("bad magnet", log)
+
+    def test_a_client_that_cannot_start_reports_rather_than_raises(self):
+        bk = self.m.LibtorrentBackend()
+        if not bk.available():
+            self.skipTest("libtorrent not installed")
+        j = self.job()
+        got = bk.start(j, "not-a-magnet-either", self.dl, {"index": 0}, 0)
+        self.assertIsNone(got)
+        self.assertIn("Couldn't start libtorrent", j["error"])
+
+    # ---- the Popen shim, which is what keeps run_torrent unchanged -------
+
+    def test_the_handle_shim_reports_running_then_stopped(self):
+        class FakeH:
+            def __init__(self): self.valid = True
+            def is_valid(self): return self.valid
+        class FakeSes:
+            def __init__(self): self.removed = []
+            def remove_torrent(self, h): self.removed.append(h); h.valid = False
+        h, ses = FakeH(), FakeSes()
+        proc = self.m._TorrentProc(ses, h)
+        # None while it is still ours, matching --keep-seeding's behaviour of
+        # not exiting when the download finishes.
+        self.assertIsNone(proc.poll())
+        proc.kill()
+        self.assertEqual(proc.poll(), 0)
+        self.assertEqual(ses.removed, [h])
+
+    def test_the_shim_pauses_on_the_signal_pause_proc_sends(self):
+        # pause_proc sends SIGSTOP/SIGCONT and must keep working unchanged;
+        # stopping this process would stop all of reel, so it maps to a real
+        # torrent pause instead.
+        acted = []
+        class FakeH:
+            def is_valid(self): return True
+            def pause(self): acted.append("pause")
+            def resume(self): acted.append("resume")
+        proc = self.m._TorrentProc(None, FakeH())
+        self.assertTrue(self.m.pause_proc(proc, True))
+        self.assertTrue(self.m.pause_proc(proc, False))
+        self.assertEqual(acted, ["pause", "resume"])
+
+    def test_stop_procs_kills_a_libtorrent_job_too(self):
+        # The generic teardown path must not need to know which client ran.
+        class FakeH:
+            def __init__(self): self.valid = True
+            def is_valid(self): return self.valid
+        class FakeSes:
+            def remove_torrent(self, h): h.valid = False
+        proc = self.m._TorrentProc(FakeSes(), FakeH())
+        j = self.job()
+        j["procs"] = [proc]
+        self.m.stop_procs(j)
+        self.assertEqual(proc.poll(), 0)
+
+    # ---- against a real libtorrent session -------------------------------
+
+    @needs_libtorrent
+    def test_a_real_torrent_produces_the_same_file_dicts_as_webtorrent(self):
+        # Both backends route through torrent_files(), so a torrent read by
+        # either must describe its contents identically -- index, name, size.
+        # Divergence here is what produced wrong-file bugs before.
+        p = self.torrent_file()
+        got = self.m.torrent_files(p)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["index"], 0)
+        self.assertEqual(got[0]["size"], 64 * 1024)
+        self.assertTrue(got[0]["name"])
+
+    @needs_libtorrent
+    def test_start_selects_only_the_chosen_file(self):
+        # A pack's siblings are separate jobs; taking the whole torrent here
+        # would download a season to play one episode.
+        import libtorrent as lt
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), self.dl, {"index": 0}, 0)
+        self.assertIsNotNone(proc)
+        try:
+            h = j["_lt"]
+            self.assertTrue(h.is_valid())
+            prios = h.get_file_priorities()
+            self.assertGreater(prios[0], 0)
+            self.assertEqual([p for p in prios[1:] if p], [])
+        finally:
+            proc.kill()
+
+    @needs_libtorrent
+    def test_start_downloads_sequentially(self):
+        # The live phase hands ffmpeg a growing prefix, so pieces must arrive
+        # front to back rather than rarest-first.
+        import libtorrent as lt
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), self.dl, {"index": 0}, 0)
+        try:
+            flags = j["_lt"].status().flags
+            self.assertTrue(flags & lt.torrent_flags.sequential_download)
+        finally:
+            proc.kill()
+
+    @needs_libtorrent
+    def test_a_real_handle_reports_peers_without_scraping_a_terminal(self):
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), self.dl, {"index": 0}, 0)
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and j.get("peers") is None:
+                time.sleep(0.05)
+            self.assertIsNotNone(j["peers"])          # a number, not parsed text
+            self.assertIn("peers", bk.recent_output(j))
+        finally:
+            proc.kill()
+            j["cancel"].set()
 
 
 # --------------------------------------------------------------------------

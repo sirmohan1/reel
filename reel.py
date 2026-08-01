@@ -436,6 +436,11 @@ def tracker_refresh_tick():
         return False        # try again next tick -- never overwrite a good list
     apply_trackers(fresh)
     save_cached_trackers(fresh, time.time())
+    # A refresh that only reaches the next download is of least use to the
+    # one that needs it most: already stalled on a handful of peers, and
+    # unable to be restarted without losing what it has. A backend that
+    # cannot do this says so by adding nothing.
+    push_trackers(fresh)
     return True
 
 
@@ -5606,6 +5611,13 @@ class WebTorrentBackend:
         """
         return True
 
+    def add_trackers(self, job, trackers):
+        """None: the tracker list went on the command line when the process
+        started and there is no way to extend it afterwards. A download
+        already running keeps the list it began with until it is restarted.
+        """
+        return 0
+
 
 class _TorrentProc:
     """A libtorrent handle wearing enough of Popen's shape to pass for one.
@@ -5824,6 +5836,35 @@ class LibtorrentBackend:
     def recent_output(self, job, lines=4, chars=200):
         return (job.get("wt_tail") or "")[:chars]
 
+    def add_trackers(self, job, trackers):
+        """Extend a running download's announce list. -> how many were new.
+
+        The one thing that makes the weekly refresh worth anything to a
+        download already in flight. A torrent sitting on two peers for hours
+        is exactly the one that would benefit from a tracker verified since
+        it started, and also the one that cannot be restarted without
+        throwing away what it has.
+        """
+        h = job.get("_lt")
+        if not (h is not None and h.is_valid()):
+            return 0
+        try:
+            # These bindings hand back plain dicts, not objects -- and
+            # add_tracker wants one the same way.
+            have = {t.get("url") for t in h.trackers()}
+        except Exception:
+            return 0
+        added = 0
+        for t in trackers or ():
+            if t in have:
+                continue
+            try:
+                h.add_tracker({"url": t})
+                added += 1
+            except Exception:
+                pass
+        return added
+
     # -- seeking ----------------------------------------------------------
 
     def ensure_range(self, job, offset, length, timeout=LT_SEEK_WAIT):
@@ -5895,6 +5936,36 @@ def backend():
         cls = TORRENT_BACKENDS.get(TORRENT_BACKEND) or WebTorrentBackend
         _BACKEND = cls()
     return _BACKEND
+
+
+def push_trackers(trackers):
+    """Hand a freshly verified tracker list to downloads already running.
+    -> how many jobs actually gained one.
+
+    Called after a weekly refresh. Whether anything comes of it is the
+    backend's business: webtorrent was given its list on the command line and
+    cannot be told about more, so it reports nothing added and this is a
+    no-op for it.
+
+    Recorded on a job only when something was genuinely added, so a log does
+    not collect a weekly line saying nothing changed.
+    """
+    try:
+        bk = backend()
+        with LOCK:
+            live = [j for j in JOBS.values() if j.get("status") in ACTIVE]
+    except Exception:
+        return 0
+    touched = 0
+    for job in live:
+        try:
+            n = bk.add_trackers(job, trackers)
+        except Exception:
+            continue          # one job's failure is not the others' problem
+        if n:
+            touched += 1
+            record(job, "added %d newly verified tracker(s) mid-download" % n)
+    return touched
 
 
 def run_torrent(job):

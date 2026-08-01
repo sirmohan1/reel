@@ -783,6 +783,85 @@ class TestLibtorrentBackend(Base):
         finally:
             proc.kill()
 
+    # ---- reaching downloads that are already running ---------------------
+
+    def test_webtorrent_cannot_extend_a_running_downloads_trackers(self):
+        # Its list went on the command line; there is no way to add to it.
+        # Reporting 0 rather than pretending is what keeps push_trackers
+        # honest about whether anything happened.
+        bk = self.m.WebTorrentBackend()
+        self.assertEqual(bk.add_trackers(self.job(), ["udp://x.example:1/a"]), 0)
+
+    def test_a_job_with_no_handle_gains_nothing(self):
+        bk = self.m.LibtorrentBackend()
+        self.assertEqual(bk.add_trackers(self.job(), ["udp://x.example:1/a"]), 0)
+
+    def test_push_reaches_running_jobs_and_skips_finished_ones(self):
+        seen = []
+        class Bk:
+            def add_trackers(self, job, trackers):
+                seen.append(job["id"])
+                return len(trackers)
+        self.m._BACKEND = Bk()
+        try:
+            live = self.job(); live["status"] = "downloading"
+            done = self.job(); done["status"] = "done"
+            touched = self.m.push_trackers(["udp://new.example:1/a"])
+        finally:
+            self.m._BACKEND = None
+        self.assertEqual(seen, [live["id"]])
+        self.assertEqual(touched, 1)
+
+    def test_a_job_that_gained_nothing_is_not_logged(self):
+        # Otherwise every job collects a weekly line saying nothing changed.
+        class Bk:
+            def add_trackers(self, job, trackers): return 0
+        self.m._BACKEND = Bk()
+        try:
+            j = self.job(); j["status"] = "downloading"
+            before = len(j["log"])
+            self.assertEqual(self.m.push_trackers(["udp://x.example:1/a"]), 0)
+        finally:
+            self.m._BACKEND = None
+        self.assertEqual(len(j["log"]), before)
+
+    def test_one_job_raising_does_not_stop_the_rest(self):
+        class Bk:
+            def __init__(self): self.n = 0
+            def add_trackers(self, job, trackers):
+                self.n += 1
+                if self.n == 1: raise RuntimeError("boom")
+                return 1
+        self.m._BACKEND = Bk()
+        try:
+            a = self.job(); a["status"] = "downloading"
+            b = self.job(); b["status"] = "downloading"
+            touched = self.m.push_trackers(["udp://x.example:1/a"])
+        finally:
+            self.m._BACKEND = None
+        self.assertEqual(touched, 1)
+
+    @needs_libtorrent
+    def test_a_real_running_torrent_gains_the_new_trackers(self):
+        # The point of the whole thing, against a real handle: a download
+        # already in flight ends up announcing to a tracker it did not start
+        # with, without being restarted.
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), self.dl, {"index": 0}, 0)
+        try:
+            h = j["_lt"]
+            before = {t.get("url") for t in h.trackers()}
+            new = "udp://freshly-verified.example:6969/announce"
+            self.assertEqual(bk.add_trackers(j, [new]), 1)
+            after = {t.get("url") for t in h.trackers()}
+            self.assertIn(new, after)
+            self.assertTrue(before <= after)      # nothing was taken away
+            # and a second pass adds nothing, rather than duplicating
+            self.assertEqual(bk.add_trackers(j, [new]), 0)
+        finally:
+            proc.kill(); j["cancel"].set()
+
     # ---- ensure_range: the reason for the whole migration ----------------
 
     def test_webtorrent_admits_it_cannot_prioritise(self):
@@ -3955,6 +4034,29 @@ class TestTrackerRefresh(Base):
         self.assertEqual(self.m.VERIFY_TRACKERS, fresh[:5])
         got, _at = self.m.load_cached_trackers()
         self.assertEqual(got, fresh)
+
+    def test_a_refresh_reaches_downloads_already_running(self):
+        # A refresh that only helps the next download is of least use to the
+        # one that needs it most: already stalled on a few peers, and unable
+        # to be restarted without throwing away what it has.
+        self.m.save_cached_trackers(
+            (), time.time() - self.m.TRACKER_REFRESH_INTERVAL - 1)
+        fresh = tuple("udp://new%d.example:80/announce" % i for i in range(3))
+        self.m.fetch_tracker_list = lambda timeout=10, keep=(): fresh
+        got = []
+        self.m.push_trackers = lambda tr: got.append(tuple(tr))
+        self.assertTrue(self.m.tracker_refresh_tick())
+        self.assertEqual(got, [fresh])       # the new list, not the old one
+
+    def test_a_failed_refresh_pushes_nothing(self):
+        # Nothing was verified, so there is nothing to hand anyone.
+        self.m.save_cached_trackers(
+            (), time.time() - self.m.TRACKER_REFRESH_INTERVAL - 1)
+        self.m.fetch_tracker_list = lambda timeout=10, keep=(): ()
+        got = []
+        self.m.push_trackers = lambda tr: got.append(tr)
+        self.assertFalse(self.m.tracker_refresh_tick())
+        self.assertEqual(got, [])
 
     def test_tick_passes_the_trackers_already_in_use_to_be_kept(self):
         # The actual bug this guards: a wholesale replace silently dropped a

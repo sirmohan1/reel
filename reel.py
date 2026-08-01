@@ -7219,18 +7219,33 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .rrow .rscore{color:var(--live)}
 
   /* Only shown when more than one section is actually present -- see
-     loadPicks -- so this never adds a label above the only section there is. */
-  .picksection{font:600 12.5px/1 var(--mono);letter-spacing:.1em;
-    text-transform:uppercase;color:var(--text);margin:30px 0 16px;
-    padding-top:22px;border-top:1px solid var(--rule)}
-  .picksection:first-child{margin-top:0;padding-top:0;border-top:none}
+     loadPicks -- so this never adds a label above the only section there is.
+     Styled as an eyebrow (the same faint mono caps as QUEUE / CACHE / PICKS)
+     rather than competing with the shelf names below it: it labels a group,
+     where a shelf name titles one. */
+  .picksection{font:600 12.5px/1 var(--mono);letter-spacing:.14em;
+    text-transform:uppercase;color:var(--faint);margin:30px 0 6px}
+  .picksection:first-child{margin-top:0}
 
   /* shelves -- one horizontally-scrolling strip per shelf, card-based rather
      than the stacked-row layout search results use, since a poster read at a
-     glance is the point of browsing and a list of text rows isn't that. */
-  .shelf:not(:first-child){margin-top:22px}
-  .shelfhead{font:500 11px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
-    color:var(--brass);margin-bottom:10px}
+     glance is the point of browsing and a list of text rows isn't that.
+     Each shelf is its own band: a rule above it and a real heading, rather
+     than the single line of small brass caps this used to be, which read as
+     a caption on the strip below instead of a title over it. */
+  .shelf{margin-top:14px;padding-top:16px;border-top:1px solid var(--rule)}
+  /* A rule directly under a section label separates nothing -- the label is
+     already the break. */
+  .shelf:first-child,.picksection + .shelf{border-top:none;padding-top:0}
+  .shelfhead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+    margin-bottom:12px;padding-left:11px;position:relative}
+  /* The same brass accent the playing queue row uses, for the same reason:
+     it marks the thing you are meant to look at first. */
+  .shelfhead::before{content:'';position:absolute;left:0;top:1px;bottom:1px;
+    width:3px;border-radius:2px;background:var(--brass)}
+  .shelfname{font:600 17px/1.2 var(--sans);letter-spacing:-.01em;
+    color:var(--text)}
+  .shelfnote{font:400 11.5px/1 var(--mono);color:var(--faint)}
   /* overflow-y is explicit, not left to default -- a lone overflow-x:auto
      gets silently promoted to overflow-y:auto too (an "auto" axis paired
      with a "visible" one forces the visible one to auto), turning each
@@ -8059,9 +8074,17 @@ async function loadPicks(force) {
 
     const sec = document.createElement('div');
     sec.className = 'shelf';
+    // Two elements, not one string: the name is the heading and the note is
+    // subordinate to it, which a single run of text cannot express.
     const head = document.createElement('div');
     head.className = 'shelfhead';
-    head.textContent = shelf.name + ' — ' + shelf.note;
+    const hname = document.createElement('span');
+    hname.className = 'shelfname';
+    hname.textContent = shelf.name;            // textContent, never HTML
+    const hnote = document.createElement('span');
+    hnote.className = 'shelfnote';
+    hnote.textContent = shelf.note || '';
+    head.append(hname, hnote);
 
     const strip = document.createElement('div');
     strip.className = 'shelfstrip';

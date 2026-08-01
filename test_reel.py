@@ -484,24 +484,34 @@ class TestTorrentBackend(Base):
     the same expectations rather than against whatever webtorrent happens
     to do."""
 
-    def test_the_default_backend_is_webtorrent(self):
-        # Named, not auto-detected: which client is in use changes how a
-        # download behaves and should never be decided silently.
+    def test_the_default_backend_is_libtorrent(self):
+        # It is the only one that can fetch the pieces under a read, which is
+        # what makes a still-downloading item seekable at all.
         self.m._BACKEND = None
-        self.assertEqual(self.m.backend().name, "webtorrent")
+        self.assertEqual(self.m.backend().name, "libtorrent")
+
+    def test_the_old_client_can_still_be_chosen_on_purpose(self):
+        self.m._BACKEND = None
+        self.m.TORRENT_BACKEND = "wt"
+        try:
+            self.assertEqual(self.m.backend().name, "webtorrent")
+        finally:
+            self.m.TORRENT_BACKEND = "libtorrent"
+            self.m._BACKEND = None
 
     def test_the_backend_is_built_once_and_reused(self):
         self.m._BACKEND = None
         self.assertIs(self.m.backend(), self.m.backend())
 
     def test_an_unknown_backend_name_falls_back_rather_than_crashing(self):
-        # A typo in REEL_TORRENT must not stop the server from starting.
+        # A typo in REEL_TORRENT must not stop the server from starting; it
+        # lands on the default, which the startup banner then names outright.
         self.m._BACKEND = None
         self.m.TORRENT_BACKEND = "not-a-real-client"
         try:
-            self.assertEqual(self.m.backend().name, "webtorrent")
+            self.assertEqual(self.m.backend().name, "libtorrent")
         finally:
-            self.m.TORRENT_BACKEND = "webtorrent"
+            self.m.TORRENT_BACKEND = "libtorrent"
             self.m._BACKEND = None
 
     def test_the_interface_run_torrent_relies_on_is_present(self):
@@ -653,13 +663,24 @@ class TestLibtorrentBackend(Base):
         try:
             self.assertEqual(self.m.backend().name, "libtorrent")
         finally:
-            self.m.TORRENT_BACKEND = "webtorrent"
+            self.m.TORRENT_BACKEND = "libtorrent"
             self.m._BACKEND = None
 
-    def test_webtorrent_is_still_the_default(self):
-        # The migration must not switch anyone over by existing.
+    def test_it_is_the_default_now(self):
         self.m._BACKEND = None
-        self.assertEqual(self.m.backend().name, "webtorrent")
+        self.assertEqual(self.m.backend().name, "libtorrent")
+
+    def test_an_unknown_name_does_not_silently_pick_the_other_client(self):
+        # Falling back quietly is what made a server look identical whether
+        # or not seeking worked. An unknown name lands on the default, which
+        # the startup banner then reports outright.
+        self.m._BACKEND = None
+        self.m.TORRENT_BACKEND = "nonsense"
+        try:
+            self.assertEqual(self.m.backend().name, "libtorrent")
+        finally:
+            self.m.TORRENT_BACKEND = "libtorrent"
+            self.m._BACKEND = None
 
     def test_it_implements_the_same_interface_as_webtorrent(self):
         lt_bk, wt_bk = self.m.LibtorrentBackend(), self.m.WebTorrentBackend()

@@ -14,16 +14,25 @@ the right language plays first.
 
 ## Requirements
 
-Nothing to `pip install` — `reel.py` is 100% Python standard library. What it
-does need, all external command-line tools:
+One `pip install`, and otherwise external command-line tools:
 
 | Tool | Needed for | Without it |
 |---|---|---|
 | **Python 3.9+** | running it at all | — |
 | **ffmpeg + ffprobe** | almost everything: remuxing, transcoding, subtitle timing, probing codecs, corruption checks | the app barely functions; install this |
-| **[webtorrent-cli](https://github.com/webtorrent/webtorrent-cli)** | BitTorrent/magnet support | torrent search and magnet links won't work; Drive links still will |
+| **libtorrent** (`pip install libtorrent`) | BitTorrent, and seeking a film while it is still downloading | torrents fail outright, and the startup banner says so |
 | **rclone**, with a remote named exactly `gdrive` | Google Drive links | Drive links won't work; torrents still will |
 | **TMDB API key** (free, optional) | the "Picks" recommendation shelves, genre/actor/year search filters | those features are hidden; everything else works |
+| **[webtorrent-cli](https://github.com/webtorrent/webtorrent-cli)** (optional) | only if you set `REEL_TORRENT=wt` | nothing — libtorrent is the default |
+
+libtorrent is what makes a half-downloaded film seekable: it can be asked for
+the pieces under a particular moment, where webtorrent-cli can only be told
+which file to take. webtorrent is kept as a fallback and needs Node, which is
+why it is no longer the default.
+
+The backend is named, never guessed. If the one you asked for is missing the
+banner says so and torrents fail, rather than quietly running the other and
+leaving you wondering why seeking stopped working.
 
 Platform: built and run on macOS. Linux should mostly work but isn't
 regularly tested. Windows isn't supported — the pause feature (SIGSTOP) and
@@ -32,8 +41,14 @@ LAN-address detection (`ifconfig`) are POSIX-only and won't work there.
 ### Installing the prerequisites (macOS, via Homebrew)
 
 ```bash
-brew install ffmpeg rclone node
-npm install -g webtorrent-cli
+brew install ffmpeg rclone
+python3 -m pip install --user libtorrent
+```
+
+Only if you want the webtorrent fallback as well:
+
+```bash
+brew install node && npm install -g webtorrent-cli
 ```
 
 Then configure the Drive remote (skip this if you don't need Drive links):
@@ -130,6 +145,7 @@ second `python3 reel.py` will detect the first and refuse to start.
 | `REEL_PACK` | `50` | max episodes split out of one season-pack torrent; `1` restores old "biggest file only" behaviour |
 | `REEL_SHELF` | `12` | how many cards per Picks shelf |
 | `REEL_SUB_LANG` | `eng` | subtitle language to look for (ISO 639-2, e.g. `spa`, `fre`) |
+| `REEL_TORRENT` | `libtorrent` | torrent client: `lt` (default, seekable while downloading) or `wt` for webtorrent-cli |
 
 The port (`8000`) and per-item cache defaults are constants near the top of
 `reel.py` if you want to change them permanently — there's no env var for

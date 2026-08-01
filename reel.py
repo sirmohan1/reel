@@ -6092,11 +6092,15 @@ class LibtorrentBackend:
                 pass
 
 
-TORRENT_BACKENDS = {"webtorrent": WebTorrentBackend,
+TORRENT_BACKENDS = {"webtorrent": WebTorrentBackend, "wt": WebTorrentBackend,
                     "libtorrent": LibtorrentBackend, "lt": LibtorrentBackend}
-# Named rather than auto-detected: which client is in use changes how a
-# download behaves, and that is not something to decide silently per machine.
-TORRENT_BACKEND = os.environ.get("REEL_TORRENT", "webtorrent").strip().lower()
+# libtorrent by default: it is the only one that can fetch the pieces under a
+# read, which is what makes a still-downloading item seekable at all. Named
+# rather than auto-detected, and deliberately not falling back on its own --
+# a server that quietly ran webtorrent instead looked identical until someone
+# tried to seek, which is exactly how an afternoon went missing. Set
+# REEL_TORRENT=wt to choose the old one on purpose.
+TORRENT_BACKEND = os.environ.get("REEL_TORRENT", "libtorrent").strip().lower()
 _BACKEND = None
 
 
@@ -6104,7 +6108,7 @@ def backend():
     """The torrent backend this process is using, built once."""
     global _BACKEND
     if _BACKEND is None:
-        cls = TORRENT_BACKENDS.get(TORRENT_BACKEND) or WebTorrentBackend
+        cls = TORRENT_BACKENDS.get(TORRENT_BACKEND) or LibtorrentBackend
         _BACKEND = cls()
     return _BACKEND
 
@@ -9861,7 +9865,21 @@ def main():
         lan = lan_ip()
         if lan and HOST != "127.0.0.1":
             print(f"  on this wifi  ->  http://{lan}:{PORT}")
+        bk = backend()
         print(f"  rclone gdrive: {has_rclone()}   ffmpeg+ffprobe: {has_ffmpeg()}")
+        print(f"  torrents: {bk.name}"
+              + ("" if bk.available() else "  <-- NOT INSTALLED"))
+        if not bk.available():
+            # Said plainly rather than quietly falling back. A server running
+            # the other client looks identical until someone tries to seek,
+            # and then the feature is simply missing with nothing to explain
+            # why -- which is worth more noise at startup than it costs.
+            fix = ("python3 -m pip install --user libtorrent"
+                   if bk.name == "libtorrent"
+                   else "npm install -g webtorrent-cli")
+            print(f"     torrents will fail until you run:  {fix}")
+            print(f"     or start with REEL_TORRENT="
+                  f"{'wt' if bk.name == 'libtorrent' else 'lt'} to use the other one")
         print(f"  cache: {DL}  (cap {CACHE_CAP_GB:g} GB, {len(JOBS)} restored)\n")
         try:
             s.serve_forever()

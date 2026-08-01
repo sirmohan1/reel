@@ -99,11 +99,13 @@ WT_DATA_MIN = 2 * 1024 * 1024
 # to cover a thin swarm, short enough that a hopeless read fails visibly
 # instead of hanging the player.
 LT_SEEK_WAIT = 20
-# How often a running download checkpoints its resume data. A hard kill then
-# costs at most this much re-fetching rather than the whole download, and the
-# blob is a few KB, so the interval is about not writing pointlessly rather
-# than about the cost of writing.
-LT_RESUME_EVERY = 30.0
+# How often a running download checkpoints its resume data. A hard kill costs
+# whatever arrived since the last one, so the interval is a bandwidth bet, not
+# an I/O one: the blob measured 8.5 KB, while 30s of a 25 MB/s swarm is ~750 MB
+# that would have to be fetched twice. Measured on a real restart, a 30s
+# interval lost about 520 MB. Ten seconds keeps the write trivial and the
+# re-fetch small.
+LT_RESUME_EVERY = 10.0
 # When the first probe learns nothing, how long to keep waiting and how much of
 # the file to want before asking again. Not a format threshold -- the first 4 MB
 # of that mp4 identifies itself perfectly once those bytes exist. The problem is
@@ -5855,6 +5857,16 @@ class LibtorrentBackend:
         except Exception:
             pass
         job["lt_resumed"] = resumed
+        if resumed:
+            # Worth saying out loud: without it there is no way to tell a
+            # resume from a re-download that merely looks fast, and the two
+            # are exactly what a restart has to be judged on.
+            try:
+                st = h.status()
+                record(job, "resumed from saved state -- %.1f%% already held, "
+                            "no re-check needed" % (st.progress * 100))
+            except Exception:
+                record(job, "resumed from saved state")
         if rate_kbps:
             try:
                 h.set_download_limit(int(rate_kbps) * 1024)

@@ -2675,6 +2675,262 @@ class TestIntegrityCheck(Base):
 
 
 # --------------------------------------------------------------------------
+class TestLoudness(Base):
+    """Loudness matching. measure_loudness is tested against a real ffmpeg
+    analysis of real generated audio at known levels rather than a mocked
+    stderr string, since the whole feature rests on that parse being right."""
+
+    def _audio(self, name, db, seconds=3):
+        """A tone at a known amplitude, so the measurement has something with
+        a knowable answer to be checked against."""
+        src = os.path.join(self.dl, name)
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=%d:sample_rate=48000" % seconds,
+             "-af", "volume=%sdB" % db, "-c:a", "aac", src],
+            check=True, capture_output=True)
+        return src
+
+    @needs_ffmpeg
+    def test_a_real_file_measures_a_plausible_loudness(self):
+        m = self.m.measure_loudness(self._audio("tone.m4a", 0))
+        self.assertIsNotNone(m)
+        self.assertIn("lufs", m)
+        self.assertIn("peak", m)
+        # A full-scale sine is loud: nowhere near a film mix's -25, and
+        # certainly not a positive number.
+        self.assertLess(m["lufs"], 0)
+        self.assertGreater(m["lufs"], -30)
+
+    @needs_ffmpeg
+    def test_a_quieter_file_measures_quieter(self):
+        # The property that actually matters -- absolute calibration is
+        # ffmpeg's business, but the ordering has to be right or every
+        # correction is backwards.
+        loud = self.m.measure_loudness(self._audio("loud.m4a", 0))
+        quiet = self.m.measure_loudness(self._audio("quiet.m4a", -20))
+        self.assertLess(quiet["lufs"], loud["lufs"] - 10)
+
+    @needs_ffmpeg
+    def test_silence_is_unmeasurable_not_a_number(self):
+        # loudnorm reports -inf for silence. Letting that through would ask
+        # the player for infinite gain on a title with nothing to hear.
+        src = os.path.join(self.dl, "silent.m4a")
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "2",
+             "-c:a", "aac", src], check=True, capture_output=True)
+        self.assertIsNone(self.m.measure_loudness(src))
+
+    def test_a_path_that_cannot_be_read_is_unmeasurable(self):
+        self.assertIsNone(self.m.measure_loudness("/no/such/file.mp4"))
+
+    # ---- the gain decision, independent of any measurement ----------------
+
+    def test_a_quiet_title_is_turned_up_and_a_loud_one_down(self):
+        target = self.m.LOUDNESS_TARGET
+        self.assertGreater(self.m.loudness_gain(target - 4), 0)
+        self.assertLess(self.m.loudness_gain(target + 4), 0)
+
+    def test_a_title_already_at_target_is_left_alone(self):
+        self.assertEqual(self.m.loudness_gain(self.m.LOUDNESS_TARGET), 0.0)
+
+    def test_the_correction_is_clamped_in_both_directions(self):
+        # An outlier must not be handed a 40 dB boost -- past a point the
+        # right answer is "this file is unusual", not "amplify it enormously".
+        self.assertEqual(self.m.loudness_gain(-90), self.m.LOUDNESS_MAX_BOOST)
+        self.assertEqual(self.m.loudness_gain(40), self.m.LOUDNESS_MAX_CUT)
+
+    def test_no_measurement_means_no_correction_claimed(self):
+        self.assertIsNone(self.m.loudness_gain(None))
+
+    def test_a_boost_is_held_to_what_the_file_has_room_for(self):
+        # From the first real film measured here: -22.7 LUFS but already
+        # +1.6 dBTP, so there is no headroom at all and the only boost
+        # available is what the limiter can absorb.
+        quiet = self.m.LOUDNESS_TARGET - 10          # wants a big boost
+        roomy = self.m.loudness_gain(quiet, peak=-20.0)
+        clipped = self.m.loudness_gain(quiet, peak=1.6)
+        self.assertGreater(roomy, clipped)
+        self.assertEqual(clipped, self.m.LOUDNESS_LIMITER_ASSIST)
+
+    def test_attenuation_ignores_the_peak_entirely(self):
+        # Turning something down always fits, however hot its peaks are.
+        loud = self.m.LOUDNESS_TARGET + 6
+        self.assertEqual(self.m.loudness_gain(loud, peak=3.0),
+                         self.m.loudness_gain(loud))
+        self.assertLess(self.m.loudness_gain(loud, peak=3.0), 0)
+
+    def test_a_peak_is_optional_and_absent_behaves_as_before(self):
+        quiet = self.m.LOUDNESS_TARGET - 10
+        self.assertEqual(self.m.loudness_gain(quiet), self.m.LOUDNESS_MAX_BOOST)
+
+    # ---- landing it on the job -------------------------------------------
+
+    def _wait(self, job, timeout=5):
+        deadline = time.time() + timeout
+        while time.time() < deadline and job.get("gain_db") is None:
+            time.sleep(0.02)
+        return job.get("gain_db")
+
+    def test_a_measurement_lands_on_the_job_as_a_gain(self):
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.measure_loudness = lambda p, timeout=None: {"lufs": -26.0, "peak": -1.0}
+        self.m.check_loudness(j)
+        # Peak included, not just loudness: a boost is held to what this
+        # file has room for, so the two must be decided together.
+        self.assertEqual(self._wait(j), self.m.loudness_gain(-26.0, -1.0))
+        self.assertEqual(j["loudness"], -26.0)
+        self.assertEqual(j["loudness_peak"], -1.0)
+
+    def test_an_unmeasurable_file_leaves_the_job_untouched(self):
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.measure_loudness = lambda p, timeout=None: None
+        self.m.check_loudness(j)
+        time.sleep(0.3)
+        self.assertIsNone(j["gain_db"])
+        self.assertIsNone(j["loudness"])
+
+    def test_no_path_anywhere_is_a_no_op(self):
+        j = self.job()
+        self.m.check_loudness(j)
+        self.assertIsNone(j["gain_db"])
+
+    def test_an_explicit_path_overrides_the_jobs_own(self):
+        # A direct-stream torrent never gets job["path"], same as the
+        # integrity check above.
+        j = self.job()
+        seen = []
+        self.m.measure_loudness = lambda p, timeout=None: (
+            seen.append(p) or {"lufs": -20.0, "peak": -2.0})
+        self.m.check_loudness(j, path="/explicit/path.mp4")
+        self._wait(j)
+        self.assertEqual(seen, ["/explicit/path.mp4"])
+
+    def test_a_cancelled_job_never_gets_a_verdict_written(self):
+        j = self.job()
+        j["path"] = "/wherever"
+        self.m.measure_loudness = lambda p, timeout=None: (
+            time.sleep(0.2) or {"lufs": -20.0, "peak": -2.0})
+        self.m.check_loudness(j)
+        j["cancel"].set()
+        time.sleep(0.4)
+        self.assertIsNone(j["gain_db"])
+
+    def test_the_gain_reaches_the_browser(self):
+        # public() is the only way the player ever learns about any of this.
+        j = self.job()
+        j["gain_db"] = -3.5
+        j["loudness"] = -16.5
+        pub = self.m.public(j)
+        self.assertEqual(pub["gain_db"], -3.5)
+        self.assertEqual(pub["loudness"], -16.5)
+
+    def test_an_unmeasured_job_reports_no_gain_rather_than_zero(self):
+        # None and 0.0 mean different things to the player: "don't touch
+        # this" versus "measured, and correctly at target already".
+        self.assertIsNone(self.m.public(self.job())["gain_db"])
+
+    # ---- the cache, which is what makes this a once-ever cost -------------
+
+    def _file(self, name="f.mp4", data=b"x" * 1000):
+        p = os.path.join(self.dl, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def test_a_measurement_is_remembered_and_reused(self):
+        p = self._file()
+        self.m.remember_loudness(p, {"lufs": -26.0, "peak": -1.5})
+        self.assertEqual(self.m.cached_loudness(p),
+                         {"lufs": -26.0, "peak": -1.5})
+
+    def test_a_cache_hit_costs_no_measurement_at_all(self):
+        # The whole point: restore() rebuilds the queue on every start, and
+        # re-measuring the library each time is the cost this avoids.
+        p = self._file()
+        self.m.remember_loudness(p, {"lufs": -26.0, "peak": -1.5})
+        calls = []
+        self.m.measure_loudness = lambda *a, **k: calls.append(1)
+        j = self.job()
+        j["path"] = p
+        self.m.check_loudness(j)
+        self.assertEqual(calls, [])
+        self.assertEqual(j["gain_db"], self.m.loudness_gain(-26.0, -1.5))
+
+    def test_a_replaced_file_of_a_different_size_is_not_a_hit(self):
+        # A refetched row reuses its name; the bytes are new, so the old
+        # measurement must not be applied to them.
+        p = self._file(data=b"x" * 1000)
+        self.m.remember_loudness(p, {"lufs": -26.0, "peak": -1.5})
+        with open(p, "wb") as f:
+            f.write(b"y" * 5000)
+        self.assertIsNone(self.m.cached_loudness(p))
+
+    def test_a_missing_file_has_no_key_and_no_hit(self):
+        self.assertIsNone(self.m.loudness_key("/no/such/file.mp4"))
+        self.assertIsNone(self.m.cached_loudness("/no/such/file.mp4"))
+
+    def test_a_corrupt_cache_file_is_ignored_not_crashed_on(self):
+        p = self._file()
+        with open(os.path.join(self.m.CACHE_DIR, "loudness.json"), "w") as f:
+            f.write("{not json at all")
+        self.assertIsNone(self.m.cached_loudness(p))
+        # and it still records afterwards, over the top of the bad file
+        self.m.remember_loudness(p, {"lufs": -20.0, "peak": -2.0})
+        self.assertIsNotNone(self.m.cached_loudness(p))
+
+    def test_restore_applies_a_cached_measurement_but_never_starts_one(self):
+        p = self._file()
+        calls = []
+        self.m.measure_loudness = lambda *a, **k: calls.append(1)
+        j = self.job()
+        j["path"] = p
+        self.m.check_loudness(j, measure=False)
+        self.assertEqual(calls, [])          # nothing measured
+        self.assertIsNone(j["gain_db"])
+        # but a title already measured is corrected for free
+        self.m.remember_loudness(p, {"lufs": -24.0, "peak": -1.0})
+        self.m.check_loudness(j, measure=False)
+        self.assertEqual(j["gain_db"], self.m.loudness_gain(-24.0, -1.0))
+        self.assertEqual(calls, [])
+
+    def test_a_second_play_does_not_start_a_second_measurement(self):
+        # /playing fires every few seconds while something is on screen.
+        p = self._file()
+        calls = []
+        def slow(path, timeout=None):
+            calls.append(1)
+            time.sleep(0.3)
+            return {"lufs": -22.0, "peak": -1.0}
+        self.m.measure_loudness = slow
+        j = self.job()
+        j["path"] = p
+        self.m.check_loudness(j)
+        self.m.check_loudness(j)
+        self.m.check_loudness(j)
+        self._wait(j)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_measurement_is_written_to_cache_even_if_the_job_is_gone(self):
+        # The pass has already been paid for; throwing the number away
+        # because the row was removed means paying it again next time.
+        p = self._file()
+        self.m.measure_loudness = lambda path, timeout=None: (
+            time.sleep(0.15) or {"lufs": -21.0, "peak": -1.0})
+        j = self.job()
+        j["path"] = p
+        self.m.check_loudness(j)
+        j["cancel"].set()
+        time.sleep(0.5)
+        self.assertIsNone(j["gain_db"])                    # not applied
+        self.assertIsNotNone(self.m.cached_loudness(p))    # but not wasted
+
+
+# --------------------------------------------------------------------------
 class TestResume(Base):
     def test_a_position_comes_back(self):
         self.m.note_resume("job1", 1830.0, 7200.0)

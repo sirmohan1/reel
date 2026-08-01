@@ -5455,6 +5455,121 @@ def list_torrent_files(job, magnet, port, limit):
     return files, ANSI.sub(" ", "".join(lines)).strip()
 
 
+# --------------------------------------------------------------------------
+# The torrent backend seam.
+#
+# Everything that knows *how* torrent bytes are obtained lives behind this
+# interface, so a second implementation can be added without run_torrent
+# growing a branch per operation. The webtorrent one below is deliberately a
+# thin adapter over the module-level functions it replaces rather than a
+# rewrite of them: the point of introducing the seam is to make the swap
+# possible, not to disturb code that already works and is heavily tested.
+#
+# The operations are the ones that genuinely differ between clients. Anything
+# a client does not decide -- picking which file to take, the cache cap,
+# subtitles, conversion, the queue -- deliberately stays outside.
+
+
+class WebTorrentBackend:
+    """webtorrent-cli, driven as a subprocess and read over its own http
+    server. What reel has always done."""
+
+    name = "webtorrent"
+
+    @staticmethod
+    def available():
+        return bool(shutil.which("webtorrent"))
+
+    def fetch_metadata(self, job, magnet, port, limit):
+        """-> (files, torrent_file_path, log). Either half may be empty."""
+        return fetch_metadata(job, magnet, port, limit)
+
+    def list_files(self, job, magnet, port, limit):
+        """-> (files, log). The fallback when no .torrent could be fetched."""
+        return list_torrent_files(job, magnet, port, limit)
+
+    def stream_url(self, job, port, chosen):
+        """-> an http url the bytes can be read from, or None.
+
+        The one operation with no libtorrent equivalent: reading straight out
+        of the client's own storage needs no url at all. A backend that reads
+        locally returns None here and is served from disk instead.
+        """
+        return find_wt_url(job, port, chosen)
+
+    def start(self, job, source, out_dir, chosen, port, rate_kbps=None):
+        """Begin downloading `chosen` into out_dir. -> the process, or None.
+
+        Both pipes are drained continuously here rather than by the caller:
+        without --quiet webtorrent draws a redrawing UI, and an unread pipe
+        would eventually block the process dead.
+        """
+        cmd = ["webtorrent", "download", source, "--out", out_dir,
+               "--select", str(chosen["index"]), "--port", str(port),
+               "--keep-seeding"]
+        # A prefetch gets a rate cap so it can never outbid the stream.
+        if rate_kbps:
+            cmd += ["--download-limit", str(rate_kbps)]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            job["error"] = f"Couldn't start webtorrent: {e}"
+            return None
+        job["procs"].append(proc)
+        job["wt_proc"] = proc
+        errbuf, tailbuf = [], []
+
+        def drain(stream, keep):
+            try:
+                for line in iter(stream.readline, ""):
+                    keep.append(line)
+                    del keep[:-40]
+                    got = parse_stats(line)
+                    if "peers" in got:
+                        job["peers"] = got["peers"]
+                    if "uploaded" in got:
+                        job["uploaded"] = got["uploaded"]
+                    if "up_rate" in got:
+                        job["up_rate"] = got["up_rate"]
+                    # keep the raw shape available: if the patterns above miss,
+                    # this shows what the client actually printed
+                    job["wt_tail"] = tail(ANSI.sub(" ", "".join(keep)), 6, 400)
+            except Exception:
+                pass
+        threading.Thread(target=drain, args=(proc.stderr, errbuf), daemon=True).start()
+        threading.Thread(target=drain, args=(proc.stdout, tailbuf), daemon=True).start()
+        job["_out"] = (errbuf, tailbuf)
+        return proc
+
+    def recent_output(self, job, lines=4, chars=200):
+        """Whatever the client last said, for an error message.
+
+        Part of the interface rather than the caller reaching into buffers:
+        a backend with no subprocess has no stdout to read, and would answer
+        this from its own log instead.
+        """
+        bufs = job.get("_out") or ()
+        return tail(ANSI.sub(" ", "".join(sum((list(b) for b in bufs), []))),
+                    lines, chars)
+
+
+TORRENT_BACKENDS = {"webtorrent": WebTorrentBackend}
+# Named rather than auto-detected: which client is in use changes how a
+# download behaves, and that is not something to decide silently per machine.
+TORRENT_BACKEND = os.environ.get("REEL_TORRENT", "webtorrent").strip().lower()
+_BACKEND = None
+
+
+def backend():
+    """The torrent backend this process is using, built once."""
+    global _BACKEND
+    if _BACKEND is None:
+        cls = TORRENT_BACKENDS.get(TORRENT_BACKEND) or WebTorrentBackend
+        _BACKEND = cls()
+    return _BACKEND
+
+
 def run_torrent(job):
     magnet = job["magnet"]
     out_dir = os.path.join(DL, job["id"] + "_wt")
@@ -5462,7 +5577,8 @@ def run_torrent(job):
     def cleanup():
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    if not has_webtorrent():
+    bk = backend()
+    if not bk.available():
         return fail(job, "webtorrent not found. Install it with: "
                          "npm install -g webtorrent-cli")
     if not has_ffmpeg():
@@ -5481,13 +5597,13 @@ def run_torrent(job):
     # Preferred: fetch the .torrent once and read it locally. The streaming run
     # can then be given the file instead of the magnet, so peer discovery and
     # metadata transfer happen once rather than twice.
-    files, tfile, log = fetch_metadata(job, magnet, probe_port, WT_META_TIMEOUT)
+    files, tfile, log = bk.fetch_metadata(job, magnet, probe_port, WT_META_TIMEOUT)
     source = tfile or magnet
     if files:
         job["note"] = "from .torrent"
     else:
         # older builds may not have downloadmeta; fall back to the listing
-        files, log2 = list_torrent_files(job, magnet, probe_port, WT_META_TIMEOUT)
+        files, log2 = bk.list_files(job, magnet, probe_port, WT_META_TIMEOUT)
         log = (log + "\n" + log2).strip()
         source = magnet
     job["timings"] = {"metadata": round(time.time() - t_meta, 1)}
@@ -5563,49 +5679,16 @@ def run_torrent(job):
         pass
 
     t_start = time.time()
-    cmd = ["webtorrent", "download", source, "--out", out_dir,
-           "--select", str(chosen["index"]), "--port", str(port),
-           "--keep-seeding"]
-    # A prefetch gets a rate cap so it can never outbid the stream.
-    if job.get("prefetch") and PREFETCH_KBPS:
-        cmd += ["--download-limit", str(PREFETCH_KBPS)]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
-    except Exception as e:
+    proc = bk.start(job, source, out_dir, chosen, port,
+                    PREFETCH_KBPS if job.get("prefetch") else None)
+    if proc is None:
         cleanup()
-        return fail(job, f"Couldn't start webtorrent: {e}")
-    job["procs"].append(proc)
-    job["wt_proc"] = proc
-    # Both pipes must be drained continuously. Without --quiet webtorrent draws a
-    # redrawing UI, and an unread pipe would eventually block the process dead.
-    errbuf = []
-    tailbuf = []
-
-    def drain(stream, keep):
-        try:
-            for line in iter(stream.readline, ""):
-                keep.append(line)
-                del keep[:-40]
-                got = parse_stats(line)
-                if "peers" in got:
-                    job["peers"] = got["peers"]
-                if "uploaded" in got:
-                    job["uploaded"] = got["uploaded"]
-                if "up_rate" in got:
-                    job["up_rate"] = got["up_rate"]
-                # keep the raw shape available: if the patterns above miss, this
-                # shows what the client actually printed
-                job["wt_tail"] = tail(ANSI.sub(" ", "".join(keep)), 6, 400)
-        except Exception:
-            pass
-    threading.Thread(target=drain, args=(proc.stderr, errbuf), daemon=True).start()
-    threading.Thread(target=drain, args=(proc.stdout, tailbuf), daemon=True).start()
+        return fail(job, job.get("error") or "Couldn't start the torrent client.")
 
     job["status"] = "connecting"
     t_connect = time.time()
     job["timings"]["spawn"] = round(t_connect - t_start, 1)
-    url = find_wt_url(job, port, chosen)
+    url = bk.stream_url(job, port, chosen)
     job["timings"]["find_url"] = round(time.time() - t_connect, 1)
     if job["cancel"].is_set():
         cleanup()
@@ -5625,7 +5708,7 @@ def run_torrent(job):
                     pass
         if run_torrent_pipe(job, magnet, chosen, out_dir):
             return
-        detail = tail(ANSI.sub(" ", "".join(errbuf + tailbuf)), 4, 200)
+        detail = bk.recent_output(job)
         cleanup()
         return fail(job, ("webtorrent exited (code %s). %s" % (rc, detail)) if rc is not None
                     else "No playable endpoint on port %d and piping failed. %s"

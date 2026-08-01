@@ -469,6 +469,84 @@ class TestOsdbHash(Base):
 
 
 # --------------------------------------------------------------------------
+class TestTorrentBackend(Base):
+    """The seam a second torrent client plugs into. These pin the contract
+    run_torrent depends on, so an alternative backend can be checked against
+    the same expectations rather than against whatever webtorrent happens
+    to do."""
+
+    def test_the_default_backend_is_webtorrent(self):
+        # Named, not auto-detected: which client is in use changes how a
+        # download behaves and should never be decided silently.
+        self.m._BACKEND = None
+        self.assertEqual(self.m.backend().name, "webtorrent")
+
+    def test_the_backend_is_built_once_and_reused(self):
+        self.m._BACKEND = None
+        self.assertIs(self.m.backend(), self.m.backend())
+
+    def test_an_unknown_backend_name_falls_back_rather_than_crashing(self):
+        # A typo in REEL_TORRENT must not stop the server from starting.
+        self.m._BACKEND = None
+        self.m.TORRENT_BACKEND = "not-a-real-client"
+        try:
+            self.assertEqual(self.m.backend().name, "webtorrent")
+        finally:
+            self.m.TORRENT_BACKEND = "webtorrent"
+            self.m._BACKEND = None
+
+    def test_the_interface_run_torrent_relies_on_is_present(self):
+        # If a method is renamed here, run_torrent breaks at runtime rather
+        # than at import -- so the contract is asserted explicitly.
+        bk = self.m.WebTorrentBackend()
+        for name in ("available", "fetch_metadata", "list_files",
+                     "stream_url", "start", "recent_output"):
+            self.assertTrue(callable(getattr(bk, name, None)), name)
+
+    def test_metadata_and_listing_delegate_to_the_existing_functions(self):
+        # Stage 1 is a seam, not a rewrite: these must still be the same code
+        # paths that were already working and tested.
+        bk = self.m.WebTorrentBackend()
+        seen = []
+        self.m.fetch_metadata = lambda *a: seen.append(("meta",) + a) or ([], None, "")
+        self.m.list_torrent_files = lambda *a: seen.append(("list",) + a) or ([], "")
+        self.m.find_wt_url = lambda *a: seen.append(("url",) + a) or None
+        j = self.job()
+        bk.fetch_metadata(j, "magnet:?x", 9, 5)
+        bk.list_files(j, "magnet:?x", 9, 5)
+        bk.stream_url(j, 9, {"index": 0, "name": "a.mkv"})
+        self.assertEqual([s[0] for s in seen], ["meta", "list", "url"])
+
+    def test_a_client_that_cannot_be_spawned_reports_rather_than_raises(self):
+        # run_torrent turns a None return into a job error; an exception here
+        # would instead kill the worker thread silently.
+        bk = self.m.WebTorrentBackend()
+        real = self.m.subprocess.Popen
+        self.m.subprocess.Popen = lambda *a, **k: (_ for _ in ()).throw(
+            OSError("no such binary"))
+        try:
+            j = self.job()
+            got = bk.start(j, "magnet:?x", self.dl, {"index": 0}, 9)
+        finally:
+            self.m.subprocess.Popen = real
+        self.assertIsNone(got)
+        self.assertIn("no such binary", j["error"])
+
+    def test_recent_output_is_empty_before_anything_has_run(self):
+        # Asked for on the error path, which can be reached before start().
+        bk = self.m.WebTorrentBackend()
+        self.assertEqual(bk.recent_output(self.job()), "")
+
+    def test_recent_output_reports_what_the_client_said(self):
+        bk = self.m.WebTorrentBackend()
+        j = self.job()
+        j["_out"] = (["connecting\n"], ["Peers: 12/40\n"])
+        got = bk.recent_output(j)
+        self.assertIn("Peers: 12/40", got)
+        self.assertIn("connecting", got)
+
+
+# --------------------------------------------------------------------------
 class TestTorrentParsing(Base):
     def test_bencode_roundtrip(self):
         self.assertEqual(self.m.bdecode(b"i42e")[0], 42)

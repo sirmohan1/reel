@@ -27,7 +27,7 @@ Before writing this doc, the real `qrcode` package (PyPI, MIT-licensed, the stan
 this in Python) was installed in an isolated scratch venv and tested end to end:
 
 - Generated QR codes for both `http://192.168.1.192:8000` (version 2, 25×25 modules) and
-  `http://shikhars-macbook-air.local:8000` (version 3, 29×29 modules) — the two realistic shapes
+  `http://yourmachine.local:8000` (version 3, 29×29 modules) — the two realistic shapes
   this feature will actually produce.
 - Decoded both back with **`jsQR`, a completely independent implementation** (different
   language, different codebase, no shared code with `qrcode`) — both matched byte-for-byte.

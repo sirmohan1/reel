@@ -3499,7 +3499,16 @@ def new_job(drive_id, jid=None, **extra):
            # the scheduler's own prefetch throttling (see scheduler() rule 2)
            # -- which must never silently resume something a person stopped
            # on purpose just because the stream's margin improved.
-           "user_paused": False}
+           "user_paused": False,
+           # Set when title came from TMDB (the catalogue or a Picks card),
+           # rather than guessed from a filename -- see the /add handler and
+           # run_torrent's own title assignment below. A release name like
+           # "Movie.Name.2026.1080p.WEB-DL.DDP5.1-GROUP" is correct but not
+           # what anyone typed or would want to read in their queue; the
+           # catalogue already asked TMDB what the thing is actually called,
+           # so that answer should survive contact with the torrent's own
+           # (scene-formatted) filename instead of being overwritten by it.
+           "title_locked": False}
     job.update(extra)
     return job
 
@@ -3627,7 +3636,8 @@ def restore():
                                         total=int(info.get("total") or 0),
                                         title=info.get("title") or "torrent",
                                         wt_index=info.get("index"),
-                                        wt_files=int(info.get("files") or 0))
+                                        wt_files=int(info.get("files") or 0),
+                                        title_locked=bool(info.get("title_locked")))
                 else:
                     shutil.rmtree(p, ignore_errors=True)
             continue
@@ -4755,9 +4765,11 @@ def run_job(job):
             return fail(job, tail(rerr) or
                         "rclone couldn't fetch that file. Check the link and your access.")
 
-        # Drive's own filename is the nicest title we get.
+        # Drive's own filename is the nicest title we get -- unless the
+        # catalogue already told us the real one (see title_locked).
         real = os.path.basename(raw)
-        job["title"] = os.path.splitext(real)[0]
+        if not job.get("title_locked"):
+            job["title"] = os.path.splitext(real)[0]
         safe = re.sub(r"[^\w.\- ]", "_", real)[:110]
         stem = os.path.splitext(safe)[0]
         base = f"{job['id']}__{drive_id}__{stem}"
@@ -5478,7 +5490,15 @@ def run_torrent(job):
         chosen = pick_file(files)
 
     if chosen:
-        job["title"] = os.path.splitext(os.path.basename(chosen["name"]))[0]
+        # The scene release name a torrent actually carries -- correct, but
+        # not what the catalogue already told us TMDB calls this. That
+        # answer (title_locked) wins when there is one -- except for a pack,
+        # where every sibling in fan_out() below keeps its own per-episode
+        # filename regardless, and this one showing just the show's bare
+        # name while its siblings show "S01E02..." would read as more
+        # inconsistent than the scene name it would otherwise replace.
+        if not job.get("title_locked") or pack:
+            job["title"] = os.path.splitext(os.path.basename(chosen["name"]))[0]
         job["total"] = chosen["size"] or 0
         job["wt_files"] = len(files)
         job["wt_index"] = chosen["index"]
@@ -5512,7 +5532,8 @@ def run_torrent(job):
         with open(os.path.join(out_dir, ".reel.json"), "w") as f:
             _json.dump({"magnet": magnet, "index": chosen["index"],
                         "title": job["title"], "total": job["total"],
-                        "files": job["wt_files"]}, f)
+                        "files": job["wt_files"],
+                        "title_locked": job.get("title_locked", False)}, f)
     except OSError:
         pass
 
@@ -6424,7 +6445,7 @@ def refetch_job(jid):
     fresh = new_job(job.get("drive_id"), jid=jid, source=job.get("source", "drive"),
                     magnet=job.get("magnet"), wt_index=job.get("wt_index"),
                     wt_files=job.get("wt_files") or 0, caps=job.get("caps"),
-                    title=job.get("title"))
+                    title=job.get("title"), title_locked=job.get("title_locked", False))
     with LOCK:
         JOBS[jid] = fresh
     record(fresh, "refetching from scratch -- the previous copy is gone")
@@ -6661,10 +6682,21 @@ class H(http.server.BaseHTTPRequestHandler):
         if p == "/add":
             magnets, ids, bad = split_sources(body.get("links"))
             caps = sorted(caps_of(body.get("client")))
+            # Only trusted when it can't be ambiguous: one magnet, from a
+            # click that already knows what TMDB calls it (the catalogue or
+            # a Picks card send their title along). A pasted batch of links
+            # never sends one, so this stays unset for that path.
+            known_title = None
+            if len(magnets) == 1 and not ids:
+                t = (body.get("title") or "").strip()
+                if t:
+                    y = body.get("year")
+                    known_title = "%s (%s)" % (t, y) if y else t
             added = []
             for uri in magnets:
                 job = new_job(None, source="torrent", magnet=uri, caps=caps,
-                              title="magnet " + infohash(uri)[:8])
+                              title=known_title or ("magnet " + infohash(uri)[:8]),
+                              title_locked=bool(known_title))
                 record(job, "added as a torrent: " + infohash(uri)[:12])
                 with LOCK:
                     JOBS[job["id"]] = job
@@ -7293,17 +7325,22 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
      nowhere left to go. flags is unpositioned here on purpose -- grid auto-
      flow drops it into a new row spanning the full width on its own, the
      same trick logpanel/morepanel already used to sit below the row rather
-     than beside it. */
-  li.row{display:grid;grid-template-columns:26px 1fr 26px;align-items:center;
-    gap:6px 12px;padding:11px 4px;border-bottom:1px solid var(--rule);cursor:pointer;
+     than beside it. kill moves right after body (not after flags) so it
+     lands beside the title in row one instead of stranded on its own line
+     below everything else. */
+  li.row{display:grid;grid-template-columns:26px 1fr 26px;align-items:start;
+    gap:0 12px;padding:12px 4px;border-bottom:1px solid var(--rule);cursor:pointer;
     transition:background .1s}
   li.row:hover{background:var(--panel)}
+  li.row .n,li.row>.kill{margin-top:1px}
   /* the log lives inside the row's grid, spanning it, so opening one does not
      disturb the columns */
-  .logbtn{font:400 10px/1 var(--mono);letter-spacing:.08em;color:var(--faint);
-    background:none;border:1px solid var(--rule);border-radius:3px;padding:3px 5px}
-  .logbtn:hover{color:var(--text);border-color:var(--dim)}
-  .logbtn.on{color:var(--brass);border-color:var(--brass)}
+  /* Flat text, not a bordered box -- see the .flags comment below for why
+     actions dropped the button chrome that .cc/.kind kept. */
+  .logbtn{font:500 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+    color:var(--faint);background:none;border:none;padding:2px 0}
+  .logbtn:hover{color:var(--text)}
+  .logbtn.on{color:var(--brass)}
   .logpanel{grid-column:1/-1;margin:8px 0 2px;padding:8px 10px;
     background:var(--ink);border:1px solid var(--rule);border-radius:4px;
     max-height:230px;overflow-y:auto;font:400 11px/1.6 var(--mono);
@@ -7319,15 +7356,15 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   /* Always present, not conditional like logbtn/moreBtn -- a copy can turn
      out to be wrong regardless of what state the row is in, so there is no
      status this should be hidden for. */
-  .refetchbtn{font:400 10px/1 var(--mono);letter-spacing:.08em;
+  .refetchbtn{font:500 10px/1 var(--mono);letter-spacing:.08em;
     text-transform:uppercase;color:var(--faint);background:none;
-    border:1px solid var(--rule);border-radius:3px;padding:3px 5px}
-  .refetchbtn:hover:not(:disabled){color:var(--warn);border-color:var(--warn)}
+    border:none;padding:2px 0}
+  .refetchbtn:hover:not(:disabled){color:var(--warn)}
   .refetchbtn:disabled{color:var(--faint);opacity:.5}
-  .pausebtn{font:400 10px/1 var(--mono);letter-spacing:.08em;
+  .pausebtn{font:500 10px/1 var(--mono);letter-spacing:.08em;
     text-transform:uppercase;color:var(--faint);background:none;
-    border:1px solid var(--rule);border-radius:3px;padding:3px 5px}
-  .pausebtn:hover:not(:disabled){color:var(--brass);border-color:var(--brass)}
+    border:none;padding:2px 0}
+  .pausebtn:hover:not(:disabled){color:var(--brass)}
   .pausebtn:disabled{color:var(--faint);opacity:.5}
   .morepanel{grid-column:1/-1;margin:8px 0 2px;padding:8px 10px;
     background:var(--ink);border:1px solid var(--rule);border-radius:4px;
@@ -7339,7 +7376,11 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .moreopt:hover{background:var(--panel);color:var(--text)}
   .moreopt.on{color:var(--brass)}
   .moreopt.on::before{content:'✓ '}
-  li.row.live{background:var(--panel)}
+  /* A tint of the same brass used for kind.now/the progress bar, not the
+     plain panel hover uses -- sharing that color would make "currently
+     playing" read as nothing more than a mouse resting over the row. */
+  li.row.live{background:rgba(198,162,101,.08);
+    box-shadow:inset 3px 0 0 var(--brass)}
   li.row.live .n{color:var(--brass)}
   li.row.live .title{color:var(--text)}
   .n{font:400 11px/1 var(--mono);color:var(--faint);text-align:right;
@@ -7366,34 +7407,48 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     white-space:pre-wrap;word-break:break-word}
   /* grid-column:1/-1 -- unpositioned, this would auto-flow into row 1's
      empty third cell instead of a row of its own, undoing the whole point.
-     flex-wrap so a long run of badges wraps onto a third line rather than
-     overflowing the row's width, same as any other text would. */
-  .flags{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
-  .kind{font:400 10px/1 var(--mono);letter-spacing:.1em;color:var(--faint);
-    text-transform:uppercase}
+     A hairline top border reads as a division within the row rather than a
+     start of a new one, and separates two visual languages that used to run
+     together as eight identical bordered boxes: badges (state you glance
+     at -- cc/eyes/integrity/kind) stay as small tinted chips, acts (things
+     you click -- log/refetch/pause) drop the box entirely and read as a
+     flat text toolbar, same idea .kind already used. flex-wrap on both
+     groups so a long run wraps onto its own line rather than overflowing. */
+  .flags{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;
+    gap:10px;margin-top:9px;padding-top:9px;border-top:1px solid var(--rule)}
+  .badges{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+  .acts{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-left:auto}
+  .kind{font:600 9.5px/1 var(--mono);letter-spacing:.1em;color:var(--faint);
+    text-transform:uppercase;display:flex;align-items:center;gap:5px}
+  .kind::before{content:'';width:5px;height:5px;border-radius:50%;
+    background:currentColor;flex:none}
   .kind.now{color:var(--brass)}
   /* only appears when more than this device is on the item */
   .eyes{font:400 10px/1 var(--mono);letter-spacing:.08em;color:var(--live);
-    border:1px solid rgba(127,169,138,.35);border-radius:3px;padding:3px 5px;
-    white-space:nowrap;display:none}
+    background:rgba(127,169,138,.08);border:1px solid rgba(127,169,138,.35);
+    border-radius:3px;padding:3px 5px;white-space:nowrap;display:none}
   .eyes.on{display:inline-block}
-  .cc{font:500 9.5px/1 var(--mono);letter-spacing:.1em;color:var(--faint);
-    border:1px solid var(--rule);border-radius:3px;padding:3px 4px;display:none}
+  .cc{font:600 9px/1 var(--mono);letter-spacing:.09em;color:var(--faint);
+    background:var(--raise);border:1px solid var(--rule);border-radius:3px;
+    padding:3px 5px;display:none}
   .cc.on{display:inline-block}
-  .cc.found{color:var(--brass);border-color:rgba(198,162,101,.4)}
-  .cc.rough{color:var(--warn);border-color:rgba(192,138,74,.4)}
+  .cc.found{color:var(--brass);background:rgba(198,162,101,.08);
+    border-color:rgba(198,162,101,.4)}
+  .cc.rough{color:var(--warn);background:rgba(192,138,74,.08);
+    border-color:rgba(192,138,74,.4)}
   /* Only shown for a verdict worth acting on -- see paint(). A clean file or
      one still mid-scan says nothing here, same as .eyes when no one else is
      watching. */
-  .integrity{font:500 9.5px/1 var(--mono);letter-spacing:.1em;
-    text-transform:uppercase;color:var(--bad);
-    border:1px solid rgba(196,117,106,.4);border-radius:3px;padding:3px 4px;
+  .integrity{font:600 9px/1 var(--mono);letter-spacing:.09em;
+    text-transform:uppercase;color:var(--bad);background:rgba(196,117,106,.08);
+    border:1px solid rgba(196,117,106,.4);border-radius:3px;padding:3px 5px;
     display:none;cursor:help}
   .integrity.on{display:inline-block}
-  /* Pushed to the end of the (now full-width) flags row with margin-left:auto
-     rather than a fixed-width column -- the one part of the row that should
-     always read as the last word on it. */
-  .stat{font:400 11.5px/1 var(--mono);color:var(--dim);margin-left:auto;
+  /* Set off from the acts with its own divider so it still reads as the
+     last word on the row, the way margin-left:auto alone used to signal
+     before acts itself started claiming that spot. */
+  .stat{font:400 11.5px/1 var(--mono);color:var(--dim);
+    margin-left:14px;padding-left:14px;border-left:1px solid var(--rule);
     font-variant-numeric:tabular-nums;text-align:right}
   .stat.ready{color:var(--live)}
   .stat.bad{color:var(--bad)}
@@ -7429,7 +7484,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     /* flags already wraps and sits on its own full-width row above this
        breakpoint -- narrower still just tightens what's already correct,
        nothing left here needs its own layout. */
-    li.row{grid-template-columns:20px 1fr 20px;gap:6px 9px}
+    li.row{grid-template-columns:20px 1fr 20px;gap:0 9px}
   }
   @media (prefers-reduced-motion:reduce){
     *{animation:none!important;transition:none!important}
@@ -7846,7 +7901,8 @@ async function runFind() {
     if (res.available) row.addEventListener('click', async () => {
       row.disabled = true;
       title.textContent = 'Adding: ' + res.title;
-      const add = await api('/add', {links: res.magnet, client: clientId});
+      const add = await api('/add', {links: res.magnet, client: clientId,
+                                      title: res.title, year: res.year});
       (add.added || []).forEach(id => { if (!order.includes(id)) order.push(id); });
       box.hidden = true; box.textContent = '';
       ta.value = ''; grow();
@@ -7934,7 +7990,8 @@ function pickCard(res) {
   if (!res.queued) card.addEventListener('click', async () => {
     card.disabled = true;
     meta.textContent = 'adding…';
-    const add = await api('/add', {links: res.magnet, client: clientId});
+    const add = await api('/add', {links: res.magnet, client: clientId,
+                                    title: res.title, year: res.year});
     (add.added || []).forEach(id => { if (!order.includes(id)) order.push(id); });
     meta.textContent = 'added to your queue';
     card.classList.add('toobig');
@@ -8322,16 +8379,19 @@ function makeRow(id) {
   li.innerHTML = '<span class="n"></span>' +
     '<span class="body"><span class="title"></span>' +
     '<span class="track"><i></i></span><span class="note"></span></span>' +
-    '<span class="flags"><span class="cc"></span><span class="eyes"></span>' +
-    '<span class="integrity" title=""></span>' +
+    '<button class="kill" type="button" aria-label="Remove">&times;</button>' +
+    '<span class="flags">' +
+    '<span class="badges"><span class="cc"></span><span class="eyes"></span>' +
+    '<span class="integrity" title=""></span><span class="kind"></span></span>' +
+    '<span class="acts">' +
     '<button class="logbtn" type="button" hidden aria-label="Show this item\'s log">log</button>' +
     '<button class="moreBtn" type="button" hidden aria-label="More options">&#8942;</button>' +
     '<button class="refetchbtn" type="button" ' +
       'aria-label="Discard this copy and download it again from scratch" ' +
       'title="Discard this copy and download it again from scratch">refetch</button>' +
     '<button class="pausebtn" type="button" hidden>pause</button>' +
-    '<span class="kind"></span><span class="stat"></span></span>' +
-    '<button class="kill" type="button" aria-label="Remove">&times;</button>' +
+    '</span>' +
+    '<span class="stat"></span></span>' +
     '<div class="logpanel" hidden></div>' +
     '<div class="morepanel" hidden></div>';
   const el = {li, n: li.querySelector('.n'), title: li.querySelector('.title'),

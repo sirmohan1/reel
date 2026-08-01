@@ -616,6 +616,36 @@ class TestRestore(Base):
         self.assertIsNone(job["wt_index"])
         self.assertEqual(job["wt_files"], 0)
 
+    def test_a_tmdb_title_survives_a_restart(self):
+        # Without this, a movie added from the catalogue would come back from
+        # every restart wearing the raw scene release name again -- the same
+        # class of bug the pack-pin fix above closes, just for the title
+        # instead of the file index.
+        wt = os.path.join(self.dl, "tmdbtitle_wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".reel.json"), "w") as f:
+            json.dump({"magnet": "magnet:?xt=urn:btih:" + "c" * 40,
+                       "index": 0, "title": "Disclosure Day (2026)",
+                       "total": 100, "files": 1, "title_locked": True}, f)
+        self.m.JOBS.clear()
+        self.m.restore()
+        self.assertTrue(self.m.JOBS["tmdbtitle"]["title_locked"])
+        self.assertEqual(self.m.JOBS["tmdbtitle"]["title"], "Disclosure Day (2026)")
+
+    def test_a_sidecar_without_title_locked_defaults_to_unlocked(self):
+        # A sidecar written before this feature shipped has no such key --
+        # must default to False (the old, already-accepted behaviour) rather
+        # than crash or, worse, lock a title that was never actually known.
+        wt = os.path.join(self.dl, "notlocked_wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".reel.json"), "w") as f:
+            json.dump({"magnet": "magnet:?xt=urn:btih:" + "d" * 40,
+                       "index": 0, "title": "Some.Scene.Release.2026",
+                       "total": 100, "files": 1}, f)
+        self.m.JOBS.clear()
+        self.m.restore()
+        self.assertFalse(self.m.JOBS["notlocked"]["title_locked"])
+
     # ---- scratch / dead-weight directories --------------------------------
 
     def test_scratch_directories_are_always_swept(self):
@@ -1493,6 +1523,21 @@ class TestPacks(Base):
         # by new_job() the same way anything else is, and starts normally.
         j = self.job(source="torrent", magnet="m")
         self.assertTrue(j["auto"])
+
+    def test_siblings_keep_their_own_filename_even_from_a_tmdb_parent(self):
+        # A TV pack found via the catalogue locks the parent's title to the
+        # show's TMDB name, but every sibling still needs its own episode
+        # number -- "Show Name" repeated on every row would be strictly less
+        # useful than the scene filename it would replace. title_locked is
+        # never passed through fan_out(), so this is the default, not a
+        # special case.
+        parent = self.job(source="torrent", magnet="magnet:?xt=urn:btih:" + "e" * 40,
+                          title="Some Show", title_locked=True)
+        files = [self.f(0, "Show.S01E01.mkv", 2.0), self.f(1, "Show.S01E02.mkv", 2.0)]
+        made = self.m.fan_out(parent, parent["magnet"], files, files[1:])
+        sib = self.m.JOBS[made[0]]
+        self.assertFalse(sib["title_locked"])
+        self.assertEqual(sib["title"], "Show.S01E02")
 
     def test_a_sibling_never_fans_out_again(self):
         # Pinned jobs must not re-expand, or a three-file pack breeds one item
@@ -2414,6 +2459,18 @@ class TestRefetch(Base):
         self.assertEqual(back["magnet"], magnet)
         self.assertEqual(back["wt_index"], 3)
         self.assertEqual(back["title"], j["title"])
+
+    def test_a_tmdb_title_survives_a_refetch(self):
+        # Without this, refetching a movie added from the catalogue would
+        # rebuild the row via new_job() with title_locked defaulted back to
+        # False, and the next run_torrent would overwrite the TMDB title
+        # with the torrent's own scene release name -- the fix working on
+        # first add but silently regressing on the very next refetch.
+        j = self.finished(title="Disclosure Day (2026)", title_locked=True)
+        jid = j["id"]
+        self.m.refetch_job(jid)
+        self.assertTrue(self.m.JOBS[jid]["title_locked"])
+        self.assertEqual(self.m.JOBS[jid]["title"], "Disclosure Day (2026)")
 
     def test_a_drive_job_keeps_its_drive_id(self):
         j = self.job(drive_id="1AbCdEfGhIjKlMnOpQrStUvWxYz0123456")

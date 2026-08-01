@@ -3557,6 +3557,10 @@ def new_job(drive_id, jid=None, **extra):
            "audio_tracks": [], "audio_default": 0,
            "caps": None, "vcodec": None, "vpix": None, "play_key": None,
            "live_proc": None,
+           # Seconds into the film that the live stream currently begins at.
+           # The player's own clock restarts at zero each time the stream is
+           # rebuilt, so this is what turns it back into a real position.
+           "live_offset": 0.0,
            "subs_status": None, "subs_source": None, "subs_lang": None,
            "subs_note": "", "subs_name": "", "subs_cues": None,
            "subs_fit": None, "subs_exact": False, "subs_why": "",
@@ -3609,6 +3613,7 @@ def public(job):
                            if job.get("live_file") and os.path.exists(job["live_file"]) else None),
             "live_done": job.get("live_done"),
             "live_note": job.get("live_note", ""),
+            "live_offset": job.get("live_offset") or 0.0,
             # False once we know the index is at the end of the file. None on a
             # job restored from disk, which never ran a live phase -- reporting
             # False there made an unrelated file look live-capable.
@@ -6771,7 +6776,14 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
     job["live_file"] = out
     job["live_kind"] = job["kind"]
     job["wt_ranges"] = False
-    job["wt_direct"] = False
+    # Only for a backend read over http. This fallback exists because that
+    # endpoint could not be read directly, which says nothing about a file on
+    # disk: a local backend's bytes are still there and still answer ranges,
+    # so clearing this would take seeking away from an item that has it --
+    # which is exactly what made a still-downloading torrent seekable or not
+    # depending on which live path it happened to take.
+    if not job.get("lt_file"):
+        job["wt_direct"] = False
 
     def watch():
         try:
@@ -6817,12 +6829,70 @@ def follow_pipe_progress(job, out_dir):
         time.sleep(1.0)
 
 
+def live_seek(job, at):
+    """Restart a live item's stream so it begins at `at` seconds. -> started?
+
+    A fragmented mp4 has no index to seek against -- that absence is exactly
+    what lets it start playing before the file is complete -- so the player
+    cannot seek one however much of it has arrived. The way to move a live
+    viewer is to build them a different stream.
+
+    ffmpeg reads reel's own /stream/ route rather than the file on disk, so
+    its reads pass through the range handler and pull the pieces under them on
+    the way (ensure_range). Pointing it straight at the file would have it
+    read preallocated zeros wherever the download has not reached.
+    """
+    if not job.get("lt_file") and not job.get("path"):
+        return False                      # nothing with random access to read
+    try:
+        at = max(0.0, float(at))
+    except (TypeError, ValueError):
+        return False
+    dur = job.get("duration") or 0
+    if dur and at > max(0.0, dur - 2):
+        return False                      # past the end; nothing to show
+    # Stop the encode that is running, and the feeder pushing into it. Its
+    # output file is replaced rather than appended to, so a viewer who is
+    # still reading the old one gets a clean end instead of two streams
+    # interleaved.
+    for p in (job.get("live_proc"), job.get("compat_proc")):
+        if p is not None:
+            try:
+                if p.poll() is None:
+                    p.kill()
+            except Exception:
+                pass
+    old_file = job.get("live_file")
+    job["live_ready"] = False
+    job["live_done"] = False
+    job["live_file"] = None
+    if old_file and os.path.exists(old_file):
+        try:
+            os.remove(old_file)
+        except OSError:
+            pass
+    url = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
+    start_live_from_url(job, url, job.get("kind", "video"),
+                        vcodec=job.get("vcodec"), pix=job.get("vpix"),
+                        start_at=at)
+    job["live_offset"] = at
+    record(job, "live stream restarted at %d:%02d" % (int(at) // 60, int(at) % 60))
+    return True
+
+
 def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
-                        pix=None):
-    """Same fragmented output as the Drive path, but reading a seekable URL."""
+                        pix=None, start_at=0.0):
+    """Same fragmented output as the Drive path, but reading a seekable URL.
+
+    start_at re-opens the stream partway in. A fragmented mp4 cannot be seeked
+    by the player -- there is no index to seek against, which is the whole
+    reason it can start before the file exists -- so seeking a live item means
+    producing a new stream that begins where the viewer asked. See live_seek().
+    """
     if kind == "audio":
         out = os.path.join(DL, job["id"] + ".live.mp3")
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+               *(["-ss", "%.3f" % start_at] if start_at else []),
                "-i", url, "-vn", "-c:a", "libmp3lame", "-q:a", "4",
                "-flush_packets", "1", "-f", "mp3", out]
     else:
@@ -6843,6 +6913,10 @@ def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
             job["audio_default"] = 0
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                "-progress", "pipe:1", "-nostats",
+               # Before -i on purpose: input seeking jumps to the keyframe
+               # rather than decoding everything up to it, which for two hours
+               # in is the difference between seconds and minutes.
+               *(["-ss", "%.3f" % start_at] if start_at else []),
                "-i", url, *vfilter, *vargs, "-map", "0:v:0", *amaps, *ameta,
                "-c:a", "aac", "-ac", "2", "-f", "mp4",
                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
@@ -7455,6 +7529,15 @@ class H(http.server.BaseHTTPRequestHandler):
         elif p == "/resume":
             self._json(200, {"ok": resume_job(body.get("id"))})
 
+        elif p == "/liveseek":
+            # A live item cannot be seeked by the player, so it is seeked by
+            # rebuilding the stream from where the viewer asked. See live_seek.
+            with LOCK:
+                job = JOBS.get(body.get("id"))
+            ok = bool(job) and live_seek(job, body.get("at"))
+            self._json(200, {"ok": ok,
+                             "offset": (job or {}).get("live_offset", 0.0)})
+
         elif p == "/playing":
             jid = body.get("id")
             try:
@@ -8033,6 +8116,23 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     color:var(--faint);background:rgba(16,18,20,.82);border:1px solid var(--rule);
     border-radius:3px;padding:5px 8px}
 
+  /* Live seek bar. Deliberately not styled like the native scrubber: it does
+     something different -- it rebuilds the stream rather than moving within
+     one -- and a control that looks identical but pauses for a few seconds
+     would read as the player being broken. */
+  .liveseek{display:flex;align-items:center;gap:10px;margin-top:8px}
+  .lsbar{position:relative;flex:1;height:16px;cursor:pointer;
+    display:flex;align-items:center}
+  .lsbar::before{content:'';position:absolute;left:0;right:0;height:3px;
+    background:var(--rule);border-radius:2px}
+  .lsbar i{position:absolute;left:0;height:3px;background:var(--dim);
+    border-radius:2px;width:0}
+  .lsbar b{position:absolute;width:2px;height:11px;background:var(--brass);
+    border-radius:1px;left:0}
+  .lsbar:hover i{background:var(--brass)}
+  .lspos{font:400 11px/1 var(--mono);color:var(--faint);
+    font-variant-numeric:tabular-nums;min-width:82px;text-align:right}
+
   /* transport */
   .transport{display:flex;align-items:center;gap:8px;margin-top:12px}
   .transport button{height:32px;padding:0 12px;font-size:12px}
@@ -8308,6 +8408,14 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     </div>
     <video id="v" controls playsinline hidden></video>
   </div>
+  <!-- A live item plays a fragmented stream, which has no index for the
+       player's own scrubber to seek against. This one seeks by asking the
+       server to rebuild the stream from the chosen point, so it is shown only
+       while that is the case. -->
+  <div class="liveseek" id="liveseek" hidden>
+    <div class="lsbar" id="lsbar"><i id="lsfill"></i><b id="lshead"></b></div>
+    <span class="lspos" id="lspos">0:00</span>
+  </div>
 
   <div class="transport">
     <button id="prev" disabled>Previous</button>
@@ -8402,6 +8510,7 @@ function reportPlaying(force) {
                    client: clientId}).catch(() => {});
 }
 v.addEventListener('timeupdate', () => reportPlaying(false));
+v.addEventListener('timeupdate', () => liveBar(byId(order[cur])));
 // 'done' plays the seekable file; 'live' plays the fragments as they're written
 const canPlay = j => !!j && (j.status === 'done' || j.status === 'streaming' || j.live);
 
@@ -8916,6 +9025,60 @@ $('subminus').addEventListener('click', () => nudgeSubs(-SUB_STEP));
 $('subplus').addEventListener('click', () => nudgeSubs(SUB_STEP));
 $('subval').addEventListener('click', () => nudgeSubs(-subShift));   // back to zero
 
+/* live seeking --------------------------------------------------------------
+   The player cannot seek a fragmented stream: there is no index to seek
+   against, which is precisely what lets it start before the download has
+   finished. So this asks the server to build a stream that begins at the
+   chosen point, and reloads. The element's own clock restarts at zero every
+   time, so liveOffset is what turns it back into a position in the film. */
+let liveOffset = 0, liveSeeking = false;
+
+// Named to not collide with clock() further down, which formats a duration
+// for the health readout rather than a position on a timeline.
+const hms = t => {
+  t = Math.max(0, Math.floor(t));
+  const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0')
+            : String(m)) + ':' + String(s).padStart(2, '0');
+};
+
+function liveBar(j) {
+  // Shown only when the stream really is unseekable and its length is known:
+  // a bar that cannot say where it is pointing is worse than none.
+  const on = !!(j && j.live && !j.seekable && j.duration);
+  $('liveseek').hidden = !on;
+  if (!on) return;
+  liveOffset = j.live_offset || 0;
+  const at = liveOffset + (v.currentTime || 0);
+  const frac = Math.min(1, at / j.duration);
+  $('lsfill').style.width = (frac * 100) + '%';
+  $('lshead').style.left = 'calc(' + (frac * 100) + '% - 1px)';
+  $('lspos').textContent = hms(at) + ' / ' + hms(j.duration);
+}
+
+$('lsbar').addEventListener('click', async ev => {
+  const j = byId(order[cur]);
+  if (!j || !j.duration || liveSeeking) return;
+  const box = ev.currentTarget.getBoundingClientRect();
+  const want = Math.max(0, Math.min(1, (ev.clientX - box.left) / box.width)) * j.duration;
+  liveSeeking = true;
+  $('lspos').textContent = 'seeking to ' + hms(want) + '…';
+  try {
+    const r = await api('/liveseek', {id: j.id, at: want});
+    if (!r.ok) { $('lspos').textContent = 'cannot seek there'; return; }
+    liveOffset = r.offset || want;
+    // The stream is a new file with the same name, so the query string is what
+    // stops the browser serving the old one back out of its cache.
+    v.src = '/live/' + j.id + '?t=' + Date.now();
+    v.load();
+    await v.play().catch(() => {});
+  } catch (e) {
+    $('lspos').textContent = 'seek failed';
+  } finally {
+    liveSeeking = false;
+  }
+});
+
 /* playback ---------------------------------------------------------------- */
 function setFlag(j) {
   if (live) { flag.textContent = 'live \u00b7 still downloading'; flag.style.display = 'block'; }
@@ -9377,6 +9540,7 @@ function paint() {
   }
   $('prev').disabled = !ready(-1);
   $('next').disabled = !ready(1);
+  liveBar(byId(order[cur]));
 }
 
 async function remove(id) {

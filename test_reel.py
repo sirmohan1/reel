@@ -1021,6 +1021,65 @@ class TestLibtorrentBackend(Base):
         finally:
             proc.kill(); j["cancel"].set()
 
+    # ---- staying seekable whichever live path is taken -------------------
+
+    def _pipe_fallback(self, job):
+        """Drive the real run_torrent_pipe with the two subprocesses stubbed,
+        so the job-state changes under test are the shipped ones rather than a
+        copy of them written into the test."""
+        import types
+        class FakeProc:
+            def __init__(self): self.stdout, self.stderr = FakeIO(), FakeIO()
+            def poll(self): return None
+            def kill(self): pass
+            def wait(self, *a, **k): return 0
+        class FakeIO:
+            def close(self): pass
+            def readline(self): return ""
+            def read(self, *a): return ""
+            def __iter__(self): return iter(())
+        real = self.m.subprocess
+        self.m.subprocess = types.SimpleNamespace(
+            Popen=lambda *a, **k: FakeProc(), PIPE=real.PIPE, DEVNULL=real.DEVNULL)
+        self.m.audio_tracks = lambda *a, **k: []
+        self.m.free_port = lambda *a, **k: 8899
+        # It waits up to 20s for enough of a file to probe. Give it one
+        # immediately rather than letting every test in this class sit
+        # through the timeout.
+        big = os.path.join(self.dl, "arrived.mkv")
+        with open(big, "wb") as fh:
+            fh.write(b"\0" * (600 * 1024))
+        self.m.newest_file = lambda d: big
+        self.m.disk_bytes = lambda p: 600 * 1024
+        self.m.codecs_of = lambda p: ("h264", "aac", 1080, False)
+        try:
+            self.m.run_torrent_pipe(job, "magnet:?xt=urn:btih:" + "a" * 40,
+                                    {"index": 0, "name": "f.mkv"}, self.dl)
+        finally:
+            self.m.subprocess = real
+
+    def test_a_local_backends_job_stays_seekable_through_the_pipe_fallback(self):
+        # The bug this closes: whether a still-downloading torrent could be
+        # seeked depended on which live path it happened to take. The pipe
+        # fallback cleared wt_direct because *its own* http endpoint was
+        # unreadable -- which says nothing about a file on disk that still
+        # answers ranges perfectly well.
+        j = self.job()
+        j["lt_file"] = os.path.join(self.dl, "film.mkv")
+        j["wt_direct"] = True
+        self._pipe_fallback(j)
+        self.assertTrue(j["wt_direct"], "a local file is still range-readable")
+        self.assertTrue(self.m.public(j)["seekable"])
+
+    def test_a_remote_backends_job_still_loses_seeking_there(self):
+        # webtorrent's case is unchanged: no local file, and the endpoint this
+        # fallback exists to replace was the only way to read it.
+        j = self.job()
+        j["wt_direct"] = True
+        self._pipe_fallback(j)
+        self.assertFalse(j["wt_direct"])
+        self.assertFalse(self.m.public(j)["seekable"])
+
     # ---- ensure_range: the reason for the whole migration ----------------
 
     def test_webtorrent_admits_it_cannot_prioritise(self):

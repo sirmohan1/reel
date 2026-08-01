@@ -92,6 +92,13 @@ WT_SERVER_WAIT = 45             # seconds to wait for its http server to appear
 # really an empty swarm.
 WT_DATA_WAIT = 90
 WT_DATA_MIN = 2 * 1024 * 1024
+# How long a read will wait for the pieces under it to be fetched on demand
+# (libtorrent only -- see LibtorrentBackend.ensure_range). Measured against a
+# real swarm, an arbitrary seek landed in about 1.4s with nothing competing
+# and under 2s at worst, so this is generous rather than typical: long enough
+# to cover a thin swarm, short enough that a hopeless read fails visibly
+# instead of hanging the player.
+LT_SEEK_WAIT = 20
 # When the first probe learns nothing, how long to keep waiting and how much of
 # the file to want before asking again. Not a format threshold -- the first 4 MB
 # of that mp4 identifies itself perfectly once those bytes exist. The problem is
@@ -5553,6 +5560,17 @@ class WebTorrentBackend:
         return tail(ANSI.sub(" ", "".join(sum((list(b) for b in bufs), []))),
                     lines, chars)
 
+    def ensure_range(self, job, offset, length, timeout=LT_SEEK_WAIT):
+        """No piece control: webtorrent's cli exposes none. A read past what
+        has arrived can only wait for sequential fill to reach it, which is
+        why a still-downloading item is not seekable on this backend.
+
+        True rather than False, because the caller is asking "may I read
+        this" -- and the answer here is "read it and find out", the same
+        behaviour as before the seam existed.
+        """
+        return True
+
 
 class _TorrentProc:
     """A libtorrent handle wearing enough of Popen's shape to pass for one.
@@ -5766,6 +5784,61 @@ class LibtorrentBackend:
 
     def recent_output(self, job, lines=4, chars=200):
         return (job.get("wt_tail") or "")[:chars]
+
+    # -- seeking ----------------------------------------------------------
+
+    def ensure_range(self, job, offset, length, timeout=LT_SEEK_WAIT):
+        """Fetch the bytes under a read before it is served. -> did they arrive.
+
+        This is the whole reason for the backend: webtorrent's cli can be told
+        which file to take and nothing else, so a read past the downloaded
+        prefix could only wait for sequential fill to reach it. Here the pieces
+        holding those bytes are asked for by name.
+
+        Sequential fill is suspended while waiting rather than left running.
+        Measured against a real swarm, a deadline competing with the fill took
+        8.9s median where the same request alone took 1.4s -- the fill is not
+        idle bandwidth, it is a rival bidding for the same peers.
+        """
+        h = job.get("_lt")
+        if not (h is not None and h.is_valid()):
+            return False
+        import libtorrent as lt
+        try:
+            ti = h.torrent_file()
+            if ti is None:
+                return False
+            idx = int(job.get("wt_index") or 0)
+            length = max(1, int(length))
+            first = ti.map_file(idx, max(0, int(offset)), 1).piece
+            last = ti.map_file(idx, max(0, int(offset) + length - 1), 1).piece
+            first, last = max(0, first), min(ti.num_pieces() - 1, last)
+        except Exception:
+            return False
+        want = range(first, last + 1)
+        if all(h.have_piece(p) for p in want):
+            return True                      # already here; nothing to ask for
+        try:
+            h.unset_flags(lt.torrent_flags.sequential_download)
+            for p in want:
+                h.piece_priority(p, 7)
+                h.set_piece_deadline(p, 0)
+            deadline = time.time() + timeout
+            while time.time() < deadline and not job["cancel"].is_set():
+                if all(h.have_piece(p) for p in want):
+                    return True
+                time.sleep(0.05)
+            return False
+        except Exception:
+            return False
+        finally:
+            # Back to filling forward, so the part being watched keeps
+            # growing once the viewer has what they jumped to.
+            try:
+                h.set_flags(lt.torrent_flags.sequential_download)
+                h.clear_piece_deadlines()
+            except Exception:
+                pass
 
 
 TORRENT_BACKENDS = {"webtorrent": WebTorrentBackend,

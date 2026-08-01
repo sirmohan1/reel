@@ -714,6 +714,68 @@ class TestLibtorrentBackend(Base):
         finally:
             proc.kill()
 
+    # ---- ensure_range: the reason for the whole migration ----------------
+
+    def test_webtorrent_admits_it_cannot_prioritise(self):
+        # True means "read it and find out" -- the behaviour that existed
+        # before the seam, not a claim that the bytes are there.
+        bk = self.m.WebTorrentBackend()
+        self.assertTrue(bk.ensure_range(self.job(), 5_000_000, 65536))
+
+    def test_a_job_with_no_handle_cannot_fetch_a_range(self):
+        bk = self.m.LibtorrentBackend()
+        self.assertFalse(bk.ensure_range(self.job(), 0, 1024))
+
+    @needs_libtorrent
+    def test_bytes_already_held_need_no_fetching(self):
+        # The common case -- reading inside the downloaded prefix must not
+        # disturb the sequential fill or wait on anything.
+        import libtorrent as lt
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), self.dl, {"index": 0}, 0)
+        try:
+            deadline = time.time() + 10
+            h = j["_lt"]
+            while time.time() < deadline and not h.status().is_seeding:
+                time.sleep(0.05)
+            self.assertTrue(h.status().is_seeding, "local torrent should verify")
+            t = time.time()
+            self.assertTrue(bk.ensure_range(j, 0, 1024))
+            self.assertLess(time.time() - t, 1.0)     # immediate, not a wait
+        finally:
+            proc.kill(); j["cancel"].set()
+
+    @needs_libtorrent
+    def test_an_impossible_range_gives_up_rather_than_hanging_the_player(self):
+        import libtorrent as lt
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), self.dl, {"index": 0}, 0)
+        try:
+            j["cancel"].set()            # nothing will ever arrive now
+            t = time.time()
+            got = bk.ensure_range(j, 0, 1024, timeout=2)
+            self.assertLess(time.time() - t, 3.0)
+        finally:
+            proc.kill()
+
+    @needs_libtorrent
+    def test_sequential_fill_is_restored_after_a_seek(self):
+        # It is suspended while waiting -- measured, the fill competes with
+        # the deadline for the same peers -- and must come back afterwards or
+        # the part being watched stops growing.
+        import libtorrent as lt
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        proc = bk.start(j, self.torrent_file(), self.dl, {"index": 0}, 0)
+        try:
+            bk.ensure_range(j, 0, 1024, timeout=1)
+            self.assertTrue(j["_lt"].status().flags
+                            & lt.torrent_flags.sequential_download)
+        finally:
+            proc.kill(); j["cancel"].set()
+
     @needs_libtorrent
     def test_a_real_handle_reports_peers_without_scraping_a_terminal(self):
         bk = self.m.LibtorrentBackend()

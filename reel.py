@@ -3514,14 +3514,6 @@ def new_job(drive_id, jid=None, **extra):
            # scanning an entire existing library on every restart is a cost
            # nobody asked to pay just for reopening the app.
            "integrity": None, "integrity_hits": 0,
-           # Measured once per finished file by check_loudness(); all three
-           # stay None for anything never measured (still downloading,
-           # restored from disk, silent, or unreadable), which the player
-           # reads as "play this one as it is".
-           "loudness": None, "loudness_peak": None, "gain_db": None,
-           # Guards against a second measurement being started for a title
-           # already being measured -- /playing fires every few seconds.
-           "loudness_pending": False,
            # False for a pack sibling: the scheduler will never start or
            # prefetch it on its own, only /start (a click) can. The episode
            # actually chosen when the series was added keeps the normal
@@ -3625,11 +3617,7 @@ def public(job):
             "seekable": bool(job.get("path") or job.get("wt_direct")),
             "codecs": job.get("wt_codecs", ""),
             "integrity": job.get("integrity"),
-            "integrity_hits": job.get("integrity_hits") or 0,
-            # None until measured -- the player applies no correction rather
-            # than a default one, so an unmeasured title is never altered.
-            "gain_db": job.get("gain_db"),
-            "loudness": job.get("loudness")}
+            "integrity_hits": job.get("integrity_hits") or 0}
 
 
 # ---- restore across restarts -------------------------------------------------
@@ -3729,10 +3717,6 @@ def restore():
                             title=title, audio_tracks=atracks,
                             audio_default=guess_audio_default(atracks),
                             **extra, kind=kind)
-        # Cache only: a measurement already paid for is free to reapply, but
-        # reopening the app must not start a decode pass over every file in
-        # the library. Anything still unmeasured is picked up on first play.
-        check_loudness(JOBS[jid], measure=False)
 
     # Second pass for subtitle sidecars, now that every job is known. One whose
     # job didn't come back is an orphan: it can never be reached, and leaving it
@@ -4252,204 +4236,6 @@ def scan_for_corruption(path, timeout=None):
     if hits == 0 and r.returncode != 0:
         return None
     return hits
-
-
-# Where a normalised title should land, in LUFS (EBU R128 integrated
-# loudness). Film mixes run quiet on average with peaks near full scale, so a
-# target chosen up at streaming levels (-14) would ask for a boost on almost
-# everything and spend the whole film against the limiter. -20 sits between a
-# cinema mix and a TV one: most titles move a few dB, few move far.
-LOUDNESS_TARGET = -20.0
-# How far a title may be moved to reach it. Attenuation is free, so it gets
-# the wider allowance; a boost has to be caught by the player's limiter when
-# it runs a peak into the ceiling, which is audible if it happens constantly.
-LOUDNESS_MAX_CUT, LOUDNESS_MAX_BOOST = -12.0, 6.0
-# A boost has to fit somewhere, and often there is nowhere for it to go: real
-# masters are routinely already over full scale, the first film measured here
-# among them at +1.6 dBTP. Boosting on top of that asks the player's limiter
-# to work through the entire film rather than catch the odd peak. So a boost
-# may use whatever headroom exists below the ceiling, plus a few dB the
-# limiter can absorb before limiting becomes the normal state instead of the
-# exception. Attenuation is unaffected -- it always fits.
-LOUDNESS_CEILING = 0.0
-LOUDNESS_LIMITER_ASSIST = 3.0
-# loudnorm prints this block at info level (not error), hence the separate
-# run from scan_for_corruption's -v error pass.
-LOUDNESS_RE = re.compile(r'"(input_i|input_tp)"\s*:\s*"(-?(?:\d+(?:\.\d+)?|inf))"')
-
-
-def measure_loudness(path, timeout=None):
-    """Integrated loudness and true peak of a file's first audio track, in
-    LUFS and dBTP, as {"lufs": float, "peak": float} -- or None if it could
-    not be measured, which is not the same as "already at target" and must
-    never be treated as a measurement of zero.
-
-    Audio only (-vn is implied by mapping one audio stream): the video is the
-    expensive half to decode and nothing here needs it, so this costs a
-    fraction of the integrity scan's full pass over the same file even though
-    both walk it end to end.
-
-    Silence measures as -inf and is reported as unmeasurable rather than as a
-    number: a title with no audio has no loudness to correct, and letting -inf
-    through would ask the player for infinite gain.
-    """
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-nostdin", "-hide_banner", "-i", path,
-             "-map", "0:a:0", "-af", "loudnorm=print_format=json",
-             "-f", "null", "-"],
-            capture_output=True, text=True, timeout=timeout)
-    except Exception:
-        return None
-    got = dict(LOUDNESS_RE.findall(r.stderr or ""))
-    try:
-        lufs, peak = float(got["input_i"]), float(got["input_tp"])
-    except (KeyError, ValueError, OverflowError):
-        return None
-    if not (math.isfinite(lufs) and math.isfinite(peak)):
-        return None
-    return {"lufs": round(lufs, 2), "peak": round(peak, 2)}
-
-
-def loudness_gain(lufs, peak=None):
-    """The correction to apply, in dB, clamped to what is safe to ask for.
-
-    Kept here rather than in the player so the target and its limits are one
-    decision in one place, testable without a browser.
-
-    peak is the measured true peak in dBTP. Without one the clamps alone
-    decide, which is the old behaviour and still correct for attenuation;
-    with one, a boost is additionally held to what the file has room for.
-    """
-    if lufs is None:
-        return None
-    want = LOUDNESS_TARGET - lufs
-    if want > 0 and peak is not None:
-        want = min(want, max(0.0, LOUDNESS_CEILING - peak) + LOUDNESS_LIMITER_ASSIST)
-    return round(max(LOUDNESS_MAX_CUT, min(LOUDNESS_MAX_BOOST, want)), 2)
-
-
-LOUDNESS_LOCK = threading.Lock()
-
-
-def loudness_key(path):
-    """Identifies a file for the cache below: name and size.
-
-    Not a content hash -- hashing 9 GB to save a measurement that reads the
-    same 9 GB trades one long pass for another. reel's own filenames already
-    carry the job id, and size is what catches the case that actually
-    matters: a row refetched, where the name is reused and the bytes are not.
-    """
-    try:
-        return "%s:%d" % (os.path.basename(path), os.path.getsize(path))
-    except OSError:
-        return None
-
-
-def _loudness_path():
-    # Computed per call, never cached at import: CACHE_DIR is reassigned by
-    # the tests, and a module-level constant would freeze the real path into
-    # them (and once wrote test fixtures into the live cache -- see
-    # load_cached_trackers, which learned this the same way).
-    return os.path.join(CACHE_DIR, "loudness.json")
-
-
-def load_loudness_cache():
-    try:
-        with open(_loudness_path(), encoding="utf-8") as f:
-            data = _json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def cached_loudness(path):
-    """A previous measurement of this exact file, if there is one.
-
-    Worth keeping forever rather than on a TTL: a file's loudness is a
-    property of its bytes and cannot change while it is the same file. This
-    is what makes the measurement a once-ever cost instead of a per-restart
-    one -- restore() rebuilds the queue from disk on every start, and
-    re-measuring a whole library each time is exactly the cost the integrity
-    scan deliberately refuses to pay.
-    """
-    key = loudness_key(path)
-    if not key:
-        return None
-    got = load_loudness_cache().get(key)
-    if not isinstance(got, dict):
-        return None
-    try:
-        return {"lufs": float(got["lufs"]), "peak": float(got["peak"])}
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def remember_loudness(path, m):
-    key = loudness_key(path)
-    if not key:
-        return
-    with LOUDNESS_LOCK:
-        data = load_loudness_cache()
-        data[key] = {"lufs": m["lufs"], "peak": m["peak"]}
-        p = _loudness_path()
-        tmp = p + ".part"
-        try:
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                _json.dump(data, f)
-            os.replace(tmp, p)
-        except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-
-
-def apply_loudness(job, m):
-    job["loudness"] = m["lufs"]
-    job["loudness_peak"] = m["peak"]
-    job["gain_db"] = loudness_gain(m["lufs"], m["peak"])
-
-
-def check_loudness(job, path=None, measure=True):
-    """Records the loudness correction on a job, measuring it if it has not
-    been measured before.
-
-    A cache hit applies immediately and costs nothing. A miss goes to a
-    background thread for the same reason check_integrity() does -- a decode
-    pass long enough to matter must never stand between a finished download
-    and playing it. A title played before the measurement lands simply plays
-    unnormalised and picks the correction up mid-playback, which the player
-    watches for rather than requiring a restart.
-
-    measure=False is the restore path: apply what is already known, but never
-    start a pass over a library that was only reopened, not downloaded.
-    """
-    path = path or job.get("path")
-    if not path:
-        return
-    hit = cached_loudness(path)
-    if hit:
-        apply_loudness(job, hit)
-        return
-    if not measure or job.get("loudness_pending"):
-        return
-    job["loudness_pending"] = True
-    def go():
-        try:
-            m = measure_loudness(path)
-            if not m:
-                return       # unmeasurable stays None: no correction claimed
-            remember_loudness(path, m)
-            if job["cancel"].is_set():
-                return       # removed, refetched, or replaced since this started
-            apply_loudness(job, m)
-            record(job, "loudness %.1f LUFS (peak %.1f dBTP) -- playing at %+.1f dB"
-                        % (m["lufs"], m["peak"], job["gain_db"]))
-        finally:
-            job["loudness_pending"] = False
-    threading.Thread(target=go, daemon=True).start()
 
 
 def check_integrity(job, path=None):
@@ -5166,7 +4952,6 @@ def run_job(job):
             sweep_live(job)
         enforce_cache_cap()
         check_integrity(job)
-        check_loudness(job)
     except Exception as e:
         cleanup()
         fail(job, f"{type(e).__name__}: {e}")
@@ -6007,7 +5792,6 @@ def run_torrent(job):
         if done_src:
             start_subs(job, done_src, name=os.path.basename(done_src))
             check_integrity(job, path=done_src)
-            check_loudness(job, path=done_src)
 
     # ---- 5. finalize into a seekable file, if this one needed transcoding ---
     # A direct stream is already seekable -- webtorrent's own ranged proxy,
@@ -6100,7 +5884,6 @@ def adopt_finalized(job, out_dir, src, out):
         sweep_live(job)
     enforce_cache_cap()
     check_integrity(job)
-    check_loudness(job)
 
 
 def finalize_torrent(job, out_dir, chosen):
@@ -7028,13 +6811,6 @@ class H(http.server.BaseHTTPRequestHandler):
                         job["paused"] = False
                     if job.get("hold") and job["status"] == "queued":
                         release(job)           # clicked something not started yet
-            # Outside the lock: a cache miss starts a decode pass, and nothing
-            # else may block on it. Measured on first play rather than on
-            # restore, so a library predating this feature is corrected a
-            # title at a time as it is actually watched, instead of in one
-            # sweep over everything at startup.
-            if job and job.get("status") == "done" and job.get("gain_db") is None:
-                check_loudness(job)
             self._json(200, {"ok": True})
 
         elif p == "/remove":
@@ -7834,7 +7610,6 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
       <span id="subval" role="status" title="Click to reset">0.0s</span>
       <button id="subplus" type="button" aria-label="Show subtitles later">+</button>
     </span>
-    <label class="toggle" title="Even out quiet dialogue and loud action"><input type="checkbox" id="night"> Night mode</label>
     <label class="toggle"><input type="checkbox" id="auto" checked> Play next automatically</label>
   </div>
 
@@ -8433,104 +8208,6 @@ $('subminus').addEventListener('click', () => nudgeSubs(-SUB_STEP));
 $('subplus').addEventListener('click', () => nudgeSubs(SUB_STEP));
 $('subval').addEventListener('click', () => nudgeSubs(-subShift));   // back to zero
 
-/* audio ---------------------------------------------------------------------
-   Two corrections, one graph: source -> gain -> compressor -> speakers.
-
-   gain is the per-title loudness match, measured on the server (see
-   check_loudness) and sent as gain_db. The compressor is night mode -- and
-   even with night mode off it stays in the chain as a safety limiter, because
-   a boosted title can run a peak past full scale and clipping is a far worse
-   artefact than the limiting that prevents it.
-
-   Built lazily, on the first play rather than at load: createMediaElementSource
-   permanently reroutes the element's audio through the graph, so constructing
-   it while the AudioContext is still suspended by autoplay policy would leave
-   a page that looks like it is playing and makes no sound. Everything here
-   degrades to "no correction" rather than to silence if any of it is
-   unavailable, which is why every use is guarded rather than assumed. */
-let actx = null, srcNode = null, gainNode = null, compNode = null;
-let nightOn = false;
-try { nightOn = localStorage.getItem('reel.night') === '1'; } catch (e) {}
-
-function audioReady() {
-  if (actx) return !!gainNode;
-  const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC) return false;                 // no Web Audio: play it untouched
-  try {
-    actx = new AC();
-    srcNode = actx.createMediaElementSource(v);
-    gainNode = actx.createGain();
-    compNode = actx.createDynamicsCompressor();
-    srcNode.connect(gainNode);
-    gainNode.connect(compNode);
-    compNode.connect(actx.destination);
-  } catch (e) {
-    // Leave actx set so this is not retried on every play; a failure here is
-    // permanent for the page (the element can only be captured once).
-    gainNode = null;
-    return false;
-  }
-  applyNight();
-  return true;
-}
-
-function applyNight() {
-  if (!compNode) return;
-  const c = compNode, t = actx.currentTime;
-  if (nightOn) {
-    // Pull the quiet half up by squeezing everything above conversation
-    // level: a low threshold with a soft knee, so dialogue stays intelligible
-    // without the loud passages having to be turned down by hand.
-    c.threshold.setValueAtTime(-30, t);
-    c.knee.setValueAtTime(20, t);
-    c.ratio.setValueAtTime(8, t);
-    c.attack.setValueAtTime(0.003, t);
-    c.release.setValueAtTime(0.30, t);
-  } else {
-    // Transparent except on the peaks that would otherwise clip.
-    c.threshold.setValueAtTime(-1.5, t);
-    c.knee.setValueAtTime(0, t);
-    c.ratio.setValueAtTime(20, t);
-    c.attack.setValueAtTime(0.001, t);
-    c.release.setValueAtTime(0.10, t);
-  }
-}
-
-/* Night mode makes up the level the compression above takes away, so turning
-   it on does not simply sound quieter. Kept separate from the title's own
-   gain_db so the two corrections stay independently reasoned about. */
-function targetGain(j) {
-  const db = (j && typeof j.gain_db === 'number') ? j.gain_db : 0;
-  return Math.pow(10, (db + (nightOn ? 6 : 0)) / 20);
-}
-
-function applyGain(j) {
-  if (!gainNode) return;
-  // Ramped, not stepped: a jump in gain at the moment a title starts is an
-  // audible click.
-  const t = actx.currentTime;
-  gainNode.gain.cancelScheduledValues(t);
-  gainNode.gain.setValueAtTime(gainNode.gain.value, t);
-  gainNode.gain.linearRampToValueAtTime(targetGain(j), t + 0.12);
-}
-
-function refreshAudio() {
-  if (!audioReady()) return;
-  if (actx.state === 'suspended') actx.resume().catch(() => {});
-  applyNight();
-  applyGain(byId(order[cur]));
-}
-// The element only ever plays after a click in this UI, so this doubles as the
-// user gesture that lets a suspended context resume.
-v.addEventListener('play', refreshAudio);
-
-$('night').checked = nightOn;
-$('night').addEventListener('change', e => {
-  nightOn = e.target.checked;
-  try { localStorage.setItem('reel.night', nightOn ? '1' : '0'); } catch (er) {}
-  refreshAudio();
-});
-
 /* playback ---------------------------------------------------------------- */
 function setFlag(j) {
   if (live) { flag.textContent = 'live \u00b7 still downloading'; flag.style.display = 'block'; }
@@ -8554,10 +8231,6 @@ function play(i) {
   v.src = srcOf(j);
   v.load();
   applySubs(j);
-  // Before play() rather than after, so the first moment of audio is already
-  // at the right level -- the ramp in applyGain is there to avoid a click,
-  // not to fade the opening in.
-  if (gainNode) applyGain(j);
   v.play().catch(() => {});
   cue.textContent = j.title;
   cue.classList.remove('none');
@@ -8996,14 +8669,7 @@ function paint() {
   }
   $('prev').disabled = !ready(-1);
   $('next').disabled = !ready(1);
-  // The measurement finishes some minutes after the download does, so it can
-  // land on a title someone is already watching. Applied when it changes
-  // rather than only at play(), so that viewer gets it without restarting.
-  const now = byId(order[cur]);
-  const g = now ? now.gain_db : null;
-  if (gainNode && g !== lastGain) { lastGain = g; applyGain(now); }
 }
-let lastGain;
 
 async function remove(id) {
   const wasPlaying = order[cur] === id;

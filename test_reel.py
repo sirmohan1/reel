@@ -478,6 +478,137 @@ class TestOsdbHash(Base):
 
 
 # --------------------------------------------------------------------------
+class TestCorruptSidecars(Base):
+    """restore() reads files that other programs, filesystems and power cuts
+    can also touch, and main() calls it before the server starts listening --
+    so anything it raised meant the app would not boot at all. Every case here
+    crashed it or was one line away from doing so."""
+
+    MAG = "magnet:?xt=urn:btih:" + "a" * 40
+
+    def wt(self, jid, content, name=".reel.json", binary=False):
+        p = os.path.join(self.dl, jid + "_wt")
+        os.makedirs(p, exist_ok=True)
+        with open(os.path.join(p, name), "wb" if binary else "w") as f:
+            f.write(content)
+        return p
+
+    def restored(self):
+        self.m.JOBS.clear()
+        self.m.restore()
+        return self.m.JOBS
+
+    # ---- shapes json.load will happily hand back ------------------------
+
+    def test_a_json_array_does_not_crash_the_boot(self):
+        # Crashed with AttributeError: 'list' object has no attribute 'get'.
+        self.wt("a1", "[1,2,3]")
+        self.assertEqual(len(self.restored()), 0)
+
+    def test_a_json_string_does_not_crash_the_boot(self):
+        self.wt("a2", '"hello"')
+        self.assertEqual(len(self.restored()), 0)
+
+    def test_a_bare_number_or_null_is_ignored(self):
+        self.wt("a3", "42")
+        self.wt("a4", "null")
+        self.assertEqual(len(self.restored()), 0)
+
+    def test_truncated_and_binary_are_ignored(self):
+        self.wt("b1", '{"magnet": "%s", "ind' % self.MAG)
+        self.wt("b2", os.urandom(200), binary=True)
+        self.wt("b3", "")
+        self.assertEqual(len(self.restored()), 0)
+
+    # ---- fields that are the wrong type ---------------------------------
+
+    def test_an_unparseable_number_does_not_crash_the_boot(self):
+        # int("1e400") raises. This crashed restore() outright.
+        self.wt("c1", json.dumps({"magnet": self.MAG, "total": "1e400"}))
+        jobs = self.restored()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(list(jobs.values())[0]["total"], 0)
+
+    def test_a_magnet_that_is_not_a_magnet_is_refused(self):
+        # A job whose magnet is a number can never be fetched; keeping it
+        # would leave bytes counting against the cap that nothing can reach.
+        for bad in (12345, [MAG_ := "x"], {"a": 1}, "", "http://not-a-magnet"):
+            self.m.JOBS.clear()
+            shutil.rmtree(os.path.join(self.dl, "d1_wt"), ignore_errors=True)
+            self.wt("d1", json.dumps({"magnet": bad}))
+            self.assertEqual(len(self.restored()), 0, bad)
+
+    def test_a_nonsense_index_is_dropped_not_carried(self):
+        # The pin decides which file of a pack this is. A bad one is worse
+        # than none: none re-picks, a bad one pins to a file that cannot exist.
+        for bad in ("two", -5, 10 ** 9, True, 1.5, None):
+            self.m.JOBS.clear()
+            shutil.rmtree(os.path.join(self.dl, "e1_wt"), ignore_errors=True)
+            self.wt("e1", json.dumps({"magnet": self.MAG, "index": bad}))
+            jobs = self.restored()
+            self.assertEqual(len(jobs), 1, bad)
+            self.assertIsNone(list(jobs.values())[0]["wt_index"], bad)
+
+    def test_a_real_index_survives(self):
+        self.wt("e2", json.dumps({"magnet": self.MAG, "index": 7}))
+        self.assertEqual(list(self.restored().values())[0]["wt_index"], 7)
+
+    def test_a_title_of_the_wrong_type_falls_back(self):
+        self.wt("f1", json.dumps({"magnet": self.MAG, "title": {"a": 1}}))
+        self.assertEqual(list(self.restored().values())[0]["title"], "torrent")
+
+    def test_title_locked_must_be_exactly_true(self):
+        # "maybe" is truthy, and locking a title on a truthy string would
+        # freeze a name nobody chose.
+        self.wt("g1", json.dumps({"magnet": self.MAG, "title_locked": "maybe"}))
+        self.assertFalse(list(self.restored().values())[0]["title_locked"])
+
+    def test_a_huge_file_count_is_clamped(self):
+        self.wt("h1", json.dumps({"magnet": self.MAG, "files": 10 ** 20}))
+        self.assertEqual(list(self.restored().values())[0]["wt_files"], 0)
+
+    # ---- the filesystem itself misbehaving -------------------------------
+
+    def test_a_directory_where_the_sidecar_should_be(self):
+        os.makedirs(os.path.join(self.dl, "i1_wt", ".reel.json"), exist_ok=True)
+        self.assertEqual(len(self.restored()), 0)
+
+    def test_an_unreadable_sidecar_is_skipped(self):
+        p = self.wt("j1", json.dumps({"magnet": self.MAG}))
+        f = os.path.join(p, ".reel.json")
+        os.chmod(f, 0o000)
+        try:
+            # Unreadable means unreachable, so the directory is swept -- which
+            # is why the file may not be there to put back afterwards.
+            self.assertEqual(len(self.restored()), 0)
+            self.assertFalse(os.path.exists(p))
+        finally:
+            if os.path.exists(f):
+                os.chmod(f, 0o600)
+
+    def test_a_corrupt_resume_blob_costs_only_the_resume(self):
+        self.wt("k1", json.dumps({"magnet": self.MAG, "index": 0}))
+        self.wt("k1", b"not resume data", name=".resume", binary=True)
+        self.assertEqual(len(self.restored()), 1)
+
+    def test_one_bad_item_does_not_hide_the_good_ones(self):
+        self.wt("m1", "[1,2,3]")
+        self.wt("m2", json.dumps({"magnet": self.MAG, "index": 3}))
+        jobs = self.restored()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(list(jobs.values())[0]["wt_index"], 3)
+
+    # ---- the coercion helper on its own ----------------------------------
+
+    def test_as_int_never_raises(self):
+        for v in ("1e400", "abc", None, [], {}, float("nan"), float("inf"), "12"):
+            self.assertIsInstance(self.m.as_int(v), int)
+        self.assertEqual(self.m.as_int("12"), 12)
+        self.assertEqual(self.m.as_int("abc", 5), 5)
+        self.assertEqual(self.m.as_int(10 ** 30), 0)      # absurd -> default
+
+
+# --------------------------------------------------------------------------
 class TestProbeCache(Base):
     """/sys is polled every 2.5s by every open tab. It used to spawn two
     processes per poll -- `rclone listremotes` and `ifconfig` -- to re-learn

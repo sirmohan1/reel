@@ -3814,6 +3814,51 @@ def playable(path):
     return stream_kind(path) is not None
 
 
+def as_int(v, default=0):
+    """int() over something that came off disk. Never raises.
+
+    A sidecar is a file on a disk that other programs, filesystems and power
+    cuts can also touch, so every field in one is a claim rather than a fact.
+    int("1e400") raises, and it raised inside restore(), which main() calls
+    before the server starts listening -- one malformed number and the app
+    would not boot.
+    """
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return n if -2 ** 62 < n < 2 ** 62 else default
+
+
+def sane_sidecar(info):
+    """The parts of a .reel.json we are willing to act on, or None.
+
+    Shape first: json.load happily returns a list, a string or a number, and
+    each of those used to reach .get() and crash. Then the magnet, which is
+    the one field the whole reconstruction hangs on -- without a usable one
+    the directory is unreachable bytes counting against the cache cap, which
+    is exactly the case the caller deletes.
+    """
+    if not isinstance(info, dict):
+        return None
+    mag = info.get("magnet")
+    if not isinstance(mag, str) or not mag.startswith("magnet:"):
+        return None
+    idx = info.get("index")
+    title = info.get("title")
+    return {
+        "magnet": mag,
+        "total": max(0, as_int(info.get("total"))),
+        "files": max(0, as_int(info.get("files"))),
+        # None keeps its meaning: not pinned to any file. A nonsense index is
+        # dropped rather than passed on as a pin to a file that cannot exist.
+        "index": idx if isinstance(idx, int) and not isinstance(idx, bool)
+                 and 0 <= idx < 100000 else None,
+        "title": title if isinstance(title, str) and title.strip() else "torrent",
+        "title_locked": info.get("title_locked") is True,
+    }
+
+
 def restore():
     for name in os.listdir(DL):
         p = os.path.join(DL, name)
@@ -3828,7 +3873,8 @@ def restore():
                         info = _json.load(f)
                 except Exception:
                     info = None
-                if info and info.get("magnet"):
+                good = sane_sidecar(info)
+                if good:
                     jid = name[:-3]
                     # index is the pin that keeps this the one file it always
                     # was. Without it, a pack sibling resumes indistinguishable
@@ -3836,12 +3882,12 @@ def restore():
                     # and fans the whole pack back out as duplicates of
                     # episodes that may already be sitting done elsewhere.
                     JOBS[jid] = new_job(None, jid=jid, source="torrent",
-                                        magnet=info["magnet"], restored=True,
-                                        total=int(info.get("total") or 0),
-                                        title=info.get("title") or "torrent",
-                                        wt_index=info.get("index"),
-                                        wt_files=int(info.get("files") or 0),
-                                        title_locked=bool(info.get("title_locked")))
+                                        magnet=good["magnet"], restored=True,
+                                        total=good["total"],
+                                        title=good["title"],
+                                        wt_index=good["index"],
+                                        wt_files=good["files"],
+                                        title_locked=good["title_locked"])
                 else:
                     shutil.rmtree(p, ignore_errors=True)
             continue
@@ -10062,7 +10108,16 @@ def main():
         signal.signal(signal.SIGTERM, _flush_and_exit)
     except (ValueError, OSError):
         pass                     # not the main thread, or no such signal here
-    restore()
+    try:
+        restore()
+    except Exception as e:
+        # Nothing on disk should be able to stop the server starting. restore()
+        # reads files that other programs, filesystems and power cuts can also
+        # touch, and it runs before serve_forever() -- so anything it raises
+        # used to mean no app at all, with a traceback in place of a reason.
+        # Starting with an empty queue is recoverable; not starting is not.
+        print("  could not restore the queue (%s: %s)" % (type(e).__name__, e))
+        print("  starting with an empty queue; nothing on disk was deleted")
     for _ in range(WORKERS):
         threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=janitor, daemon=True).start()

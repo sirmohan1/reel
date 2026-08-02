@@ -98,7 +98,41 @@ WT_DATA_MIN = 2 * 1024 * 1024
 # and under 2s at worst, so this is generous rather than typical: long enough
 # to cover a thin swarm, short enough that a hopeless read fails visibly
 # instead of hanging the player.
+# A seek can only complete once a whole piece has arrived -- pieces are the
+# smallest thing BitTorrent will hand over, whatever the read asked for. Their
+# size is chosen by whoever made the torrent and varies enormously: measured
+# here, a Debian image used 256 KB and a film used 8 MB, and the same seek took
+# 1.4s against one and 20-40s against the other. A flat timeout set from the
+# small-piece case therefore cut off seeks that were working perfectly well and
+# reported them as failures. This is a floor plus an allowance per megabyte of
+# piece, capped so a pathological torrent cannot hang a read indefinitely.
 LT_SEEK_WAIT = 20
+LT_SEEK_PER_MB = 6.0
+LT_SEEK_WAIT_MAX = 90
+
+
+def seek_note(job, offset):
+    """A line for the player while a read waits on pieces. Names the piece
+    size, because that is the whole reason some seeks are slow and it is not
+    something a viewer could otherwise guess."""
+    h = job.get("_lt")
+    try:
+        mb = h.torrent_file().piece_length() / (1024 * 1024)
+    except Exception:
+        return "fetching this part of the film…"
+    # No claim about who asked or why. ffmpeg probes this same route while
+    # setting a film up, and telling someone their jump is slow when they
+    # have not jumped is worse than saying nothing.
+    return "waiting for a %.0f MB block from the swarm…" % mb
+
+
+def seek_wait_for(piece_bytes):
+    """How long a read may wait, given what one piece costs to fetch."""
+    try:
+        mb = max(0.0, float(piece_bytes)) / (1024 * 1024)
+    except (TypeError, ValueError):
+        return LT_SEEK_WAIT
+    return min(LT_SEEK_WAIT_MAX, LT_SEEK_WAIT + LT_SEEK_PER_MB * mb)
 # How often a running download checkpoints its resume data. A hard kill costs
 # whatever arrived since the last one, so the interval is a bandwidth bet, not
 # an I/O one: the blob measured 8.5 KB, while 30s of a 25 MB/s swarm is ~750 MB
@@ -3561,6 +3595,9 @@ def new_job(drive_id, jid=None, **extra):
            # The player's own clock restarts at zero each time the stream is
            # rebuilt, so this is what turns it back into a real position.
            "live_offset": 0.0,
+           # Set while a read is waiting on pieces, so the player can say what
+           # it is waiting for rather than appearing to have stalled.
+           "seek_wait": "",
            "subs_status": None, "subs_source": None, "subs_lang": None,
            "subs_note": "", "subs_name": "", "subs_cues": None,
            "subs_fit": None, "subs_exact": False, "subs_why": "",
@@ -3614,6 +3651,7 @@ def public(job):
             "live_done": job.get("live_done"),
             "live_note": job.get("live_note", ""),
             "live_offset": job.get("live_offset") or 0.0,
+            "seek_wait": job.get("seek_wait") or "",
             # False once we know the index is at the end of the file. None on a
             # job restored from disk, which never ran a live phase -- reporting
             # False there made an unrelated file look live-capable.
@@ -5619,7 +5657,7 @@ class WebTorrentBackend:
         return tail(ANSI.sub(" ", "".join(sum((list(b) for b in bufs), []))),
                     lines, chars)
 
-    def ensure_range(self, job, offset, length, timeout=LT_SEEK_WAIT):
+    def ensure_range(self, job, offset, length, timeout=None):
         """No piece control: webtorrent's cli exposes none. A read past what
         has arrived can only wait for sequential fill to reach it, which is
         why a still-downloading item is not seekable on this backend.
@@ -6018,7 +6056,7 @@ class LibtorrentBackend:
 
     # -- seeking ----------------------------------------------------------
 
-    def ensure_range(self, job, offset, length, timeout=LT_SEEK_WAIT):
+    def ensure_range(self, job, offset, length, timeout=None):
         """Fetch the bytes under a read before it is served. -> did they arrive.
 
         This is the whole reason for the backend: webtorrent's cli can be told
@@ -6044,8 +6082,15 @@ class LibtorrentBackend:
             first = ti.map_file(idx, max(0, int(offset)), 1).piece
             last = ti.map_file(idx, max(0, int(offset) + length - 1), 1).piece
             first, last = max(0, first), min(ti.num_pieces() - 1, last)
+            if timeout is None:
+                # What one piece costs to fetch is the whole of this wait --
+                # see seek_wait_for. Read off the torrent rather than assumed,
+                # because it is the torrent that decides it.
+                timeout = seek_wait_for(ti.piece_length())
         except Exception:
             return False
+        if timeout is None:
+            timeout = LT_SEEK_WAIT
         want = range(first, last + 1)
         if all(h.have_piece(p) for p in want):
             return True                      # already here; nothing to ask for
@@ -7819,7 +7864,26 @@ class H(http.server.BaseHTTPRequestHandler):
             # so a whole-file request still starts streaming immediately.
             live_bytes = job.get("lt_file") and not job.get("path")
             if live_bytes and length:
-                if not backend().ensure_range(job, start, min(length, 262144)):
+                # Say what the wait is for while it happens. A read that sits
+                # for half a minute in silence reads as a broken player; the
+                # same wait with a reason reads as a slow torrent, which is
+                # what it actually is -- pieces here can be 8 MB, and none of
+                # a piece is usable until all of it has arrived.
+                # Published on a timer, not immediately: most reads are
+                # already held and return at once, and a note that appears
+                # and vanishes on every one of those just makes the title
+                # flicker. Only a wait long enough to look like a stall is
+                # worth explaining.
+                note = threading.Timer(
+                    1.5, lambda: job.__setitem__("seek_wait", seek_note(job, start)))
+                note.daemon = True
+                note.start()
+                try:
+                    ok = backend().ensure_range(job, start, min(length, 262144))
+                finally:
+                    note.cancel()
+                    job["seek_wait"] = ""
+                if not ok:
                     # The pieces did not arrive. The file is preallocated, so
                     # reading anyway would hand the player a block of zeros and
                     # call it video -- worse than saying no, because it decodes
@@ -9068,6 +9132,22 @@ function liveBar(j) {
   $('lspos').textContent = hms(at) + ' / ' + hms(j.duration);
 }
 
+/* A read waiting on an 8 MB piece looks identical to a hung player. The
+   server says what it is waiting for; this shows it, and puts the title back
+   the moment the wait ends. */
+let seekNoteOn = false;
+function seekNote(j) {
+  const msg = j && j.seek_wait;
+  if (msg) {
+    seekNoteOn = true;
+    cue.textContent = msg;
+    cue.classList.remove('none');
+  } else if (seekNoteOn) {
+    seekNoteOn = false;
+    if (j) { cue.textContent = j.title; cue.classList.remove('none'); }
+  }
+}
+
 $('lsbar').addEventListener('click', async ev => {
   const j = byId(order[cur]);
   if (!j || !j.duration || liveSeeking) return;
@@ -9553,6 +9633,7 @@ function paint() {
   $('prev').disabled = !ready(-1);
   $('next').disabled = !ready(1);
   liveBar(byId(order[cur]));
+  seekNote(byId(order[cur]));
 }
 
 async function remove(id) {

@@ -1101,6 +1101,76 @@ class TestLibtorrentBackend(Base):
         self.assertFalse(j["wt_direct"])
         self.assertFalse(self.m.public(j)["seekable"])
 
+    # ---- the wait scales with what a piece costs to fetch -----------------
+
+    def test_a_bigger_piece_earns_a_longer_wait(self):
+        # The bug this fixes: the timeout was set from a torrent with 256 KB
+        # pieces, so on one with 8 MB pieces a seek that was working fine got
+        # cut off at 20s and reported as a failure.
+        small = self.m.seek_wait_for(256 * 1024)
+        big = self.m.seek_wait_for(8 * 1024 * 1024)
+        self.assertGreater(big, small)
+        self.assertGreaterEqual(small, self.m.LT_SEEK_WAIT)
+        # measured: an 8 MB-piece seek took 20-40s, so it must outlast that
+        self.assertGreater(big, 40)
+
+    def test_the_wait_is_capped_however_absurd_the_pieces(self):
+        # A pathological torrent must not be able to hang a read forever.
+        self.assertLessEqual(self.m.seek_wait_for(512 * 1024 * 1024),
+                             self.m.LT_SEEK_WAIT_MAX)
+
+    def test_an_unreadable_piece_size_falls_back_to_the_floor(self):
+        self.assertEqual(self.m.seek_wait_for(None), self.m.LT_SEEK_WAIT)
+        self.assertEqual(self.m.seek_wait_for("nonsense"), self.m.LT_SEEK_WAIT)
+
+    @needs_libtorrent
+    def test_ensure_range_takes_its_wait_from_the_torrent(self):
+        # Not a constant: it is the torrent that decides how long one piece
+        # takes, so the timeout has to be read off it.
+        bk = self.m.LibtorrentBackend()
+        j = self.job()
+        out = os.path.join(self.dl, "waitout"); os.makedirs(out, exist_ok=True)
+        proc = bk.start(j, self.torrent_file(), out, {"index": 0}, 0)
+        try:
+            h = j["_lt"]
+            deadline = time.time() + 5
+            while time.time() < deadline and h.torrent_file() is None:
+                time.sleep(0.05)
+            want = self.m.seek_wait_for(h.torrent_file().piece_length())
+            self.assertEqual(want, self.m.seek_wait_for(16 * 1024))   # test torrent
+            self.assertGreaterEqual(want, self.m.LT_SEEK_WAIT)
+        finally:
+            proc.kill(); j["cancel"].set()
+
+    # ---- saying what a slow read is waiting for ---------------------------
+
+    def test_a_seek_note_names_the_piece_size(self):
+        # The number that explains the wait, and the one a viewer could never
+        # guess from the outside.
+        class FakeTI:
+            def piece_length(self): return 8 * 1024 * 1024
+        class FakeH:
+            def torrent_file(self): return FakeTI()
+        j = self.job()
+        j["_lt"] = FakeH()
+        j["total"] = 1000
+        note = self.m.seek_note(j, 700)
+        self.assertIn("8 MB", note)
+        # No claim about jumping: ffmpeg probes this same route while setting
+        # a film up, and nobody jumped then.
+        self.assertNotIn("jump", note.lower())
+
+    def test_a_seek_note_still_says_something_without_a_handle(self):
+        note = self.m.seek_note(self.job(), 0)
+        self.assertTrue(note)                    # never a blank stall
+        self.assertNotIn("None", note)
+
+    def test_the_note_reaches_the_browser_and_clears(self):
+        j = self.job()
+        self.assertEqual(self.m.public(j)["seek_wait"], "")
+        j["seek_wait"] = "fetching 8 MB block…"
+        self.assertEqual(self.m.public(j)["seek_wait"], "fetching 8 MB block…")
+
     # ---- live_seek: what it will and will not read ------------------------
 
     def test_live_seek_needs_something_that_answers_ranges(self):

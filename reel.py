@@ -7527,13 +7527,14 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         p = urllib.parse.urlparse(self.path).path
         if p == "/":
-            b = PAGE.encode()
+            b = PAGE.replace("<!--PLAYER-->", player_tags()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Security-Policy",
                              "default-src 'none'; media-src 'self'; "
                              "img-src 'self'; "
-                             "style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                             "style-src 'self' 'unsafe-inline'; "
+                             "script-src 'self' 'unsafe-inline'; "
                              "connect-src 'self'")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
@@ -7589,6 +7590,19 @@ class H(http.server.BaseHTTPRequestHandler):
                              "lan_url": lan_url() if has_qrcode() else None})
         elif p == "/qr":
             self._qr()
+        elif p.startswith("/static/"):
+            path = static_file(p[len("/static/"):])
+            if not path:
+                return self._json(404, {"error": "no such asset"})
+            self.send_response(200)
+            self.send_header("Content-Type", STATIC[os.path.basename(path)])
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            # Pinned to a version in the repo, so it never changes underneath.
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
         elif p.startswith("/poster/"):
             # Proxied rather than pointed at image.tmdb.org directly, so the
             # CSP never has to trust a third party -- img-src stays 'self' and
@@ -8092,9 +8106,43 @@ class H(http.server.BaseHTTPRequestHandler):
                 STREAMING[jid] = max(0, STREAMING.get(jid, 1) - 1)
 
 
+# The player is vendored rather than fetched from a cdn: this server is meant
+# to work on a LAN with no internet, and a control bar that only appears when
+# the house has wifi is worse than none. It is also optional -- reel.py alone
+# still runs, with the browser's own controls, which is what happens if these
+# files are missing.
+VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+STATIC = {"plyr.min.js": "text/javascript", "plyr.css": "text/css",
+          # The icon sprite too: Plyr fetches it from its own cdn by default,
+          # which a LAN with no internet cannot reach and the CSP refuses on
+          # principle. Pointed at ours via the iconUrl option.
+          "plyr.svg": "image/svg+xml"}
+
+
+def static_file(name):
+    """Path to a vendored asset, or None. Whitelisted by name rather than
+    sanitised, so no request can reach a path we did not choose ourselves."""
+    if name not in STATIC:
+        return None
+    p = os.path.join(VENDOR, name)
+    return p if os.path.isfile(p) else None
+
+
+def has_player():
+    return all(static_file(n) for n in STATIC)
+
+
+def player_tags():
+    """Head tags for the vendored player, or nothing when it is absent."""
+    if not has_player():
+        return ""
+    return ('<link rel="stylesheet" href="/static/plyr.css">'
+            '<script src="/static/plyr.min.js" defer></script>')
+
+
 PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>reel</title>
+<title>reel</title><!--PLAYER-->
 <style>
   :root{
     --ink:#101214; --panel:#171A1D; --raise:#1D2126; --rule:#262B31;
@@ -8346,6 +8394,31 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .stage{margin-top:16px;position:relative;aspect-ratio:16/9;background:#000;
     border:1px solid var(--rule);border-radius:5px;overflow:hidden}
   .stage video{position:absolute;inset:0;width:100%;height:100%;display:block}
+  /* Plyr inserts .plyr > .plyr__video-wrapper between the stage and the video.
+     The rule above positions the video absolutely, so once it is nested two
+     levels down it contributes no height and the wrappers collapse to zero --
+     which is exactly what happened: controls present in the DOM, container
+     0px tall. These give the wrappers the same fill the bare video had. */
+  .stage .plyr,
+  .stage .plyr__video-wrapper{position:absolute;inset:0;width:100%;height:100%;
+    background:#000}
+  .stage .plyr{border-radius:inherit;overflow:hidden}
+  /* Themed to reel's own palette rather than left at Plyr's blue, so the
+     controls read as part of the app instead of a component dropped into it. */
+  .plyr{--plyr-color-main:var(--brass);
+        --plyr-video-background:#000;
+        --plyr-video-control-color:#fff;
+        --plyr-badge-background:var(--brass);
+        --plyr-badge-text-color:var(--ink);
+        --plyr-range-thumb-background:var(--brass);
+        --plyr-range-fill-background:var(--brass);
+        --plyr-tooltip-background:var(--panel);
+        --plyr-tooltip-color:var(--text);
+        --plyr-menu-background:var(--panel);
+        --plyr-menu-color:var(--text);
+        --plyr-font-family:var(--sans);
+        --plyr-font-size-small:12px;
+        --plyr-control-spacing:9px}
   .slate{position:absolute;inset:0;display:grid;place-content:center;
     justify-items:center;gap:9px;text-align:center;padding:20px}
   .slate .bars{display:flex;gap:3px;align-items:flex-end;height:16px}
@@ -9278,6 +9351,45 @@ function showShift() {
 $('subminus').addEventListener('click', () => nudgeSubs(-SUB_STEP));
 $('subplus').addEventListener('click', () => nudgeSubs(SUB_STEP));
 $('subval').addEventListener('click', () => nudgeSubs(-subShift));   // back to zero
+
+/* player ---------------------------------------------------------------------
+   Plyr wraps the <video> element rather than replacing it, which is the whole
+   reason it was chosen: every v.currentTime, v.textTracks, v.seekable and src
+   swap elsewhere in this file goes on working untouched. If the vendored files
+   are missing, the browser's own controls are used and reel.py still runs
+   alone.
+
+   The native controls are what blocked two things worth having: a scrubber in
+   the browser's shadow DOM cannot show thumbnails, and it cannot be made to
+   seek a fragmented stream -- which is why live seeking needs a control of its
+   own below. */
+let player = null;
+
+function initPlayer() {
+  if (player || typeof Plyr === 'undefined') return;
+  try {
+    player = new Plyr(v, {
+      // Deliberately close to what was there: this changes how the controls
+      // look, not how the app behaves.
+      controls: ['play-large', 'play', 'progress', 'current-time', 'duration',
+                 'mute', 'volume', 'captions', 'settings', 'fullscreen'],
+      settings: ['captions', 'speed'],
+      speed: {selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2]},
+      captions: {active: true, update: true},
+      keyboard: {focused: true, global: false},
+      tooltips: {controls: false, seek: true},
+      invertTime: false,
+      storage: {enabled: true, key: 'reel.plyr'},
+      // Served by us, never fetched from a cdn -- see STATIC.
+      iconUrl: '/static/plyr.svg',
+      blankVideo: '',
+    });
+  } catch (e) {
+    player = null;                 // fall back to whatever the browser gives
+  }
+}
+document.addEventListener('DOMContentLoaded', initPlayer);
+if (document.readyState !== 'loading') initPlayer();
 
 /* live seeking --------------------------------------------------------------
    The player cannot seek a fragmented stream: there is no index to seek

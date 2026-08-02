@@ -3523,7 +3523,9 @@ def lan_url():
     there's nothing on the LAN worth sharing."""
     if HOST == "127.0.0.1":
         return None
-    ip = lan_ip()
+    # Short-lived, not permanent: this one really can change under you, when a
+    # laptop moves between networks or a VPN comes up.
+    ip = probed("lan_ip", LAN_TTL, lan_ip)
     return f"http://{ip}:{PORT}" if ip else None
 
 
@@ -3559,7 +3561,30 @@ def extract_id(raw):
     return None
 
 
-def has_rclone():
+_PROBE = {}
+PROBE_TTL = 60.0        # tool availability: changes when you install something
+LAN_TTL = 20.0          # the address: changes when you move between networks
+
+
+def probed(key, ttl, fn):
+    """Memoise an answer that costs a process to obtain and changes rarely.
+
+    /sys is polled every 2.5 seconds by every open tab, and each poll used to
+    spawn `rclone listremotes` (measured 53 ms) and `ifconfig` (12 ms) -- two
+    processes per poll, per device, forever, to re-learn facts that had not
+    changed since the server started. Same reasoning as folder_size_bytes,
+    which already memoises its walk for exactly this caller.
+    """
+    now = time.time()
+    hit = _PROBE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _PROBE[key] = (now, val)
+    return val
+
+
+def _probe_rclone():
     if not shutil.which("rclone"):
         return False
     try:
@@ -3568,6 +3593,10 @@ def has_rclone():
         return "gdrive:" in out.stdout
     except Exception:
         return False
+
+
+def has_rclone():
+    return probed("rclone", PROBE_TTL, _probe_rclone)
 
 
 def has_ffmpeg():

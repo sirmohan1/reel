@@ -478,6 +478,52 @@ class TestOsdbHash(Base):
 
 
 # --------------------------------------------------------------------------
+class TestProbeCache(Base):
+    """/sys is polled every 2.5s by every open tab. It used to spawn two
+    processes per poll -- `rclone listremotes` and `ifconfig` -- to re-learn
+    facts that had not changed since startup."""
+
+    def test_a_repeated_answer_is_not_recomputed(self):
+        calls = []
+        val = self.m.probed("k", 60, lambda: calls.append(1) or "yes")
+        for _ in range(20):
+            self.assertEqual(self.m.probed("k", 60, lambda: calls.append(1) or "yes"), val)
+        self.assertEqual(len(calls), 1)
+
+    def test_it_expires(self):
+        calls = []
+        self.m.probed("e", 0.05, lambda: calls.append(1) or len(calls))
+        time.sleep(0.08)
+        self.m.probed("e", 0.05, lambda: calls.append(1) or len(calls))
+        self.assertEqual(len(calls), 2)
+
+    def test_different_keys_do_not_share_an_answer(self):
+        self.assertEqual(self.m.probed("a", 60, lambda: 1), 1)
+        self.assertEqual(self.m.probed("b", 60, lambda: 2), 2)
+        self.assertEqual(self.m.probed("a", 60, lambda: 99), 1)
+
+    def test_a_falsey_answer_is_still_cached(self):
+        # False is the interesting case: rclone missing is exactly the answer
+        # you do not want to pay for on every poll.
+        calls = []
+        for _ in range(5):
+            self.assertFalse(self.m.probed("f", 60, lambda: calls.append(1) or False))
+        self.assertEqual(len(calls), 1)
+
+    def test_has_rclone_does_not_respawn_the_process(self):
+        runs = []
+        self.m._probe_rclone = lambda: runs.append(1) or True
+        self.m._PROBE.clear()
+        for _ in range(10):
+            self.m.has_rclone()
+        self.assertEqual(len(runs), 1)
+
+    def test_the_address_is_cached_only_briefly(self):
+        # It can genuinely change -- a laptop moving networks, a VPN coming up.
+        self.assertLess(self.m.LAN_TTL, self.m.PROBE_TTL)
+
+
+# --------------------------------------------------------------------------
 class TestRangeParsing(Base):
     """RFC 7233 range headers. Every case here is one the old parser got
     wrong by falling through to "serve the whole file": a garbage header

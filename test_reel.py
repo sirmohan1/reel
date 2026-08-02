@@ -478,6 +478,56 @@ class TestOsdbHash(Base):
 
 
 # --------------------------------------------------------------------------
+class TestRangeParsing(Base):
+    """RFC 7233 range headers. Every case here is one the old parser got
+    wrong by falling through to "serve the whole file": a garbage header
+    answered 206 with a Content-Range covering all 9.7 GB of a film."""
+
+    def test_an_explicit_span(self):
+        self.assertEqual(self.m.parse_range("bytes=0-99", 1000), (0, 99))
+        self.assertEqual(self.m.parse_range("bytes=10-20", 1000), (10, 20))
+
+    def test_open_ended_runs_to_the_end(self):
+        self.assertEqual(self.m.parse_range("bytes=500-", 1000), (500, 999))
+
+    def test_a_suffix_range_means_the_last_n_bytes(self):
+        # The one that was exactly backwards: bytes=-500 is the final 500
+        # bytes, not the first 500, and it used to return the whole file.
+        self.assertEqual(self.m.parse_range("bytes=-500", 1000), (500, 999))
+        self.assertEqual(self.m.parse_range("bytes=-1", 1000), (999, 999))
+
+    def test_a_suffix_longer_than_the_file_is_the_whole_file(self):
+        self.assertEqual(self.m.parse_range("bytes=-99999", 1000), (0, 999))
+
+    def test_no_header_is_the_whole_file(self):
+        self.assertEqual(self.m.parse_range(None, 1000), (0, 999))
+        self.assertEqual(self.m.parse_range("", 1000), (0, 999))
+
+    def test_garbage_is_refused_not_served(self):
+        # None means 416. It must never mean "everything".
+        for bad in ("bytes=junk", "bytes=abc-def", "bytes=-", "bytes=",
+                    "items=0-5", "0-5", "bytes=1-2-3"):
+            self.assertIsNone(self.m.parse_range(bad, 1000), bad)
+
+    def test_a_start_past_the_end_is_unsatisfiable(self):
+        self.assertIsNone(self.m.parse_range("bytes=1000-", 1000))
+        self.assertIsNone(self.m.parse_range("bytes=99999-", 1000))
+
+    def test_a_backwards_span_is_refused(self):
+        self.assertIsNone(self.m.parse_range("bytes=5-1", 1000))
+
+    def test_an_end_past_the_file_is_clamped_not_refused(self):
+        # A player asking for more than exists is being optimistic, not wrong.
+        self.assertEqual(self.m.parse_range("bytes=900-99999", 1000), (900, 999))
+
+    def test_an_empty_file_has_no_satisfiable_range(self):
+        self.assertIsNone(self.m.parse_range("bytes=0-10", 0))
+
+    def test_whitespace_is_tolerated(self):
+        self.assertEqual(self.m.parse_range("  bytes=0-9  ", 1000), (0, 9))
+
+
+# --------------------------------------------------------------------------
 class TestTorrentBackend(Base):
     """The seam a second torrent client plugs into. These pin the contract
     run_torrent depends on, so an alternative backend can be checked against

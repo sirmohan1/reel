@@ -92,6 +92,13 @@ WT_SERVER_WAIT = 45             # seconds to wait for its http server to appear
 # really an empty swarm.
 WT_DATA_WAIT = 90
 WT_DATA_MIN = 2 * 1024 * 1024
+# How long a connection may go without saying anything before it is dropped.
+# Generous for a LAN, and unrelated to how long a response may take to write:
+# a stalled reader is the thing being bounded, not a slow film.
+REQUEST_TIMEOUT = 30
+# The largest request body worth reading. Everything posted here is a small
+# json object, the biggest being a pasted list of magnets.
+MAX_BODY = 1 << 20
 # How long a read will wait for the pieces under it to be fetched on demand
 # (libtorrent only -- see LibtorrentBackend.ensure_range). Measured against a
 # real swarm, an arbitrary seek landed in about 1.4s with nothing competing
@@ -713,6 +720,48 @@ def stop_procs(job):
                 proc.kill()
             except Exception:
                 pass
+
+
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def parse_range(header, size):
+    """-> (start, end) inclusive, or None if the header is unusable.
+
+    None is not "serve the whole thing". An unparseable Range used to fall
+    through to the full-file defaults and answer 206 with a Content-Range
+    covering the entire file -- so `Range: junk` pulled 9.7 GB, and
+    `bytes=-1`, which properly means *the last byte*, pulled it backwards.
+
+    Three forms are legal and each means something different:
+      bytes=500-999   an explicit span
+      bytes=500-      from 500 to the end
+      bytes=-500      the last 500 bytes, not "up to 500"
+    """
+    if not header:
+        return 0, max(size - 1, 0)
+    m = RANGE_RE.match(header.strip())
+    if not m or size <= 0:
+        return None
+    first, last = m.group(1), m.group(2)
+    if not first and not last:
+        return None                       # "bytes=-" says nothing
+    try:
+        if not first:                     # suffix: the final N bytes
+            n = int(last)
+            if n <= 0:
+                return None
+            return max(0, size - n), size - 1
+        start = int(first)
+        if start >= size:
+            return None                   # unsatisfiable; 416, not a full body
+        end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    end = min(end, size - 1)
+    if end < start:
+        return None
+    return start, end
 
 
 def evictable():
@@ -7324,6 +7373,19 @@ def resume_job(jid):
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "reel"
+    # A client that opens a connection and then says nothing used to hold its
+    # worker thread for as long as it liked -- there was no timeout anywhere on
+    # the request path, and one thread is spawned per connection. Streaming
+    # bodies are written with their own long waits and are unaffected: this
+    # bounds how long we wait to *hear* something, not how long a response may
+    # take.
+    timeout = REQUEST_TIMEOUT
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except socket.timeout:
+            self.close_connection = True
 
     def log_message(self, *a):
         pass
@@ -7468,7 +7530,16 @@ class H(http.server.BaseHTTPRequestHandler):
         if not self._local_origin():
             return self._json(403, {"error": "forbidden"})
         p = urllib.parse.urlparse(self.path).path
-        n = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            n = 0
+        # Every body this server accepts is a small json object; the largest
+        # realistic one is a pasted list of magnets. A header claiming more
+        # than that is either broken or hostile, and reading it would mean
+        # allocating whatever it asked for.
+        if n > MAX_BODY:
+            return self._json(413, {"error": "body too large"})
         try:
             body = json.loads(self.rfile.read(n).decode()) if n else {}
         except Exception:
@@ -7847,14 +7918,15 @@ class H(http.server.BaseHTTPRequestHandler):
         try:
             size = os.path.getsize(path)
             rng = self.headers.get("Range")
-            start, end = 0, size - 1
-            if rng:
-                m = re.match(r"bytes=(\d+)-(\d*)", rng)
-                if m:
-                    start = min(int(m.group(1)), max(size - 1, 0))
-                    if m.group(2):
-                        end = int(m.group(2))
-            end = min(end, size - 1)
+            span = parse_range(rng, size)
+            if span is None:
+                # Say so, rather than answering 206 with the whole file.
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            start, end = span
             length = max(end - start + 1, 0)
 
             # Ask for the front of what was requested before answering at all.

@@ -6459,6 +6459,13 @@ def run_torrent(job):
         # legitimate request and ensure_range fetches what it lands on.
         job["lt_file"] = url
         job["wt_direct"] = True
+        # We are the range server for this file, so ranges are not in doubt.
+        # Left False, the direct-play test below could never pass on this
+        # backend and every download was transcoded whatever was in it --
+        # which is the waste the re-probe above exists to avoid, arrived at
+        # by a different route. The container and codec checks still decide
+        # whether direct play is actually safe.
+        job["wt_ranges"] = True
     elif not url:
         # No usable endpoint. Rather than give up, fall back to piping the file
         # out of webtorrent sequentially -- documented, and independent of
@@ -6512,7 +6519,17 @@ def run_torrent(job):
     t_probe = time.time()
 
     # ---- 3. proxy directly, or convert on the fly ---------------------------
-    probed = job.get("wt_probe") or probe_media(url, timeout=20)
+    # A local backend's `url` is the file on disk, which is preallocated to its
+    # full length -- so everything the download has not reached yet reads as
+    # zeros. That is fatal for an mp4 whose moov atom sits at the end (a
+    # non-faststart encode): ffprobe seeks to the tail, finds nothing, reports
+    # no codecs at all, and the job is then transcoded from a header it never
+    # found. Reading through reel's own route instead means those seeks pass
+    # through the range handler and fetch the pieces they land on.
+    probe_src = url
+    if job.get("lt_file"):
+        probe_src = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
+    probed = job.get("wt_probe") or probe_media(probe_src, timeout=45)
     v, a, vh, hdr, br, dur, pix = probed
     # A probe run while the swarm is still starved comes back empty -- not because
     # the file is unreadable, but because the pieces holding its header have not
@@ -6530,7 +6547,7 @@ def run_torrent(job):
             if job["received"] >= WT_REPROBE_MIN or job.get("wt_done"):
                 break
             time.sleep(2.0)
-        again = probe_media(url, timeout=25)
+        again = probe_media(probe_src, timeout=45)
         if again[0] is not None or again[1] is not None:
             probed = again
             v, a, vh, hdr, br, dur, pix = probed

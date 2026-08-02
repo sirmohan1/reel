@@ -6648,10 +6648,19 @@ def run_torrent(job):
     # no codecs at all, and the job is then transcoded from a header it never
     # found. Reading through reel's own route instead means those seeks pass
     # through the range handler and fetch the pieces they land on.
-    probe_src = url
+    probe_src, probe_alt = url, None
     if job.get("lt_file"):
-        probe_src = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
-    probed = job.get("wt_probe") or probe_media(probe_src, timeout=45)
+        probe_alt = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
+    # The file itself first. For a faststart file the header is at the front
+    # and already on disk, so this costs a local read. Going through our own
+    # range handler is what lets a probe seek to the tail -- which a file with
+    # its index at the end needs -- but every read through it waits on the
+    # swarm, and on a thin one that is seconds per seek. Measured on a
+    # two-peer torrent, the probe alone took 10.5s of a 46s start. So the
+    # expensive route is kept for the case that actually needs it.
+    probed = job.get("wt_probe") or probe_media(probe_src, timeout=20)
+    if probe_alt and probed[0] is None and probed[1] is None:
+        probed = probe_media(probe_alt, timeout=45)
     v, a, vh, hdr, br, dur, pix = probed
     # A probe run while the swarm is still starved comes back empty -- not because
     # the file is unreadable, but because the pieces holding its header have not
@@ -6669,7 +6678,7 @@ def run_torrent(job):
             if job["received"] >= WT_REPROBE_MIN or job.get("wt_done"):
                 break
             time.sleep(2.0)
-        again = probe_media(probe_src, timeout=45)
+        again = probe_media(probe_alt or probe_src, timeout=45)
         if again[0] is not None or again[1] is not None:
             probed = again
             v, a, vh, hdr, br, dur, pix = probed

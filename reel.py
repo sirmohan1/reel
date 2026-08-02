@@ -8210,7 +8210,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     font-variant-numeric:tabular-nums;min-width:82px;text-align:right}
 
   /* transport */
-  .transport{display:flex;align-items:center;gap:8px;margin-top:12px}
+  .transport{display:flex;align-items:center;gap:8px;margin-top:14px}
   .transport button{height:32px;padding:0 12px;font-size:12px}
   .cue{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     font-size:12.5px;color:var(--dim);padding-left:4px}
@@ -8231,20 +8231,34 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .toggle input{accent-color:var(--brass);width:14px;height:14px;cursor:pointer}
 
   /* swarm health for whatever is playing */
-  .wire{display:flex;align-items:center;gap:9px;margin-top:11px;padding:9px 11px;
-    background:var(--panel);border:1px solid var(--rule);border-radius:5px}
-  .lamp{width:6px;height:6px;border-radius:50%;background:var(--faint);flex:none}
+  /* The figures run long -- eight or nine measurements -- so this wraps by
+     design. line-height:1 was fine while it was one line and collided with
+     itself the moment it was two, which is most of the time. */
+  .wire{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 10px;
+    margin-top:12px;padding:11px 13px;
+    background:var(--panel);border:1px solid var(--rule);border-radius:6px}
+  .lamp{width:6px;height:6px;border-radius:50%;background:var(--faint);flex:none;
+    align-self:center}
   .lamp.ok{background:var(--live)}
   .lamp.tight{background:var(--warn)}
   .lamp.behind{background:var(--bad)}
-  .verdict{font-size:12.5px;color:var(--dim)}
-  .figures{margin-left:auto;font:400 11.5px/1 var(--mono);color:var(--faint);
-    font-variant-numeric:tabular-nums;text-align:right}
+  .verdict{font-size:12.5px;color:var(--dim);flex:none}
+  /* Left-aligned once it has wrapped: ragged-right on a wrapped block of
+     figures reads as a column of numbers, ragged-left reads as a mistake. */
+  .figures{flex-basis:100%;font:400 11.5px/1.7 var(--mono);color:var(--faint);
+    font-variant-numeric:tabular-nums;min-width:0}
+  .fig{white-space:nowrap}
 
   /* queue */
-  .section{display:flex;align-items:baseline;gap:10px;margin:30px 0 2px}
+  .section{display:flex;align-items:baseline;gap:10px;margin:34px 0 6px}
   .section .count{font:400 11px/1 var(--mono);color:var(--faint)}
   ul{list-style:none}
+  /* A surface for the queue. Without one the rows' own bottom borders were
+     the only thing suggesting a list, which left the column looking like
+     loose text beside a solid player. */
+  #list{background:var(--panel);border:1px solid var(--rule);border-radius:8px;
+    overflow:hidden}
+  #list li.row:last-child{border-bottom:none}
   /* Two rows, not one: the title used to share its row with every badge and
      button (cc, integrity, log, refetch, pause, kind, status), each new one
      eating further into the title's own column until a long release name had
@@ -8255,7 +8269,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
      lands beside the title in row one instead of stranded on its own line
      below everything else. */
   li.row{display:grid;grid-template-columns:26px 1fr 26px;align-items:start;
-    gap:0 12px;padding:12px 4px;border-bottom:1px solid var(--rule);cursor:pointer;
+    gap:0 12px;padding:13px 10px;border-bottom:1px solid var(--rule);cursor:pointer;
     transition:background .1s}
   li.row:hover{background:var(--panel)}
   li.row .n,li.row>.kill{margin-top:1px}
@@ -8305,7 +8319,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   /* A tint of the same brass used for kind.now/the progress bar, not the
      plain panel hover uses -- sharing that color would make "currently
      playing" read as nothing more than a mouse resting over the row. */
-  li.row.live{background:rgba(198,162,101,.08);
+  li.row.live{background:rgba(198,162,101,.07);
     box-shadow:inset 3px 0 0 var(--brass)}
   li.row.live .n{color:var(--brass)}
   li.row.live .title{color:var(--text)}
@@ -8370,12 +8384,12 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     border:1px solid rgba(196,117,106,.4);border-radius:3px;padding:3px 5px;
     display:none;cursor:help}
   .integrity.on{display:inline-block}
-  /* Set off from the acts with its own divider so it still reads as the
-     last word on the row, the way margin-left:auto alone used to signal
-     before acts itself started claiming that spot. */
-  .stat{font:400 11.5px/1 var(--mono);color:var(--dim);
-    margin-left:14px;padding-left:14px;border-left:1px solid var(--rule);
-    font-variant-numeric:tabular-nums;text-align:right}
+  /* Sits with the state badges rather than alone on the right. In a 380px
+     column the right-hand position forced the flags onto a third line and
+     left its divider stranded there as a stray pipe -- and a percentage is
+     status anyway, the same kind of thing as LIVE beside it. */
+  .stat{font:500 11px/1 var(--mono);color:var(--dim);
+    font-variant-numeric:tabular-nums}
   .stat.ready{color:var(--live)}
   .stat.bad{color:var(--bad)}
   .stat.idle{color:var(--faint)}
@@ -8410,7 +8424,7 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     /* flags already wraps and sits on its own full-width row above this
        breakpoint -- narrower still just tightens what's already correct,
        nothing left here needs its own layout. */
-    li.row{grid-template-columns:20px 1fr 20px;gap:0 9px}
+    li.row{grid-template-columns:20px 1fr 20px;gap:0 9px;padding:12px 8px}
   }
   @media (prefers-reduced-motion:reduce){
     *{animation:none!important;transition:none!important}
@@ -9395,7 +9409,8 @@ function makeRow(id) {
     '<button class="kill" type="button" aria-label="Remove">&times;</button>' +
     '<span class="flags">' +
     '<span class="badges"><span class="cc"></span><span class="eyes"></span>' +
-    '<span class="integrity" title=""></span><span class="kind"></span></span>' +
+    '<span class="integrity" title=""></span><span class="kind"></span>' +
+    '<span class="stat"></span></span>' +
     '<span class="acts">' +
     '<button class="logbtn" type="button" hidden aria-label="Show this item\'s log">log</button>' +
     '<button class="moreBtn" type="button" hidden aria-label="More options">&#8942;</button>' +
@@ -9403,8 +9418,7 @@ function makeRow(id) {
       'aria-label="Discard this copy and download it again from scratch" ' +
       'title="Discard this copy and download it again from scratch">refetch</button>' +
     '<button class="pausebtn" type="button" hidden>pause</button>' +
-    '</span>' +
-    '<span class="stat"></span></span>' +
+    '</span></span>' +
     '<div class="logpanel" hidden></div>' +
     '<div class="morepanel" hidden></div>';
   const el = {li, n: li.querySelector('.n'), title: li.querySelector('.title'),
@@ -9749,7 +9763,19 @@ function showWire() {
     if (j.eta) bits.push(clock(j.eta) + ' left');
   }
   if (shared) bits.push((j.viewers - 1) + ' other watching');
-  $('figures').textContent = bits.join('  \u00b7  ');
+  // One span per measurement, so a wrap never lands inside one. Joined as
+  // text it broke "encoding 129.00x" across two lines, which reads as two
+  // separate figures rather than one.
+  $('figures').textContent = '';
+  bits.forEach((b, i) => {
+    const sp = document.createElement('span');
+    sp.className = 'fig';
+    // The separator belongs to the item before it, so a wrap leaves it at the
+    // end of a line rather than starting the next one with a stray dot.
+    sp.textContent = b + (i < bits.length - 1 ? '  \u00b7' : '');
+    $('figures').append(sp);
+    if (i < bits.length - 1) $('figures').append(document.createTextNode(' '));
+  });
 }
 
 function showCache(s) {

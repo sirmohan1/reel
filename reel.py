@@ -683,8 +683,12 @@ PLAY_GRACE = 60.0         # nor what the player is on, between range requests
 
 
 def job_dirs(jid):
+    # .thumbs included so previews are swept with everything else -- a removed
+    # item leaving a sprite directory behind would count against the cache cap
+    # forever with nothing able to reach it.
     return [os.path.join(DL, jid + suffix)
-            for suffix in ("_wt", "_raw", "_meta", "_probe")]
+            for suffix in ("_wt", "_raw", "_meta", "_probe", ".thumbs",
+                           ".thumbs.part")]
 
 
 def in_use(jid):
@@ -3691,6 +3695,8 @@ def new_job(drive_id, jid=None, **extra):
            # scanning an entire existing library on every restart is a cost
            # nobody asked to pay just for reopening the app.
            "integrity": None, "integrity_hits": 0,
+           # True once scrubbing previews exist for this item.
+           "thumbs": False,
            # False for a pack sibling: the scheduler will never start or
            # prefetch it on its own, only /start (a click) can. The episode
            # actually chosen when the series was added keeps the normal
@@ -3795,6 +3801,7 @@ def public(job):
             # goes out as fragments and cannot be seeked
             "seekable": bool(job.get("path") or job.get("wt_direct")),
             "codecs": job.get("wt_codecs", ""),
+            "thumbs": bool(job.get("thumbs")),
             "integrity": job.get("integrity"),
             "integrity_hits": job.get("integrity_hits") or 0}
 
@@ -3888,6 +3895,8 @@ def restore():
                                         wt_index=good["index"],
                                         wt_files=good["files"],
                                         title_locked=good["title_locked"])
+                    JOBS[jid]["thumbs"] = os.path.isfile(
+                        os.path.join(thumbs_dir(jid), "index.vtt"))
                 else:
                     shutil.rmtree(p, ignore_errors=True)
             continue
@@ -3942,6 +3951,10 @@ def restore():
                             title=title, audio_tracks=atracks,
                             audio_default=guess_audio_default(atracks),
                             **extra, kind=kind)
+        # Previews survive a restart on disk. Noticing them costs a stat and
+        # saves rebuilding what is already there.
+        JOBS[jid]["thumbs"] = os.path.isfile(
+            os.path.join(thumbs_dir(jid), "index.vtt"))
 
     # Second pass for subtitle sidecars, now that every job is known. One whose
     # job didn't come back is an orphan: it can never be reached, and leaving it
@@ -4461,6 +4474,114 @@ def scan_for_corruption(path, timeout=None):
     if hits == 0 and r.returncode != 0:
         return None
     return hits
+
+
+# Scrubbing previews. Every THUMB_EVERY seconds, scaled to THUMB_W and tiled
+# THUMB_COLS x THUMB_ROWS to a sheet, which is the shape Plyr's previewThumbnails
+# expects: a WebVTT cue per frame pointing at a region of a sprite.
+#
+# Keyframe-only decoding is what makes this affordable. Measured on a real
+# film: 79s and 1.3 MB across 46 sheets for 2h36m, against 345s for the full
+# decode the integrity scan does over the same file.
+THUMB_EVERY = 10
+THUMB_W = 160
+THUMB_COLS, THUMB_ROWS = 5, 5
+
+
+def thumbs_dir(jid):
+    return os.path.join(DL, jid + ".thumbs")
+
+
+def vtt_time(t):
+    h, rem = divmod(max(0.0, t), 3600)
+    m, sec = divmod(rem, 60)
+    return "%02d:%02d:%06.3f" % (h, m, sec)
+
+
+def build_thumbs(job, path, timeout=None):
+    """Sprite sheets plus the VTT that indexes them. -> did it work.
+
+    Written to a temporary directory and moved into place at the end, so a
+    half-written set is never served: the player would show blank tiles for
+    the part that had not arrived and there is no way for it to ask again.
+    """
+    dur = job.get("duration") or 0
+    if not path or not os.path.isfile(path) or dur <= 0:
+        return False
+    out = thumbs_dir(job["id"])
+    tmp = out + ".part"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error",
+             # Only keyframes are decoded; everything between them is skipped,
+             # which is the whole reason this costs seconds rather than minutes.
+             "-skip_frame", "nokey", "-i", path,
+             "-vf", "fps=1/%d,scale=%d:-2,tile=%dx%d"
+                    % (THUMB_EVERY, THUMB_W, THUMB_COLS, THUMB_ROWS),
+             "-q:v", "6", os.path.join(tmp, "s%03d.jpg")],
+            capture_output=True, text=True, timeout=timeout)
+        sheets = sorted(f for f in os.listdir(tmp) if f.endswith(".jpg"))
+        if not sheets:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+        # Tile size is read back rather than assumed: scale=W:-2 keeps the
+        # source aspect, so the height depends on the film, not on us.
+        dims = probe_size(os.path.join(tmp, sheets[0]))
+        if not dims:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+        tw, th = dims[0] // THUMB_COLS, dims[1] // THUMB_ROWS
+        per = THUMB_COLS * THUMB_ROWS
+        lines = ["WEBVTT", ""]
+        n = 0
+        for sheet in sheets:
+            for i in range(per):
+                start, end = n * THUMB_EVERY, (n + 1) * THUMB_EVERY
+                if start >= dur:
+                    break
+                x, y = (i % THUMB_COLS) * tw, (i // THUMB_COLS) * th
+                lines += ["%s --> %s" % (vtt_time(start), vtt_time(min(end, dur))),
+                          "%s#xywh=%d,%d,%d,%d" % (sheet, x, y, tw, th), ""]
+                n += 1
+        with open(os.path.join(tmp, "index.vtt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        shutil.rmtree(out, ignore_errors=True)
+        os.replace(tmp, out)
+        return True
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
+
+
+def probe_size(path):
+    """(width, height) of an image or video, or None."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+            capture_output=True, text=True, timeout=20)
+        w, h = r.stdout.strip().split("x")[:2]
+        return int(w), int(h)
+    except Exception:
+        return None
+
+
+def check_thumbs(job, path=None):
+    """Build previews in the background once a film is complete.
+
+    Never a gate in front of playback, same as the integrity scan: the film is
+    watchable long before its scrubber has pictures on it.
+    """
+    path = path or job.get("path")
+    if not path or job.get("thumbs"):
+        return
+    def go():
+        if build_thumbs(job, path) and not job["cancel"].is_set():
+            job["thumbs"] = True
+            record(job, "scrubbing previews ready")
+    threading.Thread(target=go, daemon=True).start()
 
 
 def check_integrity(job, path=None):
@@ -5177,6 +5298,7 @@ def run_job(job):
             sweep_live(job)
         enforce_cache_cap()
         check_integrity(job)
+        check_thumbs(job)
     except Exception as e:
         cleanup()
         fail(job, f"{type(e).__name__}: {e}")
@@ -6661,6 +6783,7 @@ def run_torrent(job):
         if done_src:
             start_subs(job, done_src, name=os.path.basename(done_src))
             check_integrity(job, path=done_src)
+            check_thumbs(job, path=done_src)
 
     # ---- 5. finalize into a seekable file, if this one needed transcoding ---
     # A direct stream is already seekable -- webtorrent's own ranged proxy,
@@ -6753,6 +6876,7 @@ def adopt_finalized(job, out_dir, src, out):
         sweep_live(job)
     enforce_cache_cap()
     check_integrity(job)
+    check_thumbs(job)
 
 
 def finalize_torrent(job, out_dir, chosen):
@@ -7479,6 +7603,13 @@ class H(http.server.BaseHTTPRequestHandler):
         except socket.timeout:
             self.close_connection = True
 
+    def _send_bytes(self, b, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
     def log_message(self, *a):
         pass
 
@@ -7590,6 +7721,32 @@ class H(http.server.BaseHTTPRequestHandler):
                              "lan_url": lan_url() if has_qrcode() else None})
         elif p == "/qr":
             self._qr()
+        elif p.startswith("/thumbs/"):
+            parts = p[len("/thumbs/"):].split("/", 1)
+            # Both halves are checked against what we generated rather than
+            # sanitised: a job id we know, and a filename shaped like one of
+            # ours. Nothing a request supplies is joined to a path untested.
+            ok = (len(parts) == 2 and re.fullmatch(r"[0-9a-f]{6,32}", parts[0])
+                  and re.fullmatch(r"(s\d{3}\.jpg|index\.vtt)", parts[1]))
+            path = os.path.join(thumbs_dir(parts[0]), parts[1]) if ok else None
+            if (not path or not os.path.isfile(path)):
+                # An empty but valid track rather than a 404 body, for the
+                # index the player asks for before any item has previews. Plyr
+                # parses whatever comes back, and handing it a json error
+                # threw inside its vtt parser -- a 404 the caller cannot act
+                # on is worse than an honest empty answer.
+                if ok and parts[1] == "index.vtt":
+                    return self._send_bytes(b"WEBVTT\n\n", "text/vtt")
+                return self._json(404, {"error": "no such preview"})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/vtt" if path.endswith(".vtt")
+                             else "image/jpeg")
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
         elif p.startswith("/static/"):
             path = static_file(p[len("/static/"):])
             if not path:
@@ -8429,6 +8586,15 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     color:var(--faint);background:rgba(16,18,20,.82);border:1px solid var(--rule);
     border-radius:3px;padding:5px 8px}
 
+  /* Scrubbing preview. Fixed, because the stage clips its own overflow and
+     the frame has to sit above the control bar. */
+  .thumb{position:fixed;z-index:60;border:1px solid var(--rule);border-radius:4px;
+    background-color:#000;background-repeat:no-repeat;pointer-events:none;
+    box-shadow:0 6px 20px rgba(0,0,0,.55)}
+  .thumb span{position:absolute;left:0;right:0;bottom:0;text-align:center;
+    font:500 10px/1.6 var(--mono);color:#fff;background:rgba(16,18,20,.72);
+    font-variant-numeric:tabular-nums}
+
   /* Live seek bar. Deliberately not styled like the native scrubber: it does
      something different -- it rebuilds the stream rather than moving within
      one -- and a control that looks identical but pauses for a few seconds
@@ -8739,6 +8905,9 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
        player's own scrubber to seek against. This one seeks by asking the
        server to rebuild the stream from the chosen point, so it is shown only
        while that is the case. -->
+  <!-- Positioned against the viewport rather than the player, so it can sit
+       above the scrubber without the stage's overflow:hidden clipping it. -->
+  <div class="thumb" id="thumb" hidden><span id="thumbtime"></span></div>
   <div class="liveseek" id="liveseek" hidden>
     <div class="lsbar" id="lsbar"><i id="lsfill"></i><b id="lshead"></b></div>
     <span class="lspos" id="lspos">0:00</span>
@@ -9365,29 +9534,139 @@ $('subval').addEventListener('click', () => nudgeSubs(-subShift));   // back to 
    own below. */
 let player = null;
 
+// Which item's previews the player is currently configured for. Plyr reads
+// previewThumbnails once, at construction, so pointing it at a different film
+// means building it again -- cheap, and only done when the item changes.
+let thumbsFor = null;
+
+function playerOpts() {
+  return {
+    // Deliberately close to what was there: this changes how the controls
+    // look, not how the app behaves.
+    controls: ['play-large', 'play', 'progress', 'current-time', 'duration',
+               'mute', 'volume', 'captions', 'settings', 'fullscreen'],
+    settings: ['captions', 'speed'],
+    speed: {selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2]},
+    captions: {active: true, update: true},
+    keyboard: {focused: true, global: false},
+    tooltips: {controls: false, seek: true},
+    invertTime: false,
+    storage: {enabled: true, key: 'reel.plyr'},
+      // Served by us, never fetched from a cdn -- see STATIC.
+    iconUrl: '/static/plyr.svg',
+    blankVideo: '',
+    // Previews are drawn by us, not by Plyr: its module has to be configured
+    // at construction, and re-pointing it means destroy(), which detaches the
+    // <video> and hands back a clone -- measured, document.getElementById('v')
+    // stops being the element every v.* call in this file holds.
+    previewThumbnails: {enabled: false},
+  };
+}
+
 function initPlayer() {
   if (player || typeof Plyr === 'undefined') return;
   try {
-    player = new Plyr(v, {
-      // Deliberately close to what was there: this changes how the controls
-      // look, not how the app behaves.
-      controls: ['play-large', 'play', 'progress', 'current-time', 'duration',
-                 'mute', 'volume', 'captions', 'settings', 'fullscreen'],
-      settings: ['captions', 'speed'],
-      speed: {selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2]},
-      captions: {active: true, update: true},
-      keyboard: {focused: true, global: false},
-      tooltips: {controls: false, seek: true},
-      invertTime: false,
-      storage: {enabled: true, key: 'reel.plyr'},
-      // Served by us, never fetched from a cdn -- see STATIC.
-      iconUrl: '/static/plyr.svg',
-      blankVideo: '',
-    });
+    // Previews are enabled from the start, pointed at nothing. Plyr only
+    // builds its thumbnail module when the option is on at construction, and
+    // rebuilding the player later to turn it on does not work: destroy()
+    // leaves the element in a state the next instance cannot attach to --
+    // measured, isHTML5 false, no progress control in the DOM at all. So the
+    // module is created once and re-pointed as items change.
+    player = new Plyr(v, playerOpts());
   } catch (e) {
     player = null;                 // fall back to whatever the browser gives
   }
 }
+
+/* Scrubbing previews, drawn here rather than by the player -- see the note in
+   playerOpts. The server builds sprite sheets and a WebVTT index; this parses
+   the index once per item and paints the right region of the right sheet as
+   the pointer moves along the scrubber. */
+let thumbCues = [];
+
+function parseVtt(text) {
+  const out = [];
+  const t = s => {
+    const m = s.trim().match(/(?:(\d+):)?(\d{2}):(\d{2}\.\d+)/);
+    if (!m) return null;
+    return (+(m[1] || 0)) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+  };
+  text.split(/\r?\n\r?\n/).forEach(block => {
+    const lines = block.split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2 || !lines[0].includes('-->')) return;
+    const [a, b] = lines[0].split('-->');
+    const m = lines[1].match(/^(\S+)#xywh=(\d+),(\d+),(\d+),(\d+)$/);
+    const start = t(a), end = t(b);
+    if (m && start != null && end != null) {
+      out.push({start, end, sheet: m[1], x: +m[2], y: +m[3], w: +m[4], h: +m[5]});
+    }
+  });
+  return out;
+}
+
+async function syncThumbs(j) {
+  const want = (j && j.thumbs) ? '/thumbs/' + j.id + '/index.vtt' : null;
+  if (want === thumbsFor) return;
+  thumbsFor = want;
+  thumbCues = [];
+  if (!want) return;
+  try {
+    const r = await fetch(want);
+    if (r.ok) thumbCues = parseVtt(await r.text());
+  } catch (e) {}
+}
+
+function cueAt(t) {
+  for (let i = 0; i < thumbCues.length; i++) {
+    if (t >= thumbCues[i].start && t < thumbCues[i].end) return thumbCues[i];
+  }
+  return thumbCues.length && t >= thumbCues[thumbCues.length - 1].start
+       ? thumbCues[thumbCues.length - 1] : null;
+}
+
+function showThumb(ev) {
+  const box = $('thumb');
+  const seek = ev.currentTarget;
+  if (!thumbCues.length || !isFinite(v.duration)) { box.hidden = true; return; }
+  const r = seek.getBoundingClientRect();
+  const frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+  const c = cueAt(frac * v.duration);
+  if (!c) { box.hidden = true; return; }
+  const base = thumbsFor.replace('index.vtt', '');
+  box.hidden = false;
+  box.style.width = c.w + 'px';
+  box.style.height = c.h + 'px';
+  box.style.backgroundImage = 'url("' + base + c.sheet + '")';
+  box.style.backgroundPosition = '-' + c.x + 'px -' + c.y + 'px';
+  // Clamped to the player, so a preview near either end stays on screen.
+  const stage = $('v').closest('.stage').getBoundingClientRect();
+  const left = Math.max(stage.left + 4,
+                        Math.min(ev.clientX - c.w / 2, stage.right - c.w - 4));
+  box.style.left = Math.round(left) + 'px';
+  box.style.top = Math.round(r.top - c.h - 12) + 'px';
+  $('thumbtime').textContent = hms(frac * v.duration);
+}
+
+function hideThumb() { $('thumb').hidden = true; }
+
+// The scrubber only exists once Plyr has built its controls, and it is
+// replaced whenever they are rebuilt, so this attaches on the container.
+// Tested by position rather than by what the pointer landed on. Plyr stacks
+// several elements over its scrubber and rebuilds them whenever the controls
+// change, so matching on the event target -- by tag or by ancestor -- kept
+// missing. Where the pointer is cannot be defeated by either.
+document.addEventListener('mousemove', ev => {
+  const seek = document.querySelector('input[data-plyr="seek"]');
+  if (!seek) return;
+  const r = seek.getBoundingClientRect();
+  const over = r.width > 0 && ev.clientX >= r.left && ev.clientX <= r.right
+            && ev.clientY >= r.top - 8 && ev.clientY <= r.bottom + 8;
+  if (over) showThumb({currentTarget: seek, clientX: ev.clientX});
+  else if (!$('thumb').hidden) hideThumb();
+});
+// Leaving the player entirely should take the preview with it.
+document.addEventListener('mouseleave', hideThumb);
+
 document.addEventListener('DOMContentLoaded', initPlayer);
 if (document.readyState !== 'loading') initPlayer();
 
@@ -9411,7 +9690,8 @@ const hms = t => {
 function liveBar(j) {
   // Shown only when the stream really is unseekable and its length is known:
   // a bar that cannot say where it is pointing is worse than none.
-  const on = !!(j && j.live && !j.seekable && j.duration);
+  // Only when there is no player whose scrubber could have taken this over.
+  const on = !!(j && j.live && !j.seekable && j.duration && !player);
   $('liveseek').hidden = !on;
   if (!on) return;
   liveOffset = j.live_offset || 0;
@@ -9435,6 +9715,44 @@ function seekNote(j) {
   } else if (seekNoteOn) {
     seekNoteOn = false;
     if (j) { cue.textContent = j.title; cue.classList.remove('none'); }
+  }
+}
+
+// One scrubber, whichever kind of stream it is. When the media cannot be
+// seeked -- a fragmented live transcode, which has no index by design -- a
+// click on Plyr's own bar asks the server to rebuild the stream from that
+// point instead. The separate bar below stays only as the fallback for a
+// browser with no player at all.
+document.addEventListener('click', ev => {
+  const seek = document.querySelector('input[data-plyr="seek"]');
+  const j = byId(order[cur]);
+  if (!seek || !j || j.seekable || !j.duration) return;
+  const r = seek.getBoundingClientRect();
+  if (!(ev.clientX >= r.left && ev.clientX <= r.right
+        && ev.clientY >= r.top - 8 && ev.clientY <= r.bottom + 8)) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  const frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+  doLiveSeek(j, frac * j.duration);
+}, true);
+
+async function doLiveSeek(j, want) {
+  if (liveSeeking) return;
+  liveSeeking = true;
+  $('lspos').textContent = 'seeking to ' + hms(want) + '…';
+  cue.textContent = 'rebuilding the stream from ' + hms(want) + '…';
+  cue.classList.remove('none');
+  try {
+    const r = await api('/liveseek', {id: j.id, at: want});
+    if (!r.ok) { cue.textContent = 'cannot seek there'; return; }
+    liveOffset = r.offset || want;
+    v.src = '/live/' + j.id + '?t=' + Date.now();
+    v.load();
+    await v.play().catch(() => {});
+  } catch (e) {
+    cue.textContent = 'seek failed';
+  } finally {
+    liveSeeking = false;
   }
 }
 
@@ -9924,6 +10242,7 @@ function paint() {
   $('next').disabled = !ready(1);
   liveBar(byId(order[cur]));
   seekNote(byId(order[cur]));
+  syncThumbs(byId(order[cur]));
 }
 
 async function remove(id) {

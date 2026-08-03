@@ -36,6 +36,8 @@ import os
 import json
 import queue
 import gzip
+import io
+import secrets
 import struct
 import random
 import binascii
@@ -99,6 +101,11 @@ REQUEST_TIMEOUT = 30
 # The largest request body worth reading. Everything posted here is a small
 # json object, the biggest being a pasted list of magnets.
 MAX_BODY = 1 << 20
+# Ceilings on data pulled in from the network. A subtitle is a few hundred KB
+# and a TMDB/indexer page a few KB, so anything past these is broken or hostile
+# (a decompression bomb, a misbehaving mirror) and must not be read into memory.
+MAX_FETCH = 25 * 1024 * 1024      # any single external body we read
+SUBS_MAX = 8 * 1024 * 1024        # one subtitle, decompressed
 # How long a read will wait for the pieces under it to be fetched on demand
 # (libtorrent only -- see LibtorrentBackend.ensure_range). Measured against a
 # real swarm, an arbitrary seek landed in about 1.4s with nothing competing
@@ -629,6 +636,9 @@ CAN_PAUSE = hasattr(signal, "SIGSTOP")
 LIVE_HEAD = 256 * 1024          # bytes needed before the container can be judged
 LIVE_GIVEUP = 64 * 1024 * 1024  # stop trying to identify it after this much
 LIVE_OPEN = 32 * 1024           # live output must reach this before we serve it
+HLS_SEGMENT_SEC = 1             # HLS segment length; the first frame can't show
+                                # until the first segment closes, so shorter =
+                                # lower time-to-first-frame (more, smaller GETs)
 LIVE_GRACE = 90.0               # keep the live copy this long after the swap
 LIVE_IDLE = 45.0                # give up on a live reader starved this long
 COMPAT_WAIT = 30.0              # hold a compat request this long for its first
@@ -665,10 +675,11 @@ def folder_size_bytes(max_age=SIZE_TTL):
     total = 0
     for root, _dirs, files in os.walk(DL):
         for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except OSError:
-                pass
+            # disk_bytes, not getsize: a libtorrent download is preallocated to
+            # its full logical length before a single piece lands, so counting
+            # st_size reads the folder as over-cap immediately -- and the janitor
+            # then evicts the download it just started. st_blocks is real use.
+            total += disk_bytes(os.path.join(root, f))
     SIZE_CACHE["at"], SIZE_CACHE["bytes"] = now, total
     return total
 
@@ -683,8 +694,12 @@ PLAY_GRACE = 60.0         # nor what the player is on, between range requests
 
 
 def job_dirs(jid):
+    # .thumbs included so previews are swept with everything else -- a removed
+    # item leaving a sprite directory behind would count against the cache cap
+    # forever with nothing able to reach it.
     return [os.path.join(DL, jid + suffix)
-            for suffix in ("_wt", "_raw", "_meta", "_probe")]
+            for suffix in ("_wt", "_raw", "_meta", "_probe", ".thumbs",
+                           ".thumbs.part", ".live.hls", ".compat.live.hls")]
 
 
 def in_use(jid):
@@ -835,6 +850,11 @@ def enforce_cache_cap():
     if folder_size_bytes() <= cap:
         return True
     for _ts, jid, path, kind in evictable():
+        # evictable() checked in_use when it took its snapshot; a viewer may have
+        # opened this item since. Re-check right before deleting so a stale
+        # snapshot can't pull a file out from under an active stream.
+        if jid and in_use(jid):
+            continue
         with LOCK:
             j = JOBS.get(jid) if jid else None
         if j is not None:
@@ -857,6 +877,7 @@ def enforce_cache_cap():
                     os.remove(lf)
                 except OSError:
                     pass
+            shutil.rmtree(live_hls_dir(jid), ignore_errors=True)   # HLS segments
             # A finalized torrent's magnet sidecar (see finalize_torrent) is
             # only useful paired with the file restore() would find it next to;
             # once that file is gone, keeping it would just orphan it.
@@ -1183,6 +1204,18 @@ def release(job):
     WORK_Q.put(job["id"])
 
 
+def overflow_victim():
+    """The download to stop when eviction still can't get us under cap: the
+    newest one nobody is watching. Never an item a viewer is on -- cancelling
+    the very stream someone is watching to reclaim space is the worst trade
+    available, so a watched download is left to run even over cap.
+    """
+    with LOCK:
+        active = [j for j in JOBS.values() if j["status"] == "downloading"]
+    free = [j for j in active if not in_use(j["id"])]
+    return free[-1] if free else None
+
+
 def janitor():
     """Keeps the cap honest *during* transfers, not just after them. If we're
     over cap with nothing left to evict, the newest still-growing download is
@@ -1208,10 +1241,8 @@ def janitor():
                 continue
             if enforce_cache_cap():
                 continue
-            with LOCK:
-                active = [j for j in JOBS.values() if j["status"] == "downloading"]
-            if active:
-                victim = active[-1]
+            victim = overflow_victim()
+            if victim:
                 victim["cancel"].set()
                 victim["overflow"] = True
         except Exception:
@@ -1256,7 +1287,22 @@ def osdb_hash(path):
 def subs_get(url, timeout=SUBS_TIMEOUT):
     req = urllib.request.Request(url, headers={"User-Agent": SUBS_UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+        return r.read(MAX_FETCH)
+
+
+def gunzip_capped(raw, cap=SUBS_MAX):
+    """Decompress gzip bytes, refusing to expand past `cap`.
+
+    gzip.decompress() inflates a crafted bomb to gigabytes in a single call
+    before anyone can check the size; GzipFile.read(cap + 1) stops as soon as it
+    is one byte over, so a hostile subtitle download costs a bounded amount of
+    memory rather than the whole process.
+    """
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as g:
+        out = g.read(cap + 1)
+    if len(out) > cap:
+        raise ValueError("gzip output exceeds the %d-byte cap" % cap)
+    return out
 
 
 def subs_search(moviehash=None, size=0, name=None, lang=None):
@@ -1443,7 +1489,7 @@ def install_subs(job, cand, lang=None):
     try:
         raw = subs_get(cand["SubDownloadLink"])
         if raw[:2] == b"\x1f\x8b":                  # gzip, which it always is
-            raw = gzip.decompress(raw)
+            raw = gunzip_capped(raw)
     except Exception as e:
         job["subs_note"] = "%s: %s" % (type(e).__name__, str(e)[:120])
         return False
@@ -1539,7 +1585,7 @@ def wt_fetch(port, ih, relpath, timeout=45):
     return None
 
 
-def subs_from_torrent(job, port, files, chosen, lang=None):
+def subs_from_torrent(job, port, files, chosen, out_dir, lang=None):
     """Lift subtitles out of the torrent, falling back to searching for them.
 
     Runs on a thread: the file has to arrive over BitTorrent like anything else,
@@ -1550,11 +1596,11 @@ def subs_from_torrent(job, port, files, chosen, lang=None):
 
     def work():
         cands = torrent_subs(files, chosen, lang)
-        ih = job.get("wt_ih") or infohash(job.get("magnet", "") or "")
+        bk = backend()
         for cand in cands[:3]:          # a chosen one can simply never arrive
             if job["cancel"].is_set():
                 return
-            raw = wt_fetch(port, ih, cand["name"])
+            raw = bk.fetch_file(job, port, cand, out_dir)
             if not raw:
                 continue
             if write_subs(job, raw, lang,
@@ -2505,9 +2551,9 @@ def feed_pool(raw):
         imdb = r.get("imdb") or ""
         items.append({"infohash": ih, "name": name, "title": title, "year": year,
                       "imdb": imdb if imdb.startswith("tt") else "",
-                      "seeders": max(0, int(r.get("seeders") or 0)),
-                      "leechers": max(0, int(r.get("leechers") or 0)),
-                      "size": max(0, int(r.get("size") or 0)),
+                      "seeders": max(0, as_int(r.get("seeders"))),
+                      "leechers": max(0, as_int(r.get("leechers"))),
+                      "size": max(0, as_int(r.get("size"))),
                       "files": files, "added": added,
                       "status": r.get("status") or "",
                       "magnet": build_magnet(ih, name)})
@@ -2744,71 +2790,6 @@ def build_catalogue_shelves_tv():
     return [built[n] for n in order if n in built], per
 
 
-ANIME_GENRE = "animation"
-# Well below the general shelves' floors: a beloved series can carry a
-# fraction of a global hit's vote count and still be exactly what this shelf
-# is for, and English-dub availability alone already narrows the field hard.
-ANIME_MOVIE_VOTES = 100
-ANIME_TV_VOTES = 50
-
-
-def build_anime_shelf():
-    """One shelf, films and series together, both requiring an English dub.
-
-    Not two shelves split by kind: Japanese-language animation is a single
-    audience regardless of runtime, and a franchise's film sitting on a
-    different page from its own series would be a stranger split than the one
-    this avoids. Each half still goes through the finder built for its kind
-    -- a season pack and a film are not interchangeable copies -- and the two
-    results are merged and re-ranked together afterwards.
-
-    Neither Animation nor Japanese alone means anime: Animation alone
-    includes Western cartoons, Japanese alone includes live-action. Both
-    genre ids are resolved fresh rather than hardcoded, same as any other
-    catalogue lookup in this file.
-    """
-    now = time.time()
-    today = time.strftime("%Y-%m-%d", time.gmtime(now))
-    per = {}
-
-    movie_gid = tmdb_genres("movie").get(ANIME_GENRE)
-    tv_gid = tmdb_genres("tv").get(ANIME_GENRE)
-    if not movie_gid or not tv_gid:
-        return [], per       # genre list unreachable; skip rather than widen
-
-    movie_rows = tmdb_rows(kind="movie", with_original_language="ja",
-                           with_genres=movie_gid, sort_by="vote_average.desc",
-                           **{"vote_count.gte": ANIME_MOVIE_VOTES,
-                              "primary_release_date.lte": today})
-    tv_rows = tmdb_rows(kind="tv", with_original_language="ja",
-                        with_genres=tv_gid, sort_by="vote_average.desc",
-                        **{"vote_count.gte": ANIME_TV_VOTES,
-                           "first_air_date.lte": today})
-    per["anime/movie"] = len(movie_rows)
-    per["anime/tv"] = len(tv_rows)
-    if not movie_rows and not tv_rows:
-        return [], per
-
-    dub_film = lambda t, y: cached_torrent(t, y, require_dub=True)
-    dub_season = lambda t, y: cached_season(t, y, require_dub=True)
-    films = shelf_from_catalogue(movie_rows, FEED_SHELF, now, finder=dub_film)
-    shows = shelf_from_catalogue(tv_rows, FEED_SHELF, now, finder=dub_season)
-
-    used, combined = set(), []
-    for r in sorted(films + shows, key=lambda r: -r["score"]):
-        key = _norm_title(r["title"])
-        if key in used:
-            continue
-        used.add(key)
-        combined.append(r)
-        if len(combined) >= FEED_SHELF:
-            break
-    if not combined:
-        return [], per
-    return [{"name": "Anime", "note": "Japanese animation, dubbed in English",
-             "films": feed_dress(combined)}], per
-
-
 def build_shelves():
     """Every shelf, filled in order. Returns (shelves, error, sources).
 
@@ -2830,38 +2811,18 @@ def build_shelves():
             s["section"] = "movie"
         return rows, err, per
 
-    try:
-        anime, per = build_anime_shelf()
-    except Exception:
-        anime, per = [], {}
-    # A film sits on exactly one shelf (see the client's own grouping logic);
-    # built first so nothing here is later re-offered by a general shelf that
-    # has no idea it is a dub-specific pick.
-    claimed = {_norm_title(f["title"]) for s in anime for f in s["films"]}
-
-    movies, err, movies_per = build_catalogue_shelves()
-    per.update(movies_per)
-    for s in movies:
-        s["films"] = [f for f in s["films"] if _norm_title(f["title"]) not in claimed]
-    movies = [s for s in movies if s["films"]]
+    movies, err, per = build_catalogue_shelves()
     for s in movies:
         s["section"] = "movie"
-
     try:
         tv, tv_per = build_catalogue_shelves_tv()
     except Exception:
         # A TV-specific fault should cost the TV shelves, not the film ones.
         tv, tv_per = [], {}
-    per.update(tv_per)
-    for s in tv:
-        s["films"] = [f for f in s["films"] if _norm_title(f["title"]) not in claimed]
-    tv = [s for s in tv if s["films"]]
     for s in tv:
         s["section"] = "tv"
-
-    for s in anime:
-        s["section"] = "anime"
-    return movies + tv + anime, err, per
+    per.update(tv_per)
+    return movies + tv, err, per
 
 
 def build_tracker_shelves():
@@ -3004,7 +2965,7 @@ def tmdb_get(path, **params):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "reel/1.0"})
             with urllib.request.urlopen(req, timeout=TMDB_TIMEOUT) as r:
-                return _json.loads(r.read().decode("utf-8", "replace"))
+                return _json.loads(r.read(MAX_FETCH).decode("utf-8", "replace"))
         except Exception:
             if attempt:
                 return None
@@ -3112,7 +3073,7 @@ def catalogue_search(q):
 RES_ORDER = {"480p": 1, "720p": 2, "1080p": 3, "2160p": 4}
 
 
-def find_torrent(title, year=None, min_res=None, require_dub=False):
+def find_torrent(title, year=None, min_res=None):
     """The best copy of a named film on any indexer, or None.
 
     The catalogue chose the film, so this only has to find it -- and has to
@@ -3122,11 +3083,6 @@ def find_torrent(title, year=None, min_res=None, require_dub=False):
     unknown is excluded when one is set, the same way an unknown codec is
     costed as needing a remux elsewhere in this file -- better to say no copy
     than to hand over one that quietly does not meet what was asked for.
-
-    require_dub is the same kind of floor, for a title whose original audio
-    is not English: TMDb has no concept of dub availability at all, so the
-    only place this can be checked is the release name of the specific
-    torrent, the same way a resolution floor is.
     """
     rows, _per = search_all(("%s %s" % (title, year)) if year else title)
     want = _norm_title(title)
@@ -3146,8 +3102,6 @@ def find_torrent(title, year=None, min_res=None, require_dub=False):
             res = read_release(r["name"])["res"]
             if RES_ORDER.get(res, 0) < floor:
                 continue
-        if require_dub and not FEED_DUB.search(_words(r["name"])):
-            continue
         keep.append(r)
     if not keep:
         return None
@@ -3169,21 +3123,17 @@ AVAIL = {}
 AVAIL_LOCK = threading.Lock()
 
 
-def cached_torrent(title, year=None, require_dub=False):
+def cached_torrent(title, year=None):
     """find_torrent, remembered. A miss is cached too -- a film with no copy
     today will not have one in ten minutes, and re-asking is the expensive
-    half of building a shelf.
-
-    Keyed apart when require_dub is set, so a dub-only search's result -- or
-    its miss -- is never handed back to a caller that did not ask for one.
-    """
-    key = _norm_title(title) + "|" + str(year or "") + ("|dub" if require_dub else "")
+    half of building a shelf."""
+    key = _norm_title(title) + "|" + str(year or "")
     now = time.time()
     with AVAIL_LOCK:
         row = AVAIL.get(key)
         if row and now - row[0] < AVAIL_TTL:
             return row[1]
-    hit = find_torrent(title, year, require_dub=require_dub)
+    hit = find_torrent(title, year)
     with AVAIL_LOCK:
         AVAIL[key] = (now, hit)
         if len(AVAIL) > 2000:
@@ -3240,7 +3190,7 @@ def is_real_season(tid, timeout=6):
     return len(season_episode_files(files)) >= 2
 
 
-def find_season(title, year=None, min_res=None, require_dub=False):
+def find_season(title, year=None, min_res=None):
     """The best whole-season copy of a named show, or None.
 
     The acceptance runs the opposite way from find_torrent: there, anything
@@ -3251,9 +3201,6 @@ def find_season(title, year=None, min_res=None, require_dub=False):
     its real file list (is_real_season) before being trusted, in parallel
     across however many of the top candidates it takes to find one that
     survives.
-
-    require_dub: see find_torrent -- the same floor, checked against the same
-    release name, before the pack is ever verified against its file list.
     """
     rows, _per = search_all(("%s %s" % (title, year)) if year else title)
     want = _norm_title(title)
@@ -3276,8 +3223,6 @@ def find_season(title, year=None, min_res=None, require_dub=False):
             res = read_release(r["name"])["res"]
             if RES_ORDER.get(res, 0) < floor:
                 continue
-        if require_dub and not FEED_DUB.search(_words(r["name"])):
-            continue
         keep.append(r)
     if not keep:
         return None
@@ -3301,18 +3246,17 @@ def find_season(title, year=None, min_res=None, require_dub=False):
     return None
 
 
-def cached_season(title, year=None, require_dub=False):
+def cached_season(title, year=None):
     """find_season, remembered -- same reasoning as cached_torrent, and the
     same AVAIL store, keyed apart so a show and a film sharing a title never
-    collide, and again apart for require_dub."""
-    key = ("tv|" + _norm_title(title) + "|" + str(year or "")
-           + ("|dub" if require_dub else ""))
+    collide."""
+    key = "tv|" + _norm_title(title) + "|" + str(year or "")
     now = time.time()
     with AVAIL_LOCK:
         row = AVAIL.get(key)
         if row and now - row[0] < AVAIL_TTL:
             return row[1]
-    hit = find_season(title, year, require_dub=require_dub)
+    hit = find_season(title, year)
     with AVAIL_LOCK:
         AVAIL[key] = (now, hit)
     return hit
@@ -3628,7 +3572,9 @@ def lan_url():
     # Short-lived, not permanent: this one really can change under you, when a
     # laptop moves between networks or a VPN comes up.
     ip = probed("lan_ip", LAN_TTL, lan_ip)
-    return f"http://{ip}:{PORT}" if ip else None
+    # The token rides along so scanning the QR is all a phone needs -- the link
+    # sets the cookie on first load and every later request carries it.
+    return f"http://{ip}:{PORT}/?t={auth_token()}" if ip else None
 
 
 def qr_svg(url):
@@ -3771,17 +3717,9 @@ def new_job(drive_id, jid=None, **extra):
            "audio_tracks": [], "audio_default": 0,
            "caps": None, "vcodec": None, "vpix": None, "play_key": None,
            "live_proc": None,
-           # Bumped by start_live_from_url every time it starts one, so a
-           # background watcher spawned for an older attempt (already killed
-           # by a later seek, but not necessarily reaped yet) can tell its
-           # own signal is stale and must not touch live_ready/live_done on
-           # a newer generation's behalf -- the live file's path is always
-           # the same for a given job, so that alone cannot tell them apart.
-           "live_gen": 0,
            # Seconds into the film that the live stream currently begins at.
            # The player's own clock restarts at zero each time the stream is
            # rebuilt, so this is what turns it back into a real position.
-           "live_offset": 0.0,
            # Set while a read is waiting on pieces, so the player can say what
            # it is waiting for rather than appearing to have stalled.
            "seek_wait": "",
@@ -3800,6 +3738,8 @@ def new_job(drive_id, jid=None, **extra):
            # scanning an entire existing library on every restart is a cost
            # nobody asked to pay just for reopening the app.
            "integrity": None, "integrity_hits": 0,
+           # True once scrubbing previews exist for this item.
+           "thumbs": False,
            # False for a pack sibling: the scheduler will never start or
            # prefetch it on its own, only /start (a click) can. The episode
            # actually chosen when the series was added keeps the normal
@@ -3830,6 +3770,9 @@ def public(job):
             "kind": job.get("kind", "video"), "error": job.get("error", ""),
             "replayable": bool(job.get("drive_id") or job.get("magnet")),
             "live": bool(job.get("live_ready") and job.get("live_file")),
+            # True when the live phase is an HLS stream the client should attach
+            # hls.js to (and whose native seek bar works), vs the legacy tail.
+            "hls": bool(job.get("hls") and job.get("live_ready")),
             "live_kind": job.get("live_kind"),
             # diagnostics: why live did or didn't happen
             "streamable": job.get("streamable"),
@@ -3837,7 +3780,6 @@ def public(job):
                            if job.get("live_file") and os.path.exists(job["live_file"]) else None),
             "live_done": job.get("live_done"),
             "live_note": job.get("live_note", ""),
-            "live_offset": job.get("live_offset") or 0.0,
             "seek_wait": job.get("seek_wait") or "",
             # False once we know the index is at the end of the file. None on a
             # job restored from disk, which never ran a live phase -- reporting
@@ -3904,6 +3846,7 @@ def public(job):
             # goes out as fragments and cannot be seeked
             "seekable": bool(job.get("path") or job.get("wt_direct")),
             "codecs": job.get("wt_codecs", ""),
+            "thumbs": bool(job.get("thumbs")),
             "integrity": job.get("integrity"),
             "integrity_hits": job.get("integrity_hits") or 0}
 
@@ -3972,8 +3915,11 @@ def restore():
     for name in os.listdir(DL):
         p = os.path.join(DL, name)
         if os.path.isdir(p):
-            if name.endswith(("_raw", "_meta", "_probe")):
-                shutil.rmtree(p, ignore_errors=True)   # scratch, never useful
+            if name.endswith(("_raw", "_meta", "_probe", ".live.hls",
+                              ".compat.live.hls")):
+                # Scratch, never useful -- an interrupted HLS live phase leaves a
+                # truncated playlist and partial segments that can't be resumed.
+                shutil.rmtree(p, ignore_errors=True)
             elif name.endswith("_wt"):
                 # resume it if we know what it was; otherwise it's dead weight
                 info = None
@@ -3997,6 +3943,8 @@ def restore():
                                         wt_index=good["index"],
                                         wt_files=good["files"],
                                         title_locked=good["title_locked"])
+                    JOBS[jid]["thumbs"] = os.path.isfile(
+                        os.path.join(thumbs_dir(jid), "index.vtt"))
                 else:
                     shutil.rmtree(p, ignore_errors=True)
             continue
@@ -4051,6 +3999,10 @@ def restore():
                             title=title, audio_tracks=atracks,
                             audio_default=guess_audio_default(atracks),
                             **extra, kind=kind)
+        # Previews survive a restart on disk. Noticing them costs a stat and
+        # saves rebuilding what is already there.
+        JOBS[jid]["thumbs"] = os.path.isfile(
+            os.path.join(thumbs_dir(jid), "index.vtt"))
 
     # Second pass for subtitle sidecars, now that every job is known. One whose
     # job didn't come back is an orphan: it can never be reached, and leaving it
@@ -4185,7 +4137,10 @@ SIZE_UNITS = {"B": 1, "KB": 1e3, "KIB": 1024, "MB": 1e6, "MIB": 1024**2,
 def as_bytes(num, unit):
     try:
         return int(float(num) * SIZE_UNITS.get((unit or "B").upper(), 1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a torrent client can print an absurd figure ('1e400'),
+        # float() gives inf, and int(inf) raises -- best-effort stats must not
+        # crash the line parser over it.
         return None
 
 
@@ -4572,6 +4527,164 @@ def scan_for_corruption(path, timeout=None):
     return hits
 
 
+# Scrubbing previews. Every THUMB_EVERY seconds, scaled to THUMB_W and tiled
+# THUMB_COLS x THUMB_ROWS to a sheet, which is the shape Plyr's previewThumbnails
+# expects: a WebVTT cue per frame pointing at a region of a sprite.
+#
+# Keyframe-only decoding is what makes this affordable. Measured on a real
+# film: 79s and 1.3 MB across 46 sheets for 2h36m, against 345s for the full
+# decode the integrity scan does over the same file.
+THUMB_EVERY = 10
+THUMB_W = 160
+THUMB_COLS, THUMB_ROWS = 5, 5
+
+
+def thumbs_dir(jid):
+    return os.path.join(DL, jid + ".thumbs")
+
+
+def live_hls_dir(jid):
+    """Per-job directory holding the live phase's HLS output: an fMP4 init
+    segment, numbered .m4s media segments, and the growing index.m3u8. The
+    '.live.' token keeps restore()'s hard-exit fragment match working, and the
+    directory is registered in job_dirs() so eviction/removal sweep it whole."""
+    return os.path.join(DL, jid + ".live.hls")
+
+
+def hls_ready(d):
+    """The HLS live output is servable once the init segment exists and the
+    playlist lists at least one media segment (an #EXTINF line)."""
+    try:
+        if not os.path.isfile(os.path.join(d, "init.mp4")):
+            return False
+        with open(os.path.join(d, "index.m3u8")) as f:
+            return "#EXTINF" in f.read()
+    except OSError:
+        return False
+
+
+def hls_live_enabled():
+    """HLS live phase is on when hls.js is vendored and not disabled. REEL_HLS=0
+    forces the legacy fragmented-mp4 path -- the fallback if hls.js is broken."""
+    return has_hls() and os.environ.get("REEL_HLS", "1") != "0"
+
+
+def hls_ffmpeg_cmd(input_args, vfilter, vargs, out_dir, transcoding, maps=None):
+    """ffmpeg args that write an HLS EVENT stream (an fMP4 init segment + numbered
+    .m4s media segments + a growing index.m3u8) into out_dir.
+
+    EVENT keeps every segment and emits no ENDLIST until a clean close, so the
+    player's seekable range grows as the transcode advances. temp_file makes each
+    segment appear atomically (write .tmp, then rename), so a concurrent range GET
+    never sees a half-written segment. The transcode branch forces 2s GOPs for
+    even segments; a stream-copy can only split on the source's own keyframes.
+    """
+    force_kf = (["-force_key_frames", "expr:gte(t,n_forced*2)"] if transcoding
+                else [])
+    return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-progress", "pipe:1", "-nostats", *input_args,
+            *vfilter, *vargs, *(maps or []), *force_kf, "-c:a", "aac", "-ac", "2",
+            "-f", "hls", "-hls_time", str(HLS_SEGMENT_SEC),
+            "-hls_segment_type", "fmp4",
+            "-hls_playlist_type", "event",
+            "-hls_flags", "append_list+independent_segments+temp_file",
+            "-hls_fmp4_init_filename", "init.mp4",
+            "-hls_segment_filename", os.path.join(out_dir, "seg%05d.m4s"),
+            os.path.join(out_dir, "index.m3u8")]
+
+
+def vtt_time(t):
+    h, rem = divmod(max(0.0, t), 3600)
+    m, sec = divmod(rem, 60)
+    return "%02d:%02d:%06.3f" % (h, m, sec)
+
+
+def build_thumbs(job, path, timeout=None):
+    """Sprite sheets plus the VTT that indexes them. -> did it work.
+
+    Written to a temporary directory and moved into place at the end, so a
+    half-written set is never served: the player would show blank tiles for
+    the part that had not arrived and there is no way for it to ask again.
+    """
+    dur = job.get("duration") or 0
+    if not path or not os.path.isfile(path) or dur <= 0:
+        return False
+    out = thumbs_dir(job["id"])
+    tmp = out + ".part"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error",
+             # Only keyframes are decoded; everything between them is skipped,
+             # which is the whole reason this costs seconds rather than minutes.
+             "-skip_frame", "nokey", "-i", path,
+             "-vf", "fps=1/%d,scale=%d:-2,tile=%dx%d"
+                    % (THUMB_EVERY, THUMB_W, THUMB_COLS, THUMB_ROWS),
+             "-q:v", "6", os.path.join(tmp, "s%03d.jpg")],
+            capture_output=True, text=True, timeout=timeout)
+        sheets = sorted(f for f in os.listdir(tmp) if f.endswith(".jpg"))
+        if not sheets:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+        # Tile size is read back rather than assumed: scale=W:-2 keeps the
+        # source aspect, so the height depends on the film, not on us.
+        dims = probe_size(os.path.join(tmp, sheets[0]))
+        if not dims:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+        tw, th = dims[0] // THUMB_COLS, dims[1] // THUMB_ROWS
+        per = THUMB_COLS * THUMB_ROWS
+        lines = ["WEBVTT", ""]
+        n = 0
+        for sheet in sheets:
+            for i in range(per):
+                start, end = n * THUMB_EVERY, (n + 1) * THUMB_EVERY
+                if start >= dur:
+                    break
+                x, y = (i % THUMB_COLS) * tw, (i // THUMB_COLS) * th
+                lines += ["%s --> %s" % (vtt_time(start), vtt_time(min(end, dur))),
+                          "%s#xywh=%d,%d,%d,%d" % (sheet, x, y, tw, th), ""]
+                n += 1
+        with open(os.path.join(tmp, "index.vtt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        shutil.rmtree(out, ignore_errors=True)
+        os.replace(tmp, out)
+        return True
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
+
+
+def probe_size(path):
+    """(width, height) of an image or video, or None."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+            capture_output=True, text=True, timeout=20)
+        w, h = r.stdout.strip().split("x")[:2]
+        return int(w), int(h)
+    except Exception:
+        return None
+
+
+def check_thumbs(job, path=None):
+    """Build previews in the background once a film is complete.
+
+    Never a gate in front of playback, same as the integrity scan: the film is
+    watchable long before its scrubber has pictures on it.
+    """
+    path = path or job.get("path")
+    if not path or job.get("thumbs"):
+        return
+    def go():
+        if build_thumbs(job, path) and not job["cancel"].is_set():
+            job["thumbs"] = True
+            record(job, "scrubbing previews ready")
+    threading.Thread(target=go, daemon=True).start()
+
+
 def check_integrity(job, path=None):
     """Kicks off scan_for_corruption() in the background and records the
     verdict on the job once it lands, without making anything wait for it.
@@ -4848,9 +4961,9 @@ def feed_live(job, raw_dir, proc):
             pass
 
 
-def watch_live(job, raw_dir, kind, proc, out, transcoding):
+def watch_live(job, raw_dir, kind, proc, out, transcoding, errtail=None):
     try:
-        _watch_live(job, raw_dir, kind, proc, out, transcoding)
+        _watch_live(job, raw_dir, kind, proc, out, transcoding, errtail)
     except Exception as e:
         # never leave the job claiming a live stream that isn't there
         job["live_done"] = True
@@ -4858,37 +4971,51 @@ def watch_live(job, raw_dir, kind, proc, out, transcoding):
         job["live_note"] = "watcher failed: %s: %s" % (type(e).__name__, e)
 
 
-def _watch_live(job, raw_dir, kind, proc, out, transcoding):
+def _watch_live(job, raw_dir, kind, proc, out, transcoding, errtail=None):
     proc.wait()
-    err = proc.stderr.read() if proc.stderr else ""
+    err = errtail() if errtail else (proc.stderr.read() if proc.stderr else "")
     if isinstance(err, (bytes, bytearray)):
         err = err.decode("utf-8", "replace")
-    size = os.path.getsize(out) if os.path.exists(out) else 0
+    # HLS output is a directory of segments, not one growing file, so readiness
+    # is hls_ready() rather than a byte count on `out` (which is the tiny .m3u8).
+    if job.get("hls"):
+        servable = hls_ready(job.get("live_dir") or "")
+        size = None
+    else:
+        size = os.path.getsize(out) if os.path.exists(out) else 0
+        servable = size >= LIVE_OPEN
 
     # A stream copy can be refused outright — a codec the MP4 container won't
     # accept. Worth one retry that re-encodes, but only while the download is
     # still running; otherwise phase 2 is about to produce the real file anyway.
-    if (proc.returncode != 0 and size < LIVE_OPEN and kind == "video"
+    if (proc.returncode != 0 and not servable and kind == "video"
             and not transcoding and not job["cancel"].is_set()
             and not job.get("dl_done")):
-        try:
-            os.remove(out)
-        except OSError:
-            pass
+        if job.get("hls"):
+            shutil.rmtree(job.get("live_dir") or live_hls_dir(job["id"]),
+                          ignore_errors=True)
+        else:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
         job["live_note"] = tail(err, 2, 160)
         start_live(job, raw_dir, kind, transcoding=True)
         return
 
     job["live_done"] = True
-    if proc.returncode != 0 or size < LIVE_OPEN:
+    if proc.returncode != 0 or not servable:
         job["live_note"] = (("transcoded, " if transcoding else "copy, ")
-                            + "rc=%s, %s bytes; " % (proc.returncode, size)
+                            + "rc=%s, %s; " % (proc.returncode,
+                              "hls" if job.get("hls") else "%s bytes" % size)
                             + tail(err, 3, 200))
-    if size < LIVE_OPEN:
+    if not servable:
         # nothing servable came out; don't advertise it
         job["live_file"] = None
         job["live_ready"] = False
-        if size == 0:
+        # streamable=False only when truly nothing was produced (a file path with
+        # 0 bytes); a partial HLS attempt still lets phase 2 build the real file.
+        if not job.get("hls") and size == 0:
             job["streamable"] = False
 
 
@@ -4908,7 +5035,6 @@ def start_live(job, raw_dir, kind, transcoding=False, vcodec=None,
                # file stays empty until close — nothing to serve
                "-flush_packets", "1", "-f", "mp3", out]
     else:
-        out = os.path.join(DL, job["id"] + ".live.mp4")
         if transcoding:
             vargs = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "26"]
             vfilter, vnote = [], "re-encoded for the live stream"
@@ -4918,14 +5044,27 @@ def start_live(job, raw_dir, kind, transcoding=False, vcodec=None,
                                                or None)
         if vnote:
             job["note"] = (job.get("note", "") + "; " + vnote).strip("; ")
-        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-               "-progress", "pipe:1", "-nostats",
-               "-i", "pipe:0", *vfilter, *vargs,
-               "-c:a", "aac", "-ac", "2", "-f", "mp4",
-               # empty_moov puts a playable header up front; frag_keyframe closes
-               # a fragment on every keyframe so the browser gets data early.
-               "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-               "-frag_duration", "1500000", "-flush_packets", "1", out]
+        if hls_live_enabled():
+            # HLS EVENT stream: segments the browser's own seek bar can scrub.
+            d = live_hls_dir(job["id"])
+            shutil.rmtree(d, ignore_errors=True)      # clear any prior attempt
+            os.makedirs(d, exist_ok=True)
+            out = os.path.join(d, "index.m3u8")
+            cmd = hls_ffmpeg_cmd(["-i", "pipe:0"], vfilter, vargs, d, transcoding)
+            job["hls"] = True
+            job["live_dir"] = d
+        else:
+            # Legacy fallback (no/broken hls.js): one growing fragmented mp4,
+            # unseekable. empty_moov puts a playable header up front; frag_keyframe
+            # closes a fragment on every keyframe so the browser gets data early.
+            out = os.path.join(DL, job["id"] + ".live.mp4")
+            job["hls"] = False
+            cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                   "-progress", "pipe:1", "-nostats",
+                   "-i", "pipe:0", *vfilter, *vargs,
+                   "-c:a", "aac", "-ac", "2", "-f", "mp4",
+                   "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                   "-frag_duration", "1500000", "-flush_packets", "1", out]
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE,
@@ -4937,11 +5076,12 @@ def start_live(job, raw_dir, kind, transcoding=False, vcodec=None,
     job["live_file"] = out
     job["live_kind"] = kind
     job["live_transcoded"] = transcoding
+    errtail = drain_stream(proc.stderr)
     threading.Thread(target=read_progress, args=(job, proc.stdout),
                      daemon=True).start()
     threading.Thread(target=feed_live, args=(job, raw_dir, proc), daemon=True).start()
     threading.Thread(target=watch_live,
-                     args=(job, raw_dir, kind, proc, out, transcoding),
+                     args=(job, raw_dir, kind, proc, out, transcoding, errtail),
                      daemon=True).start()
 
 
@@ -4970,19 +5110,67 @@ def read_progress(job, stream, key="encode_speed", total_s=None, pct_key=None):
         pass
 
 
+def drain_stream(stream, cap=64 * 1024):
+    """Continuously drain a child's pipe (usually stderr) into a bounded tail
+    buffer from a daemon thread, so the child can never block writing to a full
+    pipe -- which would hang proc.wait() forever. Returns collect(timeout) that
+    yields the captured tail (bytes or str, matching what the pipe produces);
+    call it after the process has exited to get the final tail.
+
+    The counterpart to read_progress, which drains stdout: every ffmpeg here has
+    both pipes, and reading stderr only after wait() (as the watchers used to)
+    deadlocks the moment a corrupt source dumps more than a pipe-buffer of decode
+    errors. We keep reading regardless and discard the oldest bytes past `cap`,
+    so a megabyte of errors costs a fixed amount of memory, not the whole flood.
+    """
+    if stream is None:
+        return lambda timeout=None: b""
+    buf = []
+    size = [0]
+
+    def pump():
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                buf.append(chunk)
+                size[0] += len(chunk)
+                while size[0] > cap and len(buf) > 1:
+                    size[0] -= len(buf.pop(0))
+        except Exception:
+            pass
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+
+    def collect(timeout=5.0):
+        t.join(timeout)
+        if not buf:
+            return b""
+        return (b"" if isinstance(buf[0], (bytes, bytearray)) else "").join(buf)
+
+    return collect
+
+
 def sweep_live(job, delay=LIVE_GRACE):
     """Drop the live copy once the player has had time to swap to the seekable
     one. Keeping both forever would double what every item costs in cache."""
     def go():
         time.sleep(delay)
         lf = job.get("live_file")
+        d = job.get("live_dir") or live_hls_dir(job["id"])
         job["live_file"] = None
+        job["live_dir"] = None
         job["live_ready"] = False
+        # A live phase leaves either a single fragmented file (audio/legacy) or a
+        # directory of HLS segments; sweep whichever is there.
         if lf and os.path.exists(lf):
             try:
                 os.remove(lf)
             except OSError:
                 pass
+        shutil.rmtree(d, ignore_errors=True)
     threading.Thread(target=go, daemon=True).start()
 
 
@@ -5103,7 +5291,8 @@ def run_job(job):
                 lf = job.get("live_file")
                 if lf and not job.get("live_ready"):
                     try:
-                        if os.path.getsize(lf) >= LIVE_OPEN:
+                        if (hls_ready(job["live_dir"]) if job.get("hls")
+                                else os.path.getsize(lf) >= LIVE_OPEN):
                             job["live_ready"] = True   # playable from here on
                     except OSError:
                         pass
@@ -5286,6 +5475,7 @@ def run_job(job):
             sweep_live(job)
         enforce_cache_cap()
         check_integrity(job)
+        check_thumbs(job)
     except Exception as e:
         cleanup()
         fail(job, f"{type(e).__name__}: {e}")
@@ -5293,8 +5483,16 @@ def run_job(job):
 
 # ---- torrents ----------------------------------------------------------------
 
-def bdecode(data, i=0):
-    """Minimal bencode reader, enough for a .torrent's info dict."""
+def bdecode(data, i=0, depth=0):
+    """Minimal bencode reader, enough for a .torrent's info dict.
+
+    Depth-guarded: a hostile .torrent of deeply nested lists (b'lll...') would
+    otherwise recurse until the interpreter's stack gives out. Callers wrap this
+    in try/except, so a bounded ValueError degrades to '[]/"" on bad input',
+    where an unbounded RecursionError could take the thread down.
+    """
+    if depth > 200:
+        raise ValueError("bencode nested too deep")
     c = data[i:i + 1]
     if c == b"i":
         j = data.index(b"e", i)
@@ -5302,14 +5500,14 @@ def bdecode(data, i=0):
     if c == b"l":
         out, i = [], i + 1
         while data[i:i + 1] != b"e":
-            v, i = bdecode(data, i)
+            v, i = bdecode(data, i, depth + 1)
             out.append(v)
         return out, i + 1
     if c == b"d":
         out, i = {}, i + 1
         while data[i:i + 1] != b"e":
-            k, i = bdecode(data, i)
-            v, i = bdecode(data, i)
+            k, i = bdecode(data, i, depth + 1)
+            v, i = bdecode(data, i, depth + 1)
             out[k] = v
         return out, i + 1
     j = data.index(b":", i)
@@ -5345,18 +5543,22 @@ def torrent_files(path):
             meta, _ = bdecode(f.read())
         info = meta[b"info"]
         root = info[b"name"].decode("utf-8", "replace")
+        out = []
+        # Inside the try on purpose: a bencode-valid file can still be
+        # semantically malformed -- an entry missing b'path', a b'length' that
+        # is not an int -- and the contract is '[] on bad input', not a KeyError
+        # thrown at fetch_metadata from outside any guard.
+        if b"files" in info:
+            for i, fe in enumerate(info[b"files"]):
+                parts = [p.decode("utf-8", "replace") for p in fe[b"path"]]
+                out.append({"index": i, "name": "/".join([root] + parts),
+                            "size": int(fe[b"length"]), "rel": "/".join(parts)})
+        else:
+            out.append({"index": 0, "name": root,
+                        "size": int(info.get(b"length", 0)), "rel": root})
+        return out
     except Exception:
         return []
-    out = []
-    if b"files" in info:
-        for i, fe in enumerate(info[b"files"]):
-            parts = [p.decode("utf-8", "replace") for p in fe[b"path"]]
-            out.append({"index": i, "name": "/".join([root] + parts),
-                        "size": int(fe[b"length"]), "rel": "/".join(parts)})
-    else:
-        out.append({"index": 0, "name": root, "size": int(info.get(b"length", 0)),
-                    "rel": root})
-    return out
 
 
 def fetch_metadata(job, magnet, port, limit):
@@ -5915,6 +6117,13 @@ class WebTorrentBackend:
         """
         return False
 
+    def fetch_file(self, job, port, cand, out_dir, timeout=None):
+        """-> the bytes of a file inside the torrent that was never selected
+        for download, read over the client's own http server the same way
+        stream_url does."""
+        ih = job.get("wt_ih") or infohash(job.get("magnet", "") or "")
+        return wt_fetch(port, ih, cand["name"], timeout=timeout or 45)
+
 
 class _TorrentProc:
     """A libtorrent handle wearing enough of Popen's shape to pass for one.
@@ -6002,6 +6211,16 @@ class LibtorrentBackend:
                     # letting each job poll would have them stealing each
                     # other's, since pop_alerts empties the queue for everyone.
                     "alert_mask": lt.alert.category_t.storage_notification,
+                    # Peer discovery beyond the trackers, so a thin or
+                    # tracker-less swarm still finds seeders -- which is the
+                    # actual limiter on torrent download speed. Set explicitly
+                    # rather than trusting a given libtorrent build's defaults.
+                    # (Peer exchange rides in on libtorrent's default ut_pex
+                    # extension, which lt.session loads on its own.)
+                    "enable_dht": True,
+                    "enable_lsd": True,
+                    "enable_upnp": True,
+                    "enable_natpmp": True,
                 })
                 threading.Thread(target=self._pump, daemon=True).start()
             return self._ses
@@ -6369,6 +6588,62 @@ class LibtorrentBackend:
             except Exception:
                 pass
 
+    def fetch_file(self, job, port, cand, out_dir, timeout=None):
+        """Read an arbitrary file out of the torrent -- one that was never
+        selected for download -- by bumping just its own pieces rather than
+        `ensure_range`'s selected-file assumption (it maps offsets against
+        `job["wt_index"]`, the wrong file for anything else in the torrent).
+
+        Used for subtitles bundled alongside the chosen video: small enough
+        that fetching the whole file up front costs nothing, and there is no
+        second read coming to amortize a partial one against.
+        """
+        h = job.get("_lt")
+        if not (h is not None and h.is_valid()):
+            return None
+        import libtorrent as lt
+        try:
+            ti = h.torrent_file()
+            if ti is None:
+                return None
+            idx = int(cand.get("index") or 0)
+            size = int(cand.get("size") or 0)
+            if size <= 0:
+                return None
+            first = ti.map_file(idx, 0, 1).piece
+            last = ti.map_file(idx, size - 1, 1).piece
+            first, last = max(0, first), min(ti.num_pieces() - 1, last)
+            if timeout is None:
+                timeout = seek_wait_for(ti.piece_length())
+        except Exception:
+            return None
+        want = range(first, last + 1)
+        try:
+            if not all(h.have_piece(p) for p in want):
+                h.unset_flags(lt.torrent_flags.sequential_download)
+                for n, p in enumerate(want):
+                    if not h.have_piece(p):
+                        h.piece_priority(p, 7)
+                        h.set_piece_deadline(p, n * 100)
+                deadline = time.time() + (timeout or LT_SEEK_WAIT_MAX)
+                while time.time() < deadline and not job["cancel"].is_set():
+                    if all(h.have_piece(p) for p in want):
+                        break
+                    time.sleep(0.05)
+        except Exception:
+            pass
+        finally:
+            try:
+                h.set_flags(lt.torrent_flags.sequential_download)
+            except Exception:
+                pass
+        path = os.path.join(out_dir, cand["name"])
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
 
 TORRENT_BACKENDS = {"webtorrent": WebTorrentBackend, "wt": WebTorrentBackend,
                     "libtorrent": LibtorrentBackend, "lt": LibtorrentBackend}
@@ -6567,13 +6842,15 @@ def run_torrent(job):
         # file is preallocated to its full length, so a seek anywhere is a
         # legitimate request and ensure_range fetches what it lands on.
         job["lt_file"] = url
-        job["wt_direct"] = True
-        # We are the range server for this file, so ranges are not in doubt.
-        # Left False, the direct-play test below could never pass on this
-        # backend and every download was transcoded whatever was in it --
-        # which is the waste the re-probe above exists to avoid, arrived at
-        # by a different route. The container and codec checks still decide
-        # whether direct play is actually safe.
+        # wt_ranges only -- ranges are not in doubt, since we are the range
+        # server for this file. wt_direct stays False here on purpose: it
+        # doubles as the client-facing "seekable" signal (see public()), and
+        # setting it before the codec/container check below decided anything
+        # made every torrent needing conversion look direct-playable to the
+        # browser -- video would decode, audio wouldn't (DTS, TrueHD, or any
+        # other codec a browser refuses), and it silently served raw bytes
+        # over the working transcoded stream. The direct-play test below is
+        # what actually earns this flag, and is the only place that may set it.
         job["wt_ranges"] = True
     elif not url:
         # No usable endpoint. Rather than give up, fall back to piping the file
@@ -6637,13 +6914,12 @@ def run_torrent(job):
     # through the range handler and fetch the pieces they land on.
     probe_src, probe_alt = url, None
     if job.get("lt_file"):
-        probe_alt = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
-    # Wanted below to judge how far a probe can be trusted, not just to tag
-    # the container -- moved up from where this used to sit, after probing.
-    ext = os.path.splitext(urllib.parse.unquote(
-        urllib.parse.urlparse(url).path))[1].lower()
-    if not ext:
-        ext = os.path.splitext((chosen or {}).get("name") or "")[1].lower()
+        # ?t=... because every route this server has requires the install
+        # token now -- without it ffprobe/ffmpeg's own request comes back a
+        # plain 403, which reads identically to "nothing here yet" and used
+        # to be blamed on the swarm.
+        probe_alt = "http://127.0.0.1:%d/stream/%s?t=%s" % (PORT, job["id"],
+                                                              auth_token())
     # The file itself first. For a faststart file the header is at the front
     # and already on disk, so this costs a local read. Going through our own
     # range handler is what lets a probe seek to the tail -- which a file with
@@ -6652,16 +6928,7 @@ def run_torrent(job):
     # two-peer torrent, the probe alone took 10.5s of a 46s start. So the
     # expensive route is kept for the case that actually needs it.
     probed = job.get("wt_probe") or probe_media(probe_src, timeout=20)
-    # A video container that came back with only an audio codec is exactly as
-    # untrustworthy as one that came back with nothing: a real audio release
-    # is not shipped in .mkv/.mp4, so this is a video track whose header the
-    # swarm has not delivered yet, read a few seconds into a fresh download
-    # (Arrival, 8s in: "-/dts", filed as an audio job with a duration ffprobe
-    # extrapolated from a sliver of the file -- 9h06m for a 1h56m film).
-    # Checking it the same way the all-empty case already does, rather than
-    # trusting a probe that only got half an answer.
-    untrustworthy = lambda p: p[0] is None and (p[1] is None or ext in VIDEO_EXT)
-    if probe_alt and untrustworthy(probed):
+    if probe_alt and probed[0] is None and probed[1] is None:
         probed = probe_media(probe_alt, timeout=45)
     v, a, vh, hdr, br, dur, pix = probed
     # A probe run while the swarm is still starved comes back empty -- not because
@@ -6672,7 +6939,7 @@ def run_torrent(job):
     # ffmpeg at 61%, producing what the browser would have played as it arrived.
     # So when the probe learns nothing, wait for the download to be moving and ask
     # again before committing to an encode that cannot be undone.
-    if untrustworthy(probed) and not job["cancel"].is_set():
+    if v is None and a is None and not job["cancel"].is_set():
         for _ in range(int(WT_REPROBE_WAIT / 2)):
             if job["cancel"].is_set():
                 break
@@ -6681,9 +6948,6 @@ def run_torrent(job):
                 break
             time.sleep(2.0)
         again = probe_media(probe_alt or probe_src, timeout=45)
-        # Whatever this found is more recent than the first attempt, even if
-        # it is still only partial -- one retry is the bound, not a promise
-        # of a clean answer, the same as the all-empty case already accepts.
         if again[0] is not None or again[1] is not None:
             probed = again
             v, a, vh, hdr, br, dur, pix = probed
@@ -6697,6 +6961,10 @@ def run_torrent(job):
     # Matroska whatever is inside it, so an h264/AAC .mkv served straight
     # through was marked seekable, skipped finalizing, and then simply refused
     # to play -- silent failure, which is worse than an unnecessary remux.
+    ext = os.path.splitext(urllib.parse.unquote(
+        urllib.parse.urlparse(url).path))[1].lower()
+    if not ext:
+        ext = os.path.splitext((chosen or {}).get("name") or "")[1].lower()
     direct = (job.get("wt_ranges") and ext in BROWSER_CONTAINERS
               and (v is None or (v in BROWSER_VIDEO and pix_ok(pix)))
               and (a in BROWSER_AUDIO or a is None)
@@ -6718,7 +6986,7 @@ def run_torrent(job):
     # The torrent's own subtitles first: they were made for this exact file, so
     # they cannot drift, and for television they are usually the only ones that
     # exist. Falls back to searching when the torrent carries none.
-    subs_from_torrent(job, port, files, chosen)
+    subs_from_torrent(job, port, files, chosen, out_dir)
     if direct:
         # Best case: hand the browser webtorrent's own ranged stream. Seeking
         # works immediately and no transcode happens at all.
@@ -6729,27 +6997,8 @@ def run_torrent(job):
         job["timings"]["total"] = round(time.time() - t_meta, 1)
         job["note"] = (job.get("note", "") + "; direct stream, seekable").strip("; ")
     else:
-        # Codec or container the browser won't take. A local backend set this
-        # True on locating the file, before this verdict existed, so the
-        # client could start on /stream/ the instant a compatible file was
-        # ready -- that guess was wrong, and left uncorrected here it lied to
-        # every poll after: seekable stayed True forever, the client kept
-        # pulling the raw file instead of /live/, and finalize_torrent below
-        # (which is what actually transcodes eac3 et al.) never ran because
-        # it's gated on this same flag being False. A film could sit at
-        # "streaming" with silent audio for its entire runtime.
-        job["wt_direct"] = False
-        # ffmpeg reads the *seekable* http url, so where the index sits no
-        # longer matters. For a local backend that url is reel's own
-        # /stream/ route, not the raw path on disk -- read directly, the
-        # file is preallocated to its full length, so the encoder would run
-        # off the end of what has actually downloaded into a stretch of
-        # zeros and (observed against a real download) quietly call that the
-        # end of the film: rc=0, a plausible-looking output, hours before the
-        # torrent itself was done. Going through /stream/ is what makes a
-        # read past the frontier block on the real piece instead.
-        live_src = ("http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
-                    if job.get("lt_file") else url)
+        # Codec or container the browser won't take. ffmpeg reads the *seekable*
+        # http url, so where the index sits no longer matters.
         job["streamable"] = True
         job["status"] = "downloading"
         # Nothing to preview when every byte is already here -- a restored
@@ -6764,21 +7013,26 @@ def run_torrent(job):
             job["note"] = (job.get("note", "") +
                            "; already downloaded, finalizing").strip("; ")
         else:
-            # Bumped before starting, same as live_seek() bumps before
-            # killing: a viewer can seek immediately, even before this first
-            # stream finishes starting up, and that race is exactly what
-            # live_gen exists to lose safely rather than win by accident.
-            job["live_gen"] = job.get("live_gen", 0) + 1
+            # A local backend's `url` is the raw file on disk here (see
+            # probe_alt above) -- preallocated to its full length, so ffmpeg
+            # reading it directly with no piece awareness can race straight
+            # past the download's real front into the zeros still sitting in
+            # whatever hasn't arrived yet. It has no way to tell the
+            # difference: it just decodes them, out_time_us climbs as if that
+            # were real progress, and the muxer eventually chokes on the
+            # garbage -- a live stream that stops a few seconds in no matter
+            # how far the download has actually reached. Reel's own /stream
+            # route is what the probe above already trusts for exactly this
+            # reason: it goes through ensure_range, which waits for a piece to
+            # really be there rather than serving what's preallocated in its
+            # place.
+            live_src = probe_alt if job.get("lt_file") else url
             start_live_from_url(job, live_src, job["kind"], v, vh, hdr, pix)
-            # From here, a viewer seeking is live_seek()'s own newer attempt
-            # to report readiness for, not this loop's to fail over.
-            my_gen = job.get("live_gen")
             deadline = time.time() + 90
             while time.time() < deadline and not job["cancel"].is_set():
-                if job.get("live_gen") != my_gen:
-                    break
                 lf = job.get("live_file")
-                if lf and os.path.exists(lf) and os.path.getsize(lf) >= LIVE_OPEN:
+                if lf and (hls_ready(job["live_dir"]) if job.get("hls")
+                           else os.path.exists(lf) and os.path.getsize(lf) >= LIVE_OPEN):
                     job["live_ready"] = True
                     job["status"] = "streaming"
                     job["timings"]["total"] = round(time.time() - t_meta, 1)
@@ -6786,7 +7040,7 @@ def run_torrent(job):
                 if job.get("live_done"):
                     break
                 time.sleep(0.4)
-            if not job.get("live_ready") and job.get("live_gen") == my_gen:
+            if not job.get("live_ready"):
                 # Stop the encoder first. Without this it outlives the job and
                 # keeps reading a webtorrent server that has already gone, which
                 # left a stray ffmpeg running minutes after the row said failed.
@@ -6794,7 +7048,7 @@ def run_torrent(job):
                 if not tree_bytes(out_dir):
                     cleanup()      # keep any real bytes so a retry can resume
                 return fail(job, "Couldn't convert the torrent stream from %s -- %s"
-                            % (live_src, tail(job.get("live_note", ""), 3, 220)
+                            % (url, tail(job.get("live_note", ""), 3, 220)
                                or "ffmpeg produced nothing"))
 
     # ---- 4. follow progress -------------------------------------------------
@@ -6822,6 +7076,7 @@ def run_torrent(job):
         if done_src:
             start_subs(job, done_src, name=os.path.basename(done_src))
             check_integrity(job, path=done_src)
+            check_thumbs(job, path=done_src)
 
     # ---- 5. finalize into a seekable file, if this one needed transcoding ---
     # A direct stream is already seekable -- webtorrent's own ranged proxy,
@@ -6914,6 +7169,7 @@ def adopt_finalized(job, out_dir, src, out):
         sweep_live(job)
     enforce_cache_cap()
     check_integrity(job)
+    check_thumbs(job)
 
 
 def finalize_torrent(job, out_dir, chosen):
@@ -7073,6 +7329,8 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
         return False
     job["procs"].append(src)
     job["wt_proc"] = src
+    drain_stream(src.stderr)   # webtorrent's stderr, drained so a full pipe
+                               # can't block the bytes it feeds into ffmpeg
 
     # Give the on-disk copy a moment so the codecs can be identified; without
     # that we'd have to guess whether the video needs transcoding.
@@ -7099,7 +7357,6 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
               "-c:a", "libmp3lame", "-q:a", "4", "-flush_packets", "1",
               "-f", "mp3", out]
     else:
-        out = os.path.join(DL, job["id"] + ".live.mp4")
         # f is the same file webtorrent is writing to disk as it feeds the pipe,
         # so its stream order matches pipe:0's -- probing it is the only way to
         # see language tags here, since ffprobe can't also read the pipe itself
@@ -7111,11 +7368,24 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
         if ordered:
             job["audio_tracks"] = ordered
             job["audio_default"] = 0
-        ff = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-              "-progress", "pipe:1", "-nostats", "-i", "pipe:0", *vfilter, *vargs,
-              "-map", "0:v:0", *amaps, *ameta, "-c:a", "aac", "-ac", "2", "-f", "mp4",
-              "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-              "-frag_duration", "1500000", "-flush_packets", "1", out]
+        maps = ["-map", "0:v:0", *amaps, *ameta]
+        if hls_live_enabled():
+            d = live_hls_dir(job["id"])
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d, exist_ok=True)
+            out = os.path.join(d, "index.m3u8")
+            ff = hls_ffmpeg_cmd(["-i", "pipe:0"], vfilter, vargs, d,
+                                "copy" not in vargs, maps=maps)
+            job["hls"] = True
+            job["live_dir"] = d
+        else:
+            out = os.path.join(DL, job["id"] + ".live.mp4")
+            job["hls"] = False
+            ff = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                  "-progress", "pipe:1", "-nostats", "-i", "pipe:0", *vfilter, *vargs,
+                  *maps, "-c:a", "aac", "-ac", "2", "-f", "mp4",
+                  "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                  "-frag_duration", "1500000", "-flush_packets", "1", out]
     try:
         enc = subprocess.Popen(ff, stdin=src.stdout, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True)
@@ -7124,6 +7394,7 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
         return False
     src.stdout.close()               # ffmpeg owns the read end now
     job["procs"].append(enc)
+    enc_err = drain_stream(enc.stderr)
     job["live_file"] = out
     job["live_kind"] = job["kind"]
     job["wt_ranges"] = False
@@ -7149,16 +7420,23 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
             pass
         enc.wait()
         job["live_done"] = True
-        size = os.path.getsize(out) if os.path.exists(out) else 0
-        if enc.returncode != 0 or size < LIVE_OPEN:
-            err = enc.stderr.read() if enc.stderr else ""
-            job["live_note"] = "pipe rc=%s %s bytes; %s" % (enc.returncode, size,
-                                                            tail(err, 3, 200))
+        if job.get("hls"):
+            servable = hls_ready(job.get("live_dir") or "")
+            where = "hls"
+        else:
+            sz = os.path.getsize(out) if os.path.exists(out) else 0
+            servable = sz >= LIVE_OPEN
+            where = "%s bytes" % sz
+        if enc.returncode != 0 or not servable:
+            err = enc_err()
+            job["live_note"] = "pipe rc=%s %s; %s" % (enc.returncode, where,
+                                                      tail(err, 3, 200))
     threading.Thread(target=watch, daemon=True).start()
 
     deadline = time.time() + 120
     while time.time() < deadline and not job["cancel"].is_set():
-        if os.path.exists(out) and os.path.getsize(out) >= LIVE_OPEN:
+        if (hls_ready(job["live_dir"]) if job.get("hls")
+                else os.path.exists(out) and os.path.getsize(out) >= LIVE_OPEN):
             job["live_ready"] = True
             job["streamable"] = True
             job["status"] = "streaming"
@@ -7180,151 +7458,46 @@ def follow_pipe_progress(job, out_dir):
         time.sleep(1.0)
 
 
-def live_seek(job, at):
-    """Restart a live item's stream so it begins at `at` seconds. -> started?
-
-    A fragmented mp4 has no index to seek against -- that absence is exactly
-    what lets it start playing before the file is complete -- so the player
-    cannot seek one however much of it has arrived. The way to move a live
-    viewer is to build them a different stream.
-
-    ffmpeg reads reel's own /stream/ route rather than the file on disk, so
-    its reads pass through the range handler and pull the pieces under them on
-    the way (ensure_range). Pointing it straight at the file would have it
-    read preallocated zeros wherever the download has not reached.
-    """
-    # A finished job is already natively seekable through /stream/ -- the
-    # player's own scrubber handles it instantly, with no encode at all. A
-    # stale client (its poll hasn't caught up to the job finishing) can still
-    # send this; rebuilding a live stream for it would tear nothing down and
-    # spawn a needless re-encode of a film already complete, which is what a
-    # seek on a just-finished item looked like: the player switching from the
-    # real, finished file to a fresh transcode restarting from that point,
-    # indistinguishable from a hang until it caught back up.
-    if job.get("path"):
-        return False
-    # Any source that answers ranges will do. A local backend's file is read
-    # back through reel's own route so the pieces under each read are fetched
-    # on the way; webtorrent's server is read directly, since it is already
-    # http and reel has no piece control over it either way. Without one of
-    # those there is nothing to seek in.
-    if job.get("lt_file"):
-        src = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
-    elif job.get("wt_url") and job.get("wt_ranges"):
-        src = job["wt_url"]
-    else:
-        return False
-    try:
-        at = max(0.0, float(at))
-    except (TypeError, ValueError):
-        return False
-    dur = job.get("duration") or 0
-    if dur and at > max(0.0, dur - 2):
-        return False                      # past the end; nothing to show
-    # Bumped here, before the kill below, rather than inside
-    # start_live_from_url(): a killed process is not necessarily reaped
-    # before this function returns, and its own watch() thread can still be
-    # checking live_gen at the moment it finally exits. Bumping it only once
-    # start_live_from_url() gets around to it left a window between the kill
-    # and the bump where that stale watch() thread would see the generation
-    # it started with still current -- exactly the race this whole mechanism
-    # exists to close, just moved one step earlier. Measured against a real
-    # seek: live_gen read 2 (this call had already run), live_done was still
-    # True from generation 1's late exit, because the bump had not happened
-    # yet at the moment that exit was checked against it.
-    job["live_gen"] = job.get("live_gen", 0) + 1
-    # Stop the encode that is running, and the feeder pushing into it. Its
-    # output file is replaced rather than appended to, so a viewer who is
-    # still reading the old one gets a clean end instead of two streams
-    # interleaved.
-    for p in (job.get("live_proc"), job.get("compat_proc")):
-        if p is not None:
-            try:
-                if p.poll() is None:
-                    p.kill()
-            except Exception:
-                pass
-    old_file = job.get("live_file")
-    job["live_ready"] = False
-    job["live_done"] = False
-    job["live_file"] = None
-    if old_file and os.path.exists(old_file):
-        try:
-            os.remove(old_file)
-        except OSError:
-            pass
-    start_live_from_url(job, src, job.get("kind", "video"),
-                        vcodec=job.get("vcodec"), pix=job.get("vpix"),
-                        start_at=at)
-    job["live_offset"] = at
-    new_file = job.get("live_file")
-    my_gen = job.get("live_gen")
-
-    def arm_when_ready():
-        # live_ready is only ever set once, by run_torrent()'s own startup
-        # wait loop -- nothing re-arms it for the stream this just started,
-        # so without this a viewer who seeks is left on a 503 that (even
-        # held open, see _live()) eventually gives up regardless of how well
-        # the new encode is actually going. Gated on live_gen rather than on
-        # live_file, which is always the same path for a given job and so
-        # cannot tell one attempt's watcher from a superseding one's.
-        deadline = time.time() + 90
-        while time.time() < deadline and not job["cancel"].is_set():
-            if job.get("live_gen") != my_gen:
-                return                   # superseded by a later seek
-            if new_file and os.path.exists(new_file) and os.path.getsize(new_file) >= LIVE_OPEN:
-                job["live_ready"] = True
-                return
-            if job.get("live_done"):
-                return                   # encoder exited before producing enough
-            time.sleep(0.4)
-    threading.Thread(target=arm_when_ready, daemon=True).start()
-
-    record(job, "live stream restarted at %d:%02d" % (int(at) // 60, int(at) % 60))
-    return True
-
-
 def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
-                        pix=None, start_at=0.0):
-    """Same fragmented output as the Drive path, but reading a seekable URL.
-
-    start_at re-opens the stream partway in. A fragmented mp4 cannot be seeked
-    by the player -- there is no index to seek against, which is the whole
-    reason it can start before the file exists -- so seeking a live item means
-    producing a new stream that begins where the viewer asked. See live_seek().
-    """
+                        pix=None):
+    """The live phase for a torrent read over a seekable URL: an HLS EVENT stream
+    (native-seekable, attached via hls.js) when enabled, else the legacy
+    fragmented-mp4 tail. Same producer shape as the Drive path (start_live)."""
     if kind == "audio":
         out = os.path.join(DL, job["id"] + ".live.mp3")
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-               *(["-ss", "%.3f" % start_at] if start_at else []),
                "-i", url, "-vn", "-c:a", "libmp3lame", "-q:a", "4",
                "-flush_packets", "1", "-f", "mp3", out]
     else:
-        out = os.path.join(DL, job["id"] + ".live.mp4")
         vargs, vfilter, vnote = video_args(vcodec, height, hdr, pix=pix)
         if vnote:
             job["note"] = (job.get("note", "") + "; " + vnote).strip("; ")
-        # Without an explicit -map, ffmpeg's automatic stream selection takes
-        # whichever audio track the container itself flags as default -- for a
-        # MULTi release that is whoever packaged it, not the viewer, and it
-        # silently drops every other track rather than just picking one badly.
-        # This is the same fix audio_remap_args gives the finished file, just
-        # applied while the file is still arriving instead of after.
+        # Explicit -map so a MULTi release's non-default audio tracks aren't
+        # silently dropped -- the same fix audio_remap_args gives the finished
+        # file, applied while the file is still arriving.
         atracks = audio_tracks(url)
         amaps, ameta, ordered = audio_remap_args(atracks)
         if ordered:
             job["audio_tracks"] = ordered
             job["audio_default"] = 0
-        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-               "-progress", "pipe:1", "-nostats",
-               # Before -i on purpose: input seeking jumps to the keyframe
-               # rather than decoding everything up to it, which for two hours
-               # in is the difference between seconds and minutes.
-               *(["-ss", "%.3f" % start_at] if start_at else []),
-               "-i", url, *vfilter, *vargs, "-map", "0:v:0", *amaps, *ameta,
-               "-c:a", "aac", "-ac", "2", "-f", "mp4",
-               "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-               "-frag_duration", "1500000", "-flush_packets", "1", out]
+        maps = ["-map", "0:v:0", *amaps, *ameta]
+        if hls_live_enabled():
+            d = live_hls_dir(job["id"])
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d, exist_ok=True)
+            out = os.path.join(d, "index.m3u8")
+            cmd = hls_ffmpeg_cmd(["-i", url], vfilter, vargs, d,
+                                 "copy" not in vargs, maps=maps)
+            job["hls"] = True
+            job["live_dir"] = d
+        else:
+            out = os.path.join(DL, job["id"] + ".live.mp4")
+            job["hls"] = False
+            cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                   "-progress", "pipe:1", "-nostats", "-i", url,
+                   *vfilter, *vargs, *maps, "-c:a", "aac", "-ac", "2", "-f", "mp4",
+                   "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                   "-frag_duration", "1500000", "-flush_packets", "1", out]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
@@ -7338,14 +7511,7 @@ def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
     job["live_proc"] = proc
     job["live_file"] = out
     job["live_kind"] = kind
-    # Not bumped here: a caller superseding a running stream (live_seek())
-    # has to bump this before it kills the old process, or that process's own
-    # watch() thread can still observe the pre-bump generation as current
-    # when it finally, belatedly exits. The one caller with nothing to
-    # supersede (run_torrent()'s first call) bumps just as early, for the
-    # same reason this function should not be trusted to get the timing
-    # right on every caller's behalf.
-    my_gen = job.get("live_gen", 0)
+    errtail = drain_stream(proc.stderr)
 
     def progress():
         """ffmpeg reports speed=N.NNx; below 1.0 it is losing to realtime."""
@@ -7368,19 +7534,18 @@ def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
 
     def watch():
         proc.wait()
-        err = proc.stderr.read() if proc.stderr else ""
-        # A kill sent by a later live_seek() does not reap this process
-        # instantly -- proc.wait() can return well after that seek has
-        # already started its own, newer generation. Reporting this exit
-        # against that newer generation would look exactly like the new
-        # encoder having failed immediately, which it did not.
-        if job.get("live_gen") != my_gen:
-            return
+        err = errtail()
         job["live_done"] = True
-        size = os.path.getsize(out) if os.path.exists(out) else 0
-        if proc.returncode != 0 or size < LIVE_OPEN:
-            job["live_note"] = "rc=%s, %s bytes; %s" % (proc.returncode, size,
-                                                        tail(err, 3, 200))
+        if job.get("hls"):
+            servable = hls_ready(job.get("live_dir") or "")
+            where = "hls"
+        else:
+            sz = os.path.getsize(out) if os.path.exists(out) else 0
+            servable = sz >= LIVE_OPEN
+            where = "%s bytes" % sz
+        if proc.returncode != 0 or not servable:
+            job["live_note"] = "rc=%s, %s; %s" % (proc.returncode, where,
+                                                  tail(err, 3, 200))
     threading.Thread(target=watch, daemon=True).start()
 
 
@@ -7462,13 +7627,16 @@ def start_compat(job):
         return False
     job["procs"].append(proc)
     job["compat_proc"] = proc
+    errtail = drain_stream(proc.stderr)
     threading.Thread(target=read_progress,
                      args=(job, proc.stdout, "compat_speed", dur, "compat_pct"),
                      daemon=True).start()
 
     def watch():
         proc.wait()
-        err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        err = errtail()
+        if isinstance(err, (bytes, bytearray)):
+            err = err.decode("utf-8", "replace")
         size = os.path.getsize(out) if os.path.exists(out) else 0
         job["compat_proc"] = None
         if proc.returncode == 0 and size >= LIVE_OPEN:
@@ -7503,12 +7671,28 @@ def start_compat(job):
     return True
 
 
+def claim_job(jid):
+    """Atomically take ownership of a job so two workers can't run it at once.
+
+    Returns the job (marked running) if this caller won the claim, else None --
+    a duplicate WORK_Q entry, a cancelled job, or one already in flight. Without
+    this, a jid queued twice (a /refetch race, or scheduler + a click) ran on
+    both workers into the same _raw/_wt dirs, orphaning one process (its handle
+    overwritten in job['proc']) and corrupting the output.
+    """
+    with LOCK:
+        job = JOBS.get(jid)
+        if not job or job["cancel"].is_set() or job.get("running"):
+            return None
+        job["running"] = True
+        return job
+
+
 def worker():
     while True:
         jid = WORK_Q.get()
-        with LOCK:
-            job = JOBS.get(jid)
-        if job and not job["cancel"].is_set():
+        job = claim_job(jid)
+        if job:
             try:
                 if job.get("source") == "torrent":
                     run_torrent(job)
@@ -7516,6 +7700,9 @@ def worker():
                     run_job(job)
             except Exception as e:
                 fail(job, str(e))
+            finally:
+                with LOCK:
+                    job["running"] = False
         WORK_Q.task_done()
 
 
@@ -7683,6 +7870,79 @@ def resume_job(jid):
 
 # ---- http --------------------------------------------------------------------
 
+# ---- access token ------------------------------------------------------------
+# The server binds the whole LAN by default (its reason for existing is phones
+# on the same wifi), so a secret is the thing that stops any other device on the
+# network from driving the queue and reading the cache. It rides a same-origin
+# cookie, so once the page is opened with the token in the link, <video> and
+# /stream requests carry it on their own -- no per-request wiring in the page.
+
+AUTH_TOKEN = [None]
+# SameSite=Strict is the CSRF defence: a hostile page can't make the browser
+# send this cookie cross-site, so it can't drive the API even from the same LAN.
+COOKIE = "reel_token=%s; Path=/; Max-Age=31536000; SameSite=Strict; HttpOnly"
+UNAUTH_PAGE = (
+    "<!doctype html><meta charset=utf-8><title>reel</title>"
+    "<body style='font-family:system-ui,-apple-system,sans-serif;background:#101214;"
+    "color:#dde1e5;max-width:34rem;margin:14vh auto;padding:0 1.5rem;line-height:1.65'>"
+    "<div style='font:600 15px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em'>reel</div>"
+    "<p style='margin-top:1.2rem;color:#8c939b'>This link needs the access token. "
+    "Open the address printed in the terminal where reel is running &mdash; it ends "
+    "with <code style='color:#c6a265'>?t=&hellip;</code> &mdash; or scan the QR shown "
+    "there from your phone.</p></body>")
+
+
+def auth_token():
+    """The per-install secret that gates every request.
+
+    Generated once and kept in the cache dir so it survives restarts -- the QR
+    link and any bookmark keep working. Regenerated only if the file is missing
+    or unreadable.
+    """
+    if AUTH_TOKEN[0]:
+        return AUTH_TOKEN[0]
+    path = os.path.join(CACHE_DIR, "token")
+    try:
+        with open(path) as f:
+            tok = f.read().strip()
+    except OSError:
+        tok = ""
+    if not tok:
+        tok = secrets.token_urlsafe(24)
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(path, "w") as f:
+                f.write(tok)
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    AUTH_TOKEN[0] = tok
+    return tok
+
+
+def request_token(handler):
+    """The token presented on a request: the ?t= query, the X-Reel-Token header,
+    or the reel_token cookie -- whichever is set, in that order."""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+    if q.get("t"):
+        return q["t"][0]
+    hdr = handler.headers.get("X-Reel-Token")
+    if hdr:
+        return hdr
+    for part in (handler.headers.get("Cookie") or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == "reel_token":
+            return v
+    return None
+
+
+def authorized(handler):
+    """True if the request carries the install token. Constant-time compared so
+    a wrong guess leaks nothing through timing."""
+    tok = request_token(handler)
+    return bool(tok) and secrets.compare_digest(str(tok), auth_token())
+
+
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "reel"
@@ -7699,6 +7959,13 @@ class H(http.server.BaseHTTPRequestHandler):
             super().handle_one_request()
         except socket.timeout:
             self.close_connection = True
+
+    def _send_bytes(self, b, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
 
     def log_message(self, *a):
         pass
@@ -7745,16 +8012,39 @@ class H(http.server.BaseHTTPRequestHandler):
         mine = urllib.parse.urlparse("//" + (self.headers.get("Host") or "")).hostname
         return h in ("localhost", "127.0.0.1", "::1") or (h and h == mine)
 
+    def _unauthorized(self, p):
+        # The page gets a human explanation; everything else a plain 403 JSON.
+        if p == "/":
+            body = UNAUTH_PAGE.encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except GONE:
+                pass
+        else:
+            self._json(403, {"error": "unauthorized"})
+
     def do_GET(self):
         p = urllib.parse.urlparse(self.path).path
+        if not authorized(self):
+            return self._unauthorized(p)
         if p == "/":
-            b = PAGE.encode()
+            b = PAGE.replace("<!--PLAYER-->", player_tags()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # Set the cookie now so the ?t= link only has to be used once: every
+            # later same-origin request (fetch, <video>, /stream) carries it.
+            self.send_header("Set-Cookie", COOKIE % auth_token())
             self.send_header("Content-Security-Policy",
-                             "default-src 'none'; media-src 'self'; "
+                             # blob: for the MSE MediaSource URL hls.js assigns
+                             # to the video element in the live phase.
+                             "default-src 'none'; media-src 'self' blob:; "
                              "img-src 'self'; "
-                             "style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                             "style-src 'self' 'unsafe-inline'; "
+                             "script-src 'self' 'unsafe-inline'; "
                              "connect-src 'self'")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
@@ -7810,6 +8100,48 @@ class H(http.server.BaseHTTPRequestHandler):
                              "lan_url": lan_url() if has_qrcode() else None})
         elif p == "/qr":
             self._qr()
+        elif p.startswith("/thumbs/"):
+            parts = p[len("/thumbs/"):].split("/", 1)
+            # Both halves are checked against what we generated rather than
+            # sanitised: a job id we know, and a filename shaped like one of
+            # ours. Nothing a request supplies is joined to a path untested.
+            ok = (len(parts) == 2 and re.fullmatch(r"[0-9a-f]{6,32}", parts[0])
+                  and re.fullmatch(r"(s\d{3}\.jpg|index\.vtt)", parts[1]))
+            path = os.path.join(thumbs_dir(parts[0]), parts[1]) if ok else None
+            if (not path or not os.path.isfile(path)):
+                # An empty but valid track rather than a 404 body, for the
+                # index the player asks for before any item has previews. Plyr
+                # parses whatever comes back, and handing it a json error
+                # threw inside its vtt parser -- a 404 the caller cannot act
+                # on is worse than an honest empty answer.
+                if ok and parts[1] == "index.vtt":
+                    return self._send_bytes(b"WEBVTT\n\n", "text/vtt")
+                return self._json(404, {"error": "no such preview"})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/vtt" if path.endswith(".vtt")
+                             else "image/jpeg")
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
+        elif p.startswith("/hls/"):
+            self._hls(p[len("/hls/"):])
+
+        elif p.startswith("/static/"):
+            path = static_file(p[len("/static/"):])
+            if not path:
+                return self._json(404, {"error": "no such asset"})
+            self.send_response(200)
+            self.send_header("Content-Type", STATIC[os.path.basename(path)])
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            # Pinned to a version in the repo, so it never changes underneath.
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
         elif p.startswith("/poster/"):
             # Proxied rather than pointed at image.tmdb.org directly, so the
             # CSP never has to trust a third party -- img-src stays 'self' and
@@ -7842,6 +8174,8 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._local_origin():
             return self._json(403, {"error": "forbidden"})
+        if not authorized(self):
+            return self._json(403, {"error": "unauthorized"})
         p = urllib.parse.urlparse(self.path).path
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
@@ -7870,20 +8204,31 @@ class H(http.server.BaseHTTPRequestHandler):
             # Nothing is started here -- this only looks. The chosen magnet
             # comes back through /add like any other, so the download path is
             # the existing one, unchanged.
-            results, err, dropped, per = search_torrents(body.get("q"))
+            try:
+                results, err, dropped, per = search_torrents(body.get("q"))
+            except Exception:
+                results, err, dropped, per = [], "search failed", 0, {}
             return self._json(200, {"results": results, "error": err,
                                     "dropped": dropped, "sources": per})
 
         if p == "/find":
             # Nothing starts here: this only looks, and a chosen row goes
             # through /add like anything else.
-            rows, err, note = catalogue_with_copies(body or {})
+            try:
+                rows, err, note = catalogue_with_copies(body or {})
+            except Exception:
+                # A bad filter (non-numeric year/votes/rating) must read as
+                # "no results", not a 500 with a dropped connection.
+                rows, err, note = [], "search failed", ""
             return self._json(200, {"results": rows, "error": err, "note": note})
 
         if p == "/feed":
             # Nothing starts here either -- this only suggests. Chosen rows go
             # through /add exactly like a search result or a pasted magnet.
-            shelves, err, per = recommendations(force=bool(body.get("force")))
+            try:
+                shelves, err, per = recommendations(force=bool(body.get("force")))
+            except Exception:
+                shelves, err, per = [], "feed failed", {}
             with LOCK:
                 have = {infohash(j["magnet"]) for j in JOBS.values() if j.get("magnet")}
             # Shown as "already queued" rather than hidden: a familiar film
@@ -7921,6 +8266,15 @@ class H(http.server.BaseHTTPRequestHandler):
                 with LOCK:
                     JOBS[job["id"]] = job
                 added.append(job["id"])
+            # Kick the scheduler now rather than waiting up to a second for its
+            # next tick, so a just-pasted item begins downloading immediately.
+            # Safe against a double-start: claim_job dedups if the scheduler
+            # thread also releases it in the same window.
+            if added:
+                try:
+                    scheduler_tick()
+                except Exception:
+                    pass
             self._json(200, {"added": added, "bad": bad,
                              "torrents": len(magnets), "links": len(ids)})
 
@@ -7969,15 +8323,6 @@ class H(http.server.BaseHTTPRequestHandler):
 
         elif p == "/resume":
             self._json(200, {"ok": resume_job(body.get("id"))})
-
-        elif p == "/liveseek":
-            # A live item cannot be seeked by the player, so it is seeked by
-            # rebuilding the stream from where the viewer asked. See live_seek.
-            with LOCK:
-                job = JOBS.get(body.get("id"))
-            ok = bool(job) and live_seek(job, body.get("at"))
-            self._json(200, {"ok": ok,
-                             "offset": (job or {}).get("live_offset", 0.0)})
 
         elif p == "/playing":
             jid = body.get("id")
@@ -8074,6 +8419,88 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(svg)
 
+    def _hls(self, rest):
+        """Serve the live phase's HLS playlist and fMP4 segments. Both the id and
+        the filename are checked against strict allowlists -- a known-shaped job
+        id and a filename shaped like one of ours -- so nothing a request supplies
+        is joined to a path untested (same discipline as /thumbs)."""
+        parts = rest.split("?", 1)[0].split("/", 1)
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{6,32}", parts[0]):
+            return self._json(404, {"error": "not found"})
+        jid, name = parts
+        d = live_hls_dir(jid)
+        if name == "index.m3u8":
+            path = os.path.join(d, "index.m3u8")
+            if not os.path.isfile(path):
+                self.send_response(503)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                with open(path, "rb") as f:
+                    body = f.read()
+            except OSError:
+                return self._json(404, {"error": "not found"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            # The playlist grows while live; the player re-fetches to discover new
+            # segments, so it must never be cached.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except GONE:
+                pass
+            return
+        if not re.fullmatch(r"(init\.mp4|seg\d{5}\.m4s)", name):
+            return self._json(404, {"error": "not found"})
+        path = os.path.join(d, name)
+        if not os.path.isfile(path):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        # Segments are immutable once the temp_file rename lands, so they cache.
+        self._serve_file_range(path, "video/mp4", "public, max-age=31536000")
+
+    def _serve_file_range(self, path, ctype, cache=None):
+        """Serve a whole immutable file honouring a single Range request -- for
+        the HLS segments, distinct from _stream's growing live/lt-file cases."""
+        size = os.path.getsize(path)
+        rng = self.headers.get("Range")
+        span = parse_range(rng, size) if rng else None
+        if rng and span is None:
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % size)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        start, end = span if span else (0, size - 1)
+        length = max(end - start + 1, 0)
+        self.send_response(206 if span else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if span:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        if cache:
+            self.send_header("Cache-Control", cache)
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(start)
+            left = length
+            while left > 0:
+                chunk = f.read(min(262144, left))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except GONE:
+                    return
+                left -= len(chunk)
+
     def _live(self, jid, live_file=None, ready_key="live_ready",
               done_key="live_done"):
         """Serve the fragmented copy while ffmpeg is still writing it.
@@ -8089,22 +8516,6 @@ class H(http.server.BaseHTTPRequestHandler):
         if not job:
             return self._json(404, {"error": "unknown item"})
         lf = live_file or job.get("live_file")
-        if not (job.get(ready_key) and lf and os.path.isfile(lf)):
-            # Held rather than bounced off a 503 immediately, the same
-            # reasoning _stream()'s compat branch already applies: a browser
-            # does not retry a failed video load on its own, so a request
-            # that lands before the first fragment exists -- the initial
-            # start racing this, or live_seek() restarting the encoder mid-
-            # stream, since nothing else ever re-arms ready_key for the file
-            # it swaps in -- must wait for one rather than fail outright.
-            deadline = time.time() + COMPAT_WAIT
-            while time.time() < deadline and not job["cancel"].is_set():
-                lf = live_file or job.get("live_file")
-                if job.get(ready_key) and lf and os.path.isfile(lf):
-                    break
-                if job.get(done_key):
-                    break
-                time.sleep(0.25)
         if not (job.get(ready_key) and lf and os.path.isfile(lf)):
             self.send_response(503)
             self.send_header("Retry-After", "1")
@@ -8324,14 +8735,71 @@ class H(http.server.BaseHTTPRequestHandler):
                     except GONE:
                         return
                     left -= len(chunk)
+                if left > 0:
+                    # Committed to Content-Length: length but sent fewer bytes
+                    # (a piece stopped arriving, or the file was truncated under
+                    # us). On an HTTP/1.1 keep-alive socket the client blocks
+                    # forever on the missing bytes and the next request desyncs,
+                    # so tear the connection down -- the player reconnects.
+                    self.close_connection = True
         finally:
             with STREAM_LOCK:
                 STREAMING[jid] = max(0, STREAMING.get(jid, 1) - 1)
 
 
+# The player is vendored rather than fetched from a cdn: this server is meant
+# to work on a LAN with no internet, and a control bar that only appears when
+# the house has wifi is worse than none. It is also optional -- reel.py alone
+# still runs, with the browser's own controls, which is what happens if these
+# files are missing.
+VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+STATIC = {"plyr.min.js": "text/javascript", "plyr.css": "text/css",
+          # The icon sprite too: Plyr fetches it from its own cdn by default,
+          # which a LAN with no internet cannot reach and the CSP refuses on
+          # principle. Pointed at ours via the iconUrl option.
+          "plyr.svg": "image/svg+xml",
+          # hls.js drives the live phase's HLS playback (Chrome/Firefox via MSE;
+          # Safari plays HLS natively without it). Served, but the player is not
+          # gated on it -- see has_player vs has_hls.
+          "hls.min.js": "text/javascript"}
+
+# The Plyr core only; has_player() checks these so a missing hls.min.js degrades
+# to Plyr-without-native-live-seek rather than no player at all.
+PLAYER_ASSETS = ("plyr.min.js", "plyr.css", "plyr.svg")
+
+
+def static_file(name):
+    """Path to a vendored asset, or None. Whitelisted by name rather than
+    sanitised, so no request can reach a path we did not choose ourselves."""
+    if name not in STATIC:
+        return None
+    p = os.path.join(VENDOR, name)
+    return p if os.path.isfile(p) else None
+
+
+def has_player():
+    return all(static_file(n) for n in PLAYER_ASSETS)
+
+
+def has_hls():
+    return static_file("hls.min.js") is not None
+
+
+def player_tags():
+    """Head tags for the vendored player, or nothing when it is absent. hls.js is
+    added when present, so the live phase can be seeked natively."""
+    if not has_player():
+        return ""
+    tags = ('<link rel="stylesheet" href="/static/plyr.css">'
+            '<script src="/static/plyr.min.js" defer></script>')
+    if has_hls():
+        tags += '<script src="/static/hls.min.js" defer></script>'
+    return tags
+
+
 PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>reel</title>
+<title>reel</title><!--PLAYER-->
 <style>
   :root{
     --ink:#101214; --panel:#171A1D; --raise:#1D2126; --rule:#262B31;
@@ -8583,6 +9051,31 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .stage{margin-top:16px;position:relative;aspect-ratio:16/9;background:#000;
     border:1px solid var(--rule);border-radius:5px;overflow:hidden}
   .stage video{position:absolute;inset:0;width:100%;height:100%;display:block}
+  /* Plyr inserts .plyr > .plyr__video-wrapper between the stage and the video.
+     The rule above positions the video absolutely, so once it is nested two
+     levels down it contributes no height and the wrappers collapse to zero --
+     which is exactly what happened: controls present in the DOM, container
+     0px tall. These give the wrappers the same fill the bare video had. */
+  .stage .plyr,
+  .stage .plyr__video-wrapper{position:absolute;inset:0;width:100%;height:100%;
+    background:#000}
+  .stage .plyr{border-radius:inherit;overflow:hidden}
+  /* Themed to reel's own palette rather than left at Plyr's blue, so the
+     controls read as part of the app instead of a component dropped into it. */
+  .plyr{--plyr-color-main:var(--brass);
+        --plyr-video-background:#000;
+        --plyr-video-control-color:#fff;
+        --plyr-badge-background:var(--brass);
+        --plyr-badge-text-color:var(--ink);
+        --plyr-range-thumb-background:var(--brass);
+        --plyr-range-fill-background:var(--brass);
+        --plyr-tooltip-background:var(--panel);
+        --plyr-tooltip-color:var(--text);
+        --plyr-menu-background:var(--panel);
+        --plyr-menu-color:var(--text);
+        --plyr-font-family:var(--sans);
+        --plyr-font-size-small:12px;
+        --plyr-control-spacing:9px}
   .slate{position:absolute;inset:0;display:grid;place-content:center;
     justify-items:center;gap:9px;text-align:center;padding:20px}
   .slate .bars{display:flex;gap:3px;align-items:flex-end;height:16px}
@@ -8593,22 +9086,20 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     color:var(--faint);background:rgba(16,18,20,.82);border:1px solid var(--rule);
     border-radius:3px;padding:5px 8px}
 
+  /* Scrubbing preview. Fixed, because the stage clips its own overflow and
+     the frame has to sit above the control bar. */
+  .thumb{position:fixed;z-index:60;border:1px solid var(--rule);border-radius:4px;
+    background-color:#000;background-repeat:no-repeat;pointer-events:none;
+    box-shadow:0 6px 20px rgba(0,0,0,.55)}
+  .thumb span{position:absolute;left:0;right:0;bottom:0;text-align:center;
+    font:500 10px/1.6 var(--mono);color:#fff;background:rgba(16,18,20,.72);
+    font-variant-numeric:tabular-nums}
+
   /* Live seek bar. Deliberately not styled like the native scrubber: it does
      something different -- it rebuilds the stream rather than moving within
      one -- and a control that looks identical but pauses for a few seconds
      would read as the player being broken. */
-  .liveseek{display:flex;align-items:center;gap:10px;margin-top:8px}
-  .lsbar{position:relative;flex:1;height:16px;cursor:pointer;
-    display:flex;align-items:center}
-  .lsbar::before{content:'';position:absolute;left:0;right:0;height:3px;
-    background:var(--rule);border-radius:2px}
-  .lsbar i{position:absolute;left:0;height:3px;background:var(--dim);
-    border-radius:2px;width:0}
-  .lsbar b{position:absolute;width:2px;height:11px;background:var(--brass);
-    border-radius:1px;left:0}
-  .lsbar:hover i{background:var(--brass)}
-  .lspos{font:400 11px/1 var(--mono);color:var(--faint);
-    font-variant-numeric:tabular-nums;min-width:82px;text-align:right}
+
 
   /* transport */
   .transport{display:flex;align-items:center;gap:8px;margin-top:14px}
@@ -8903,10 +9394,9 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
        player's own scrubber to seek against. This one seeks by asking the
        server to rebuild the stream from the chosen point, so it is shown only
        while that is the case. -->
-  <div class="liveseek" id="liveseek" hidden>
-    <div class="lsbar" id="lsbar"><i id="lsfill"></i><b id="lshead"></b></div>
-    <span class="lspos" id="lspos">0:00</span>
-  </div>
+  <!-- Positioned against the viewport rather than the player, so it can sit
+       above the scrubber without the stage's overflow:hidden clipping it. -->
+  <div class="thumb" id="thumb" hidden><span id="thumbtime"></span></div>
 
   <div class="transport">
     <button id="prev" disabled>Previous</button>
@@ -9001,7 +9491,6 @@ function reportPlaying(force) {
                    client: clientId}).catch(() => {});
 }
 v.addEventListener('timeupdate', () => reportPlaying(false));
-v.addEventListener('timeupdate', () => liveBar(byId(order[cur])));
 // 'done' plays the seekable file; 'live' plays the fragments as they're written
 const canPlay = j => !!j && (j.status === 'done' || j.status === 'streaming' || j.live);
 
@@ -9047,8 +9536,42 @@ const srcOf = j => {
     // in seconds rather than after a full encode.
     return '/stream/' + j.id + (playsHere(j) ? '' : '?compat=1');
   }
+  // The live phase: an HLS EVENT stream (native-seekable, attached via hls.js)
+  // when the server produced one, else the legacy fragmented-mp4 tail.
+  if (j.hls) return '/hls/' + j.id + '/index.m3u8';
   return '/live/' + j.id;
 };
+
+/* hls.js attach -----------------------------------------------------------
+   Live HLS gets the browser's OWN seek bar: hls.js feeds segments into MSE and
+   keeps v.seekable spanning the published EVENT range, so the native scrubber
+   just works -- no custom bar, no server-rebuild seek. Safari plays the m3u8
+   natively (no hls.js). A missing/broken hls.js on a non-Safari browser leaves
+   j.hls unset server-side and falls back to the legacy /live tail. */
+let hls = null;
+const NATIVE_HLS = !!document.createElement('video')
+                       .canPlayType('application/vnd.apple.mpegurl');
+function detachHls() {
+  if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+}
+function setSource(j, bust) {
+  detachHls();
+  let url = srcOf(j);
+  if (bust) url += (url.includes('?') ? '&' : '?') + 'r=' + Date.now();
+  const isHls = j.hls && j.status !== 'done' && !j.seekable;
+  if (isHls && !NATIVE_HLS && window.Hls && Hls.isSupported()) {
+    hls = new Hls({enableWorker: false, lowLatencyMode: false,
+                   // Start playing sooner: prefetch the first fragment and skip
+                   // the initial bandwidth probe (pointless on a LAN, and it
+                   // delays the first frame).
+                   startFragPrefetch: true, testBandwidth: false});
+    hls.loadSource(url);
+    hls.attachMedia(v);
+  } else {
+    v.src = url;              // Safari native HLS, or a plain /stream or /live url
+    v.load();
+  }
+}
 
 /* intake ------------------------------------------------------------------ */
 const ta = $('links');
@@ -9364,11 +9887,10 @@ async function loadPicks(force) {
   $('pcount').textContent = total ? total + ' titles' : '';
   if (!total) { box.textContent = 'Nothing to suggest right now.'; return; }
 
-  // Movie, TV and anime sections are only worth telling apart when more than
-  // one is actually present -- a divider above the one section there is
-  // would be a label for nothing. shelves already arrives grouped by
-  // section, so this only has to notice when it changes, not sort anything.
-  const SECTION_LABEL = {movie: 'Movies', tv: 'TV Shows', anime: 'Anime'};
+  // Movies and TV shows are only worth telling apart when both are actually
+  // present -- a divider above the one section there is would be a label for
+  // nothing. shelves already arrives movies-then-tv, so this only has to
+  // notice when the section changes, not sort anything itself.
   const sections = new Set(shelves.map(s => s.section).filter(Boolean));
   let lastSection = null;
 
@@ -9379,7 +9901,7 @@ async function loadPicks(force) {
       lastSection = shelf.section;
       const div = document.createElement('div');
       div.className = 'picksection';
-      div.textContent = SECTION_LABEL[shelf.section] || 'Movies';
+      div.textContent = shelf.section === 'tv' ? 'TV Shows' : 'Movies';
       box.append(div);
     }
 
@@ -9517,13 +10039,154 @@ $('subminus').addEventListener('click', () => nudgeSubs(-SUB_STEP));
 $('subplus').addEventListener('click', () => nudgeSubs(SUB_STEP));
 $('subval').addEventListener('click', () => nudgeSubs(-subShift));   // back to zero
 
-/* live seeking --------------------------------------------------------------
-   The player cannot seek a fragmented stream: there is no index to seek
-   against, which is precisely what lets it start before the download has
-   finished. So this asks the server to build a stream that begins at the
-   chosen point, and reloads. The element's own clock restarts at zero every
-   time, so liveOffset is what turns it back into a position in the film. */
-let liveOffset = 0, liveSeeking = false;
+/* player ---------------------------------------------------------------------
+   Plyr wraps the <video> element rather than replacing it, which is the whole
+   reason it was chosen: every v.currentTime, v.textTracks, v.seekable and src
+   swap elsewhere in this file goes on working untouched. If the vendored files
+   are missing, the browser's own controls are used and reel.py still runs
+   alone.
+
+   The native controls are what blocked two things worth having: a scrubber in
+   the browser's shadow DOM cannot show thumbnails, and it cannot be made to
+   seek a fragmented stream -- which is why live seeking needs a control of its
+   own below. */
+let player = null;
+
+// Which item's previews the player is currently configured for. Plyr reads
+// previewThumbnails once, at construction, so pointing it at a different film
+// means building it again -- cheap, and only done when the item changes.
+let thumbsFor = null;
+
+function playerOpts() {
+  return {
+    // Deliberately close to what was there: this changes how the controls
+    // look, not how the app behaves.
+    controls: ['play-large', 'play', 'progress', 'current-time', 'duration',
+               'mute', 'volume', 'captions', 'settings', 'fullscreen'],
+    settings: ['captions', 'speed'],
+    speed: {selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2]},
+    captions: {active: true, update: true},
+    keyboard: {focused: true, global: false},
+    tooltips: {controls: false, seek: true},
+    invertTime: false,
+    storage: {enabled: true, key: 'reel.plyr'},
+      // Served by us, never fetched from a cdn -- see STATIC.
+    iconUrl: '/static/plyr.svg',
+    blankVideo: '',
+    // Previews are drawn by us, not by Plyr: its module has to be configured
+    // at construction, and re-pointing it means destroy(), which detaches the
+    // <video> and hands back a clone -- measured, document.getElementById('v')
+    // stops being the element every v.* call in this file holds.
+    previewThumbnails: {enabled: false},
+  };
+}
+
+function initPlayer() {
+  if (player || typeof Plyr === 'undefined') return;
+  try {
+    // Previews are enabled from the start, pointed at nothing. Plyr only
+    // builds its thumbnail module when the option is on at construction, and
+    // rebuilding the player later to turn it on does not work: destroy()
+    // leaves the element in a state the next instance cannot attach to --
+    // measured, isHTML5 false, no progress control in the DOM at all. So the
+    // module is created once and re-pointed as items change.
+    player = new Plyr(v, playerOpts());
+  } catch (e) {
+    player = null;                 // fall back to whatever the browser gives
+  }
+}
+
+/* Scrubbing previews, drawn here rather than by the player -- see the note in
+   playerOpts. The server builds sprite sheets and a WebVTT index; this parses
+   the index once per item and paints the right region of the right sheet as
+   the pointer moves along the scrubber. */
+let thumbCues = [];
+
+function parseVtt(text) {
+  const out = [];
+  const t = s => {
+    const m = s.trim().match(/(?:(\d+):)?(\d{2}):(\d{2}\.\d+)/);
+    if (!m) return null;
+    return (+(m[1] || 0)) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+  };
+  text.split(/\r?\n\r?\n/).forEach(block => {
+    const lines = block.split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2 || !lines[0].includes('-->')) return;
+    const [a, b] = lines[0].split('-->');
+    const m = lines[1].match(/^(\S+)#xywh=(\d+),(\d+),(\d+),(\d+)$/);
+    const start = t(a), end = t(b);
+    if (m && start != null && end != null) {
+      out.push({start, end, sheet: m[1], x: +m[2], y: +m[3], w: +m[4], h: +m[5]});
+    }
+  });
+  return out;
+}
+
+async function syncThumbs(j) {
+  const want = (j && j.thumbs) ? '/thumbs/' + j.id + '/index.vtt' : null;
+  if (want === thumbsFor) return;
+  thumbsFor = want;
+  thumbCues = [];
+  if (!want) return;
+  try {
+    const r = await fetch(want);
+    if (r.ok) thumbCues = parseVtt(await r.text());
+  } catch (e) {}
+}
+
+function cueAt(t) {
+  for (let i = 0; i < thumbCues.length; i++) {
+    if (t >= thumbCues[i].start && t < thumbCues[i].end) return thumbCues[i];
+  }
+  return thumbCues.length && t >= thumbCues[thumbCues.length - 1].start
+       ? thumbCues[thumbCues.length - 1] : null;
+}
+
+function showThumb(ev) {
+  const box = $('thumb');
+  const seek = ev.currentTarget;
+  if (!thumbCues.length || !isFinite(v.duration)) { box.hidden = true; return; }
+  const r = seek.getBoundingClientRect();
+  const frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+  const c = cueAt(frac * v.duration);
+  if (!c) { box.hidden = true; return; }
+  const base = thumbsFor.replace('index.vtt', '');
+  box.hidden = false;
+  box.style.width = c.w + 'px';
+  box.style.height = c.h + 'px';
+  box.style.backgroundImage = 'url("' + base + c.sheet + '")';
+  box.style.backgroundPosition = '-' + c.x + 'px -' + c.y + 'px';
+  // Clamped to the player, so a preview near either end stays on screen.
+  const stage = $('v').closest('.stage').getBoundingClientRect();
+  const left = Math.max(stage.left + 4,
+                        Math.min(ev.clientX - c.w / 2, stage.right - c.w - 4));
+  box.style.left = Math.round(left) + 'px';
+  box.style.top = Math.round(r.top - c.h - 12) + 'px';
+  $('thumbtime').textContent = hms(frac * v.duration);
+}
+
+function hideThumb() { $('thumb').hidden = true; }
+
+// The scrubber only exists once Plyr has built its controls, and it is
+// replaced whenever they are rebuilt, so this attaches on the container.
+// Tested by position rather than by what the pointer landed on. Plyr stacks
+// several elements over its scrubber and rebuilds them whenever the controls
+// change, so matching on the event target -- by tag or by ancestor -- kept
+// missing. Where the pointer is cannot be defeated by either.
+document.addEventListener('mousemove', ev => {
+  const seek = document.querySelector('input[data-plyr="seek"]');
+  if (!seek) return;
+  const r = seek.getBoundingClientRect();
+  const over = r.width > 0 && ev.clientX >= r.left && ev.clientX <= r.right
+            && ev.clientY >= r.top - 8 && ev.clientY <= r.bottom + 8;
+  if (over) showThumb({currentTarget: seek, clientX: ev.clientX});
+  else if (!$('thumb').hidden) hideThumb();
+});
+// Leaving the player entirely should take the preview with it.
+document.addEventListener('mouseleave', hideThumb);
+
+document.addEventListener('DOMContentLoaded', initPlayer);
+if (document.readyState !== 'loading') initPlayer();
 
 // Named to not collide with clock() further down, which formats a duration
 // for the health readout rather than a position on a timeline.
@@ -9533,20 +10196,6 @@ const hms = t => {
   return (h ? h + ':' + String(m).padStart(2, '0')
             : String(m)) + ':' + String(s).padStart(2, '0');
 };
-
-function liveBar(j) {
-  // Shown only when the stream really is unseekable and its length is known:
-  // a bar that cannot say where it is pointing is worse than none.
-  const on = !!(j && j.live && !j.seekable && j.duration);
-  $('liveseek').hidden = !on;
-  if (!on) return;
-  liveOffset = j.live_offset || 0;
-  const at = liveOffset + (v.currentTime || 0);
-  const frac = Math.min(1, at / j.duration);
-  $('lsfill').style.width = (frac * 100) + '%';
-  $('lshead').style.left = 'calc(' + (frac * 100) + '% - 1px)';
-  $('lspos').textContent = hms(at) + ' / ' + hms(j.duration);
-}
 
 /* A read waiting on an 8 MB piece looks identical to a hung player. The
    server says what it is waiting for; this shows it, and puts the title back
@@ -9563,29 +10212,6 @@ function seekNote(j) {
     if (j) { cue.textContent = j.title; cue.classList.remove('none'); }
   }
 }
-
-$('lsbar').addEventListener('click', async ev => {
-  const j = byId(order[cur]);
-  if (!j || !j.duration || liveSeeking) return;
-  const box = ev.currentTarget.getBoundingClientRect();
-  const want = Math.max(0, Math.min(1, (ev.clientX - box.left) / box.width)) * j.duration;
-  liveSeeking = true;
-  $('lspos').textContent = 'seeking to ' + hms(want) + '…';
-  try {
-    const r = await api('/liveseek', {id: j.id, at: want});
-    if (!r.ok) { $('lspos').textContent = 'cannot seek there'; return; }
-    liveOffset = r.offset || want;
-    // The stream is a new file with the same name, so the query string is what
-    // stops the browser serving the old one back out of its cache.
-    v.src = '/live/' + j.id + '?t=' + Date.now();
-    v.load();
-    await v.play().catch(() => {});
-  } catch (e) {
-    $('lspos').textContent = 'seek failed';
-  } finally {
-    liveSeeking = false;
-  }
-});
 
 /* playback ---------------------------------------------------------------- */
 function setFlag(j) {
@@ -9607,8 +10233,7 @@ function play(i) {
   v.hidden = false; slate.style.display = 'none';
   setFlag(j);
   wantSeek = j.resume_at || 0;      // applied once the file knows its length
-  v.src = srcOf(j);
-  v.load();
+  setSource(j);
   applySubs(j);
   v.play().catch(() => {});
   cue.textContent = j.title;
@@ -9731,8 +10356,7 @@ function swapToSeekable(j) {
   const resume = wantPlay;
   live = false;
   setFlag(j);
-  v.src = srcOf(j);          // may be the compat rendition on this device
-  v.load();
+  setSource(j);              // destroys the live hls.js, points at /stream
   applySubs(j);
   const once = () => {
     v.removeEventListener('loadedmetadata', once);
@@ -9755,8 +10379,7 @@ v.addEventListener('error', () => {
   // so the position has to be captured now, before load() throws it away.
   const at = v.currentTime;
   setTimeout(() => {
-    v.src = srcOf(j) + '?r=' + Date.now();
-    v.load();
+    setSource(j, true);
     const once = () => {
       v.removeEventListener('loadedmetadata', once);
       if (at > 0.25 && isFinite(at)) { try { v.currentTime = at; } catch (e) {} }
@@ -9778,6 +10401,7 @@ v.addEventListener('ended', () => {
 });
 function stopPlayback() {
   live = false;
+  detachHls();
   v.pause(); v.removeAttribute('src'); v.load();
   v.hidden = true; slate.style.display = 'grid'; flag.style.display = 'none';
   cur = -1; cue.textContent = order.length ? 'Nothing playing' : 'Queue is empty';
@@ -10048,8 +10672,8 @@ function paint() {
   }
   $('prev').disabled = !ready(-1);
   $('next').disabled = !ready(1);
-  liveBar(byId(order[cur]));
   seekNote(byId(order[cur]));
+  syncThumbs(byId(order[cur]));
 }
 
 async function remove(id) {
@@ -10379,10 +11003,13 @@ def main():
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=tracker_refresher, daemon=True).start()
     with Server((HOST, PORT), H) as s:
-        print(f"\n  reel  ->  http://localhost:{PORT}")
+        tok = auth_token()
+        # The token is in the link on purpose: opening it is what sets the cookie
+        # that authorises the browser. Every device needs this link (or the QR).
+        print(f"\n  reel  ->  http://localhost:{PORT}/?t={tok}")
         lan = lan_ip()
         if lan and HOST != "127.0.0.1":
-            print(f"  on this wifi  ->  http://{lan}:{PORT}")
+            print(f"  on this wifi  ->  http://{lan}:{PORT}/?t={tok}")
         bk = backend()
         print(f"  rclone gdrive: {has_rclone()}   ffmpeg+ffprobe: {has_ffmpeg()}")
         print(f"  torrents: {bk.name}"

@@ -4,6 +4,7 @@ reel_downloads/
 reel_cache/
 test_dl/
 *.live.mp4
+*.live.hls/
 *.compat.mp4
 *.compat.live.mp4
 

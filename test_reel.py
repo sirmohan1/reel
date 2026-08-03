@@ -1398,260 +1398,6 @@ class TestLibtorrentBackend(Base):
         j["seek_wait"] = "fetching 8 MB block…"
         self.assertEqual(self.m.public(j)["seek_wait"], "fetching 8 MB block…")
 
-    # ---- live_seek: what it will and will not read ------------------------
-
-    def test_live_seek_needs_something_that_answers_ranges(self):
-        j = self.job()
-        j["duration"] = 600
-        self.assertFalse(self.m.live_seek(j, 100))        # no source at all
-        j["wt_url"] = "http://127.0.0.1:9/x.mkv"          # but no ranges
-        self.assertFalse(self.m.live_seek(j, 100))
-
-    def test_live_seek_refuses_a_point_past_the_end(self):
-        # lt_file, not path: a finished job is refused for a different reason
-        # (see test_live_seek_refuses_an_already_finished_job) and would pass
-        # this assertion without ever reaching the check it names.
-        j = self.job()
-        j["duration"] = 600
-        j["lt_file"] = os.path.join(self.dl, "f.mkv")
-        self.assertFalse(self.m.live_seek(j, 599.5))
-        self.assertFalse(self.m.live_seek(j, 10_000))
-
-    def test_live_seek_refuses_an_already_finished_job(self):
-        # The bug this closes: a finished job is already seekable natively
-        # through /stream/, at no cost. A stale client -- its poll hasn't
-        # caught up to the job finishing -- can still send this; without the
-        # refusal, the server would tear down nothing and spawn a fresh
-        # re-encode of a film already complete, and the player would switch
-        # from the real finished file to that restarting transcode --
-        # indistinguishable from a hang until it caught back up.
-        seen = []
-        self.m.start_live_from_url = lambda *a, **k: seen.append(a)
-        j = self.job()
-        j["duration"] = 600
-        j["path"] = os.path.join(self.dl, "f.mp4")
-        j["lt_file"] = os.path.join(self.dl, "f.mkv")   # still set; must not matter
-        self.assertFalse(self.m.live_seek(j, 60))
-        self.assertEqual(seen, [])
-
-    def test_live_seek_reads_webtorrents_endpoint_when_there_is_no_local_file(self):
-        # The gap this closes: on the default backend there is no file to
-        # read, but webtorrent's own server answers ranges perfectly well.
-        seen = {}
-        self.m.start_live_from_url = lambda job, url, kind, **kw: seen.update(
-            url=url, start_at=kw.get("start_at"))
-        j = self.job()
-        j["duration"] = 600
-        j["wt_url"] = "http://127.0.0.1:8801/webtorrent/abc/f.mkv"
-        j["wt_ranges"] = True
-        self.assertTrue(self.m.live_seek(j, 120))
-        self.assertEqual(seen["url"], j["wt_url"])
-        self.assertEqual(seen["start_at"], 120)
-        self.assertEqual(j["live_offset"], 120)
-
-    def test_live_seek_reads_reels_own_route_for_a_local_file(self):
-        # So the reads pass through the range handler and pull pieces on the
-        # way; pointed at the file it would read preallocated zeros.
-        seen = {}
-        self.m.start_live_from_url = lambda job, url, kind, **kw: seen.update(
-            url=url, start_at=kw.get("start_at"))
-        j = self.job()
-        j["duration"] = 600
-        j["lt_file"] = os.path.join(self.dl, "f.mkv")
-        self.assertTrue(self.m.live_seek(j, 60))
-        self.assertIn("/stream/" + j["id"], seen["url"])
-
-    def test_live_seek_clears_the_stream_it_replaces(self):
-        # Two streams writing the same file would interleave; the viewer on
-        # the old one has to be given a clean end instead. lt_file, not path:
-        # a job still mid-download, which is the only case this can happen
-        # in -- a finished job is refused outright, see the test above.
-        old = os.path.join(self.dl, "old.live.mp4")
-        with open(old, "wb") as f:
-            f.write(b"x" * 32)
-        self.m.start_live_from_url = lambda *a, **k: None
-        j = self.job()
-        j["duration"] = 600
-        j["lt_file"] = os.path.join(self.dl, "f.mkv")
-        j["live_file"] = old
-        j["live_ready"] = True
-        self.assertTrue(self.m.live_seek(j, 30))
-        self.assertFalse(os.path.exists(old))
-        self.assertFalse(j["live_ready"])
-
-    def test_live_seek_rearms_ready_once_the_new_stream_has_enough(self):
-        # The bug this closes: live_ready is only ever set once, by
-        # run_torrent()'s own startup wait loop -- nothing re-arms it for the
-        # stream live_seek() just started. A real ffmpeg process could be
-        # encoding perfectly normally and the job would still sit at
-        # live_ready=False forever, which _live() (even held open) eventually
-        # gives up on regardless. Found on a real seek: the bar vanished and
-        # the player never recovered, while ffmpeg kept running untouched.
-        out = os.path.join(self.dl, "seek.live.mp4")
-        def fake_start(job, url, kind, **kw):
-            job["live_file"] = out
-            with open(out, "wb") as f:
-                f.write(b"x" * 10)          # below LIVE_OPEN -- not ready yet
-        self.m.start_live_from_url = fake_start
-        j = self.job()
-        j["duration"] = 600
-        j["lt_file"] = os.path.join(self.dl, "f.mkv")
-        self.assertTrue(self.m.live_seek(j, 60))
-        self.assertFalse(j["live_ready"])       # too little written so far
-
-        with open(out, "wb") as f:
-            f.write(b"x" * (self.m.LIVE_OPEN + 1))
-        deadline = time.time() + 3
-        while time.time() < deadline and not j["live_ready"]:
-            time.sleep(0.05)
-        self.assertTrue(j["live_ready"])
-
-    def test_a_second_seek_abandons_the_first_ones_watcher(self):
-        # Without this, two live_seek calls close together race: the first
-        # watcher could still mark live_ready True after the second seek has
-        # already replaced live_file with a different stream, reporting a
-        # brand new (possibly still-empty) file as ready because an old
-        # watcher happened to see enough bytes in the file it was pointed at.
-        first_out = os.path.join(self.dl, "first.live.mp4")
-        second_out = os.path.join(self.dl, "second.live.mp4")
-        calls = []
-        def fake_start(job, url, kind, **kw):
-            calls.append(1)
-            out = first_out if len(calls) == 1 else second_out
-            job["live_file"] = out
-            job["live_gen"] = job.get("live_gen", 0) + 1   # what the real fn does
-            with open(out, "wb") as f:
-                f.write(b"x" * 10)
-        self.m.start_live_from_url = fake_start
-        j = self.job()
-        j["duration"] = 600
-        j["lt_file"] = os.path.join(self.dl, "f.mkv")
-        self.assertTrue(self.m.live_seek(j, 30))     # starts watching first_out
-        self.assertTrue(self.m.live_seek(j, 60))     # replaces it with second_out
-
-        # The abandoned watcher's file becomes fully ready; it must not be
-        # allowed to mark the job ready on the new file's behalf.
-        with open(first_out, "wb") as f:
-            f.write(b"x" * (self.m.LIVE_OPEN + 1))
-        time.sleep(0.6)
-        self.assertFalse(j["live_ready"])
-        self.assertEqual(j["live_file"], second_out)
-
-        with open(second_out, "wb") as f:
-            f.write(b"x" * (self.m.LIVE_OPEN + 1))
-        deadline = time.time() + 3
-        while time.time() < deadline and not j["live_ready"]:
-            time.sleep(0.05)
-        self.assertTrue(j["live_ready"])
-
-    def test_a_killed_processs_late_exit_does_not_clobber_a_newer_generation(self):
-        # The race actually found on a real seek: live_seek() sends kill() to
-        # the old ffmpeg and immediately starts a new one, but a killed
-        # process is not necessarily reaped the instant kill() returns --
-        # its own watch() thread can call job["live_done"] = True well after
-        # the new attempt has already started. live_file is always the same
-        # path for a given job, so path alone cannot tell the two attempts
-        # apart; only live_gen can. Without the gate, a perfectly healthy new
-        # encode reads as failed because a stale exit from the one it
-        # replaced landed after it started.
-        import types
-        class FakeProc:
-            def __init__(self):
-                self.stdout, self.stderr = FakeIO(), FakeIO()
-                self.returncode = -9
-                self._release = threading.Event()
-            def wait(self, *a, **k):
-                self._release.wait(5)
-                return self.returncode
-        class FakeIO:
-            def read(self, *a): return ""
-            def readline(self): return ""
-            def __iter__(self): return iter(())
-        real = self.m.subprocess
-        made = []
-        def fake_popen(*a, **k):
-            p = FakeProc()
-            made.append(p)
-            return p
-        self.m.subprocess = types.SimpleNamespace(
-            Popen=fake_popen, PIPE=real.PIPE, DEVNULL=real.DEVNULL)
-        self.m.audio_tracks = lambda *a, **k: []
-        self.m.video_args = lambda *a, **k: ([], [], "")
-
-        # The caller bumps live_gen before calling this, not the function
-        # itself -- see the comment on my_gen inside start_live_from_url.
-        j = self.job()
-        j["live_gen"] = 1
-        self.m.start_live_from_url(j, "http://x/1", "video")   # generation 1
-        gen1 = made[0]
-        j["live_gen"] = 2
-        self.m.start_live_from_url(j, "http://x/2", "video")   # generation 2, kills gen 1
-        self.assertEqual(len(made), 2)
-
-        # Generation 1 is only now (late) actually reaped.
-        gen1._release.set()
-        time.sleep(0.3)
-
-        self.assertFalse(j["live_done"])     # not clobbered by the stale exit
-        self.assertEqual(j["live_note"], "")
-
-        # And the gate is scoped, not stuck: generation 2's own real exit
-        # still gets through correctly.
-        made[1]._release.set()
-        time.sleep(0.3)
-        self.assertTrue(j["live_done"])
-
-    def test_live_seek_bumps_the_generation_before_the_kill_not_after(self):
-        # The precise bug this closes, found on a real seek: the first fix
-        # gated watch() on live_gen but bumped it inside start_live_from_url,
-        # which runs *after* live_seek() sends kill(). A process reaped
-        # quickly enough lands in that gap: kill() unblocks its wait(), its
-        # watch() thread checks live_gen immediately, and at that instant the
-        # bump has not happened yet -- so it still matches, and the stale
-        # exit gets written as if it were still-current work. Moving the
-        # bump to before the kill, in live_seek() itself, is what actually
-        # closes the window rather than narrowing it: kill() cannot be sent
-        # until the new generation number is already in place.
-        import types
-        class FakeProc:
-            def __init__(self):
-                self.stdout, self.stderr = FakeIO(), FakeIO()
-                self.returncode = -9
-                self._killed = threading.Event()
-            def poll(self):
-                return self.returncode if self._killed.is_set() else None
-            def kill(self):
-                self._killed.set()        # reaps instantly, on the kill itself
-            def wait(self, *a, **k):
-                self._killed.wait(5)
-                return self.returncode
-        class FakeIO:
-            def read(self, *a): return ""
-            def readline(self): return ""
-            def __iter__(self): return iter(())
-        real = self.m.subprocess
-        self.m.subprocess = types.SimpleNamespace(
-            Popen=lambda *a, **k: FakeProc(), PIPE=real.PIPE, DEVNULL=real.DEVNULL)
-        self.m.audio_tracks = lambda *a, **k: []
-        self.m.video_args = lambda *a, **k: ([], [], "")
-
-        # Generation 1, started for real -- a real watch() thread, blocked in
-        # wait() until something kills it, exactly as run_torrent()'s first
-        # call would leave it.
-        j = self.job()
-        j["duration"] = 600
-        j["lt_file"] = os.path.join(self.dl, "f.mkv")
-        j["live_gen"] = 1
-        self.m.start_live_from_url(j, "http://x/1", "video")
-        self.assertFalse(j["live_done"])
-
-        # live_seek()'s kill() is what unblocks generation 1's watch() thread
-        # -- the reap and the bump-vs-kill ordering are racing head to head,
-        # not merely close in time.
-        self.assertTrue(self.m.live_seek(j, 30))
-        time.sleep(0.3)
-        self.assertFalse(j["live_done"])
-
     # ---- ensure_range: the reason for the whole migration ----------------
 
     def test_webtorrent_admits_it_cannot_prioritise(self):
@@ -1772,259 +1518,220 @@ class TestLibtorrentBackend(Base):
             proc.kill()
             j["cancel"].set()
 
-    # ---- run_torrent(): the local fast-path's wt_direct guess gets corrected
-
-    class _FakeLocalBackend:
-        """A local-serving backend whose transport is faked but whose
-        contract is real: run_torrent() only ever calls these six methods
-        (see test_it_implements_the_same_interface_as_webtorrent), so a
-        double honouring the same contract exercises exactly the code path a
-        real libtorrent swarm would, without needing DHT or a peer to reach
-        it from a test sandbox.
-        """
-        name = "libtorrent"
-        serves_locally = True
-
-        def __init__(self, payload):
-            self.payload = payload      # the file already "downloaded"
-
-        def available(self): return True
-
-        def fetch_metadata(self, job, magnet, port, limit):
-            name = os.path.basename(self.payload)
-            size = os.path.getsize(self.payload)
-            return [{"index": 0, "name": name, "size": size}], None, ""
-
-        def list_files(self, job, magnet, port, limit):
-            files, _t, log = self.fetch_metadata(job, magnet, port, limit)
-            return files, log
-
-        def stream_url(self, job, port, chosen):
-            return None             # None + serves_locally is what run_torrent
-                                     # reads as "the file is on disk, not a url"
-
-        def start(self, job, source, out_dir, chosen, port, rate_kbps=None):
-            # The swarm already delivered every byte -- copied in rather than
-            # trickled, since what is being tested is what happens once the
-            # file is there, not how it arrives. wt_done says so directly,
-            # rather than padding the fixture past WT_DATA_MIN (2 MB) to earn
-            # it the slow way.
-            shutil.copyfile(self.payload, os.path.join(out_dir, chosen["name"]))
-            job["wt_done"] = True
-            return types.SimpleNamespace(poll=lambda: 0, kill=lambda: None)
-
-        def recent_output(self, job, lines=4, chars=200):
-            return ""
-
-    def eac3_fixture(self):
-        """A real h264/E-AC-3 .mkv -- the container/codec pair this test
-        class's bug report used. No browser decodes E-AC-3, so this is the
-        shape that must not be direct-played."""
-        path = os.path.join(self.dl, "source.mkv")
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-             "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1",
-             "-f", "lavfi", "-i", "sine=frequency=1000:duration=1",
-             "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-c:a", "eac3", "-ac", "6", "-shortest", path],
-            check=True, capture_output=True)
-        return path
+    @needs_libtorrent
+    def test_fetch_file_reads_a_sibling_file_the_selection_never_chose(self):
+        # The bug this exists for: subtitles bundled in the torrent live in a
+        # file that was never selected for download (ensure_range only ever
+        # bumps job["wt_index"], the chosen video). fetch_file has to pull an
+        # arbitrary index's own pieces instead, so a byte-exact read of a file
+        # nothing else in the job asked for is the real proof.
+        bk = self.m.LibtorrentBackend()
+        tf = self.multi_file_torrent()
+        # Self-seeded: save_path points at the directory multi_file_torrent()
+        # already wrote the real files into, so libtorrent's own check phase
+        # finds every piece already present and correct -- no peer, no swarm,
+        # no network needed to prove the read is byte-exact.
+        out = self.dl
+        with open(os.path.join(self.dl, "pack", "ep0.bin"), "rb") as f:
+            original = f.read()
+        j = self.job()
+        # Only the third file (index 2) is selected -- ep0.bin at index 0 is
+        # a sibling the download itself was never told to fetch.
+        proc = bk.start(j, tf, out, {"index": 2}, 0)
+        try:
+            cand = next(f for f in self.m.torrent_files(tf) if f["index"] == 0)
+            got = bk.fetch_file(j, 0, cand, out, timeout=15)
+            self.assertEqual(got, original)
+        finally:
+            proc.kill(); j["cancel"].set()
 
     @needs_libtorrent
+    def test_fetch_file_returns_none_without_a_valid_handle(self):
+        bk = self.m.LibtorrentBackend()
+        j = self.job()          # never started: no "_lt" handle at all
+        cand = {"index": 0, "name": "whatever.srt", "size": 100}
+        self.assertIsNone(bk.fetch_file(j, 0, cand, self.dl))
+
+
+# --------------------------------------------------------------------------
+class TestDirectPlayFlag(Base):
+    """wt_direct is the client-facing seekable signal (see public()) as well
+    as the gate on whether finalize_torrent ever runs. It used to be set True
+    the moment a local backend located the file on disk -- before the codec
+    and container check below had decided anything -- so a torrent needing
+    conversion (an .mkv, or audio the browser can't decode, DTS here) was
+    reported seekable, served raw over /stream, and never finalized into a
+    real seekable copy. This drives run_torrent() itself, through a fake
+    backend that stands in for the swarm but is real ffmpeg all the way
+    through the codec probe and the finalize conversion -- the exact path
+    the bug lived on.
+    """
+
+    def multitrack_dts_mkv(self):
+        p = os.path.join(self.dl, "src.mkv")
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=640x480:rate=25:duration=15",
+            "-f", "lavfi", "-i", "sine=frequency=1000:duration=15",
+            "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M",
+            "-c:a", "dca", "-strict", "-2", p,
+        ], check=True, capture_output=True)
+        return p
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = 0
+        def poll(self):
+            return 0            # already finished: nothing to wait on
+        def kill(self):
+            pass
+
     @needs_ffmpeg
-    def test_undecodable_audio_is_still_finalized_and_transcoded(self):
-        # The bug this closes: a local backend marks wt_direct True the
-        # instant it locates the file on disk -- before the codec probe runs
-        # -- so a client can start on /stream/ immediately when the file
-        # turns out to be compatible. When the probe then finds this is not
-        # such a file (E-AC-3 here, which no browser decodes), that guess has
-        # to be corrected. Left uncorrected: job["seekable"] stayed True
-        # forever, the client kept pulling the raw file's undecoded audio
-        # instead of asking for /live/, and finalize_torrent -- the only
-        # thing that transcodes the audio -- never ran, because it is gated
-        # on this exact flag. A film played picture with silence for its
-        # entire runtime.
-        payload = self.eac3_fixture()
-        self.m._BACKEND = self._FakeLocalBackend(payload)
+    def test_a_torrent_needing_conversion_is_not_reported_seekable(self):
+        src = self.multitrack_dts_mkv()
+        size = os.path.getsize(src)
+        files = [{"index": 0, "name": "video.mkv", "size": size}]
+
+        class FakeBk:
+            serves_locally = True
+            def available(self): return True
+            def fetch_metadata(self, job, magnet, port, limit):
+                return files, None, "fake meta"
+            def start(self, job, source, out_dir, chosen, port, rate_kbps=None):
+                shutil.copy(src, os.path.join(out_dir, chosen["name"]))
+                proc = TestDirectPlayFlag.FakeProc()
+                job["procs"].append(proc)
+                return proc
+            def stream_url(self, job, port, chosen):
+                return None
+            def recent_output(self, job, lines=4, chars=200):
+                return ""
+            def fetch_file(self, job, port, cand, out_dir, timeout=None):
+                return None
+
+        m = self.m
+        real_backend, real_search = m.backend, m.subs_search
+        m.backend = lambda: FakeBk()
+        # No real internet lookups from the subtitle fallback this job takes
+        # (the fake torrent carries no subtitle files of its own).
+        m.subs_search = lambda *a, **k: ([], "test")
         try:
-            j = self.job(magnet="magnet:?xt=urn:btih:" + "b" * 40)
-            self.m.run_torrent(j)
+            job = self.job(magnet="magnet:?xt=urn:btih:" + "a" * 40,
+                           source="torrent")
+            m.run_torrent(job)
         finally:
-            self.m._BACKEND = None
+            m.backend, m.subs_search = real_backend, real_search
 
-        self.assertEqual(j["error"], "")
-        # The flag the client's "seekable" reading is built from must not be
-        # left true for a file that was never actually direct-playable.
-        self.assertFalse(j["wt_direct"])
-        # And the consequence, not just the flag: finalize_torrent must have
-        # run and produced a file a browser can actually play the audio of --
-        # without the fix, path stays None and this file is never reached.
-        self.assertEqual(j["status"], "done")
-        self.assertIsNotNone(j["path"])
-        v, a, _h, _hdr, _br, _dur, pix = self.m.probe_media(j["path"])
-        self.assertEqual(v, "h264")
-        self.assertIn(a, self.m.BROWSER_AUDIO)
-        self.assertTrue(self.m.public(j)["seekable"])
+        # wt_direct was set True the instant the file was located on disk,
+        # before this codec/container check ran -- so it must not still carry
+        # that early value now that the check is over.
+        self.assertFalse(job.get("wt_direct"),
+                         "an .mkv with DTS audio must not be marked direct-play")
+        # And that flag being correct is what let finalize_torrent run at all:
+        # wrongly True, "if not wt_direct: finalize_torrent(...)" never fires,
+        # and no browser-safe copy is ever produced -- the file plays raw
+        # DTS audio forever. A real copy with the audio actually transcoded
+        # (AAC, not the original DTS) is the proof it did. (title is not
+        # locked, so run_torrent renames the job after the chosen file, "video".)
+        out = os.path.join(m.DL, "%s__torrent__video.mp4" % job["id"])
+        self.assertTrue(os.path.isfile(out), job.get("note"))
+        kept = m.audio_tracks(out)
+        self.assertEqual(kept[0]["codec"], "aac")
 
-    @needs_libtorrent
     @needs_ffmpeg
-    def test_compatible_audio_is_played_direct_with_no_transcode(self):
-        # The null test for the fix above: a file that genuinely is
-        # direct-playable must not be pulled into a conversion it does not
-        # need. wt_direct starting True and staying True is correct here.
-        path = os.path.join(self.dl, "source.mp4")
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-             "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1",
-             "-f", "lavfi", "-i", "sine=frequency=1000:duration=1",
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
-             "-shortest", "-movflags", "+faststart", path],
-            check=True, capture_output=True)
-        self.m._BACKEND = self._FakeLocalBackend(path)
+    def test_a_still_downloading_libtorrent_job_feeds_the_live_encoder_through_stream(self):
+        # start_live_from_url() used to be handed the raw preallocated file
+        # path directly for a libtorrent job (job["lt_file"]) -- ffmpeg has no
+        # way to tell already-downloaded bytes from the zeros still sitting in
+        # whatever hasn't arrived yet, so it could race straight past the real
+        # download front and decode zero-filled garbage as if it were content.
+        # It must be handed reel's own /stream/{id} route instead (the same
+        # one the probe just above already trusts for this exact reason),
+        # which blocks on ensure_range until a piece has genuinely arrived.
+        src = self.multitrack_dts_mkv()
+        size = os.path.getsize(src)
+        files = [{"index": 0, "name": "video.mkv", "size": size}]
+
+        class FakeBk:
+            serves_locally = True
+            def available(self): return True
+            def fetch_metadata(self, job, magnet, port, limit):
+                return files, None, "fake meta"
+            def start(self, job, source, out_dir, chosen, port, rate_kbps=None):
+                # Only part of the file has "arrived" -- a real
+                # still-downloading torrent, not one that finished before the
+                # live phase even started.
+                with open(src, "rb") as f:
+                    data = f.read()
+                with open(os.path.join(out_dir, chosen["name"]), "wb") as f:
+                    f.write(data[:len(data) // 2])
+                proc = TestDirectPlayFlag.FakeProc()
+                job["procs"].append(proc)
+                return proc
+            def stream_url(self, job, port, chosen):
+                return None
+            def recent_output(self, job, lines=4, chars=200):
+                return ""
+            def fetch_file(self, job, port, cand, out_dir, timeout=None):
+                return None
+
+        m = self.m
+        captured = {}
+
+        def fake_start_live_from_url(job, url, kind, *a, **k):
+            captured["url"] = url
+            # Made to fail fast rather than actually encode -- this test only
+            # cares what URL the live encoder would have been pointed at.
+            job["live_done"] = True
+
+        real_backend = m.backend
+        real_search = m.subs_search
+        real_start_live = m.start_live_from_url
+        m.backend = lambda: FakeBk()
+        m.subs_search = lambda *a, **k: ([], "test")
+        m.start_live_from_url = fake_start_live_from_url
         try:
-            j = self.job(magnet="magnet:?xt=urn:btih:" + "c" * 40)
-            self.m.run_torrent(j)
+            job = self.job(magnet="magnet:?xt=urn:btih:" + "a" * 40,
+                           source="torrent")
+            m.run_torrent(job)
         finally:
-            self.m._BACKEND = None
+            m.backend = real_backend
+            m.subs_search = real_search
+            m.start_live_from_url = real_start_live
 
-        self.assertEqual(j["error"], "")
-        self.assertTrue(j["wt_direct"])
-        self.assertTrue(self.m.public(j)["seekable"])
-        # No conversion pass, and therefore no finalize -- the source stays
-        # exactly where the backend put it.
-        self.assertIsNone(j["path"])
+        self.assertIn("url", captured,
+                      "start_live_from_url must have been called")
+        self.assertEqual(
+            captured["url"],
+            "http://127.0.0.1:%d/stream/%s?t=%s" % (m.PORT, job["id"], m.auth_token()),
+            "a still-downloading libtorrent job must feed the live encoder "
+            "through reel's own piece-aware /stream route (carrying the "
+            "install token, since every route now requires one), not the "
+            "raw preallocated file on disk")
 
-    @needs_libtorrent
-    @needs_ffmpeg
-    def test_the_live_encode_reads_through_stream_not_the_raw_file(self):
-        # The bug this closes: a local backend's file is preallocated to its
-        # full length, so a still-downloading job's file is real data up to
-        # wherever the swarm has reached and zeros for the rest of its
-        # length. start_live_from_url used to be handed that raw path
-        # directly -- ffmpeg would read straight through into the zeros and
-        # (observed against a real download stuck at 24%) quietly call that
-        # the end of the film: a clean exit, hours before the torrent was
-        # actually done. live_seek() already reads through /stream/ for
-        # exactly this reason; the very first live-encode call must too.
-        payload = self.eac3_fixture()
-        backend = self._FakeLocalBackend(payload)
-        # Reported bigger than what actually landed on disk, so `already`
-        # (tree_bytes >= total) comes out False and the live-encode path is
-        # the one taken, rather than "already downloaded, finalizing".
-        real_fetch = backend.fetch_metadata
-        def bigger_fetch(job, magnet, port, limit):
-            files, tfile, log = real_fetch(job, magnet, port, limit)
-            files[0]["size"] = os.path.getsize(payload) * 10
-            return files, tfile, log
-        backend.fetch_metadata = bigger_fetch
-        self.m._BACKEND = backend
-
-        captured = []
-        def fake_live(job, url, kind, *a, **k):
-            captured.append(url)
-            job["live_done"] = True     # let run_torrent's wait loop exit
-        self.m.start_live_from_url = fake_live
-        try:
-            j = self.job(magnet="magnet:?xt=urn:btih:" + "d" * 40)
-            self.m.run_torrent(j)
-        finally:
-            self.m._BACKEND = None
-
-        self.assertEqual(len(captured), 1)
-        self.assertEqual(captured[0],
-                         "http://127.0.0.1:%d/stream/%s" % (self.m.PORT, j["id"]))
-
-    def _probe_job(self, name="source.mkv"):
-        """A job whose first probe will land on a video-shaped file, without
-        needing a real ffprobe call -- probe_media is stubbed per test to
-        script exactly what each attempt finds."""
-        payload = os.path.join(self.dl, name)
-        with open(payload, "wb") as f:
-            f.write(b"\0" * 1024)     # never actually read; probe_media is stubbed
-        backend = self._FakeLocalBackend(payload)
-        real_fetch = backend.fetch_metadata
-        def bigger_fetch(job, magnet, port, limit):
-            files, tfile, log = real_fetch(job, magnet, port, limit)
-            files[0]["name"] = name
-            files[0]["size"] = 10_000_000
-            return files, tfile, log
-        backend.fetch_metadata = bigger_fetch
-        self.m._BACKEND = backend
-        self.m.start_live_from_url = lambda job, url, kind, *a, **kw: (
-            job.__setitem__("live_done", True))
-        return backend
-
-    def test_a_video_container_with_only_audio_is_untrustworthy_first_try(self):
-        # The bug this closes, seen on a real download: 8 seconds into a
-        # fresh torrent, ffprobe found DTS audio but no video track yet --
-        # not because the file is audio-only, but because the swarm had not
-        # delivered the video header. Taken at face value, the job was filed
-        # as audio and given a duration ffprobe extrapolated from a sliver of
-        # the file: 9h06m for a 1h56m film. The retry through /stream/ (the
-        # piece-aware route) is what a still-downloading local job has, and
-        # it is where the real answer was.
-        self._probe_job()
-        calls = []
-        def fake_probe(path, timeout=25):
-            calls.append(path)
-            if path.startswith("http://"):
-                return ("h264", "dts", 1080, False, 3_000_000, 6982.976, "yuv420p")
-            return (None, "dts", None, False, None, 32797.786644, None)
-        self.m.probe_media = fake_probe
-        try:
-            j = self.job(magnet="magnet:?xt=urn:btih:" + "e" * 40)
-            self.m.run_torrent(j)
-        finally:
-            self.m._BACKEND = None
-
-        self.assertEqual(j["kind"], "video")
-        self.assertEqual(j["duration"], 6982.976)
-        self.assertTrue(any(c.startswith("http://") for c in calls),
-                        "the piece-aware /stream/ route was never tried")
-
-    def test_a_still_partial_result_falls_through_to_the_reprobe_wait(self):
-        # Both the raw-path probe and the /stream/ retry land during the same
-        # starved moment and both come back audio-only -- the wait-for-more-
-        # data loop (already proven for the all-empty case) is what a third,
-        # later attempt needs to actually find the video track.
-        self._probe_job()
-        calls = []
-        def fake_probe(path, timeout=25):
-            calls.append(path)
-            if len(calls) <= 2:
-                return (None, "dts", None, False, None, 32797.786644, None)
-            return ("h264", "dts", 1080, False, 3_000_000, 6982.976, "yuv420p")
-        self.m.probe_media = fake_probe
-        try:
-            j = self.job(magnet="magnet:?xt=urn:btih:" + "f" * 40)
-            self.m.run_torrent(j)
-        finally:
-            self.m._BACKEND = None
-
-        self.assertEqual(j["kind"], "video")
-        self.assertEqual(j["duration"], 6982.976)
-        self.assertGreaterEqual(len(calls), 3)
-
-    def test_a_genuine_audio_release_is_not_held_up_waiting_for_video(self):
-        # The null test: an actual audio-only release (a music or podcast
-        # torrent, packaged in an audio container) must not pay this wait --
-        # v is permanently None for it, and that is correct, not partial.
-        self._probe_job(name="album.flac")
-        calls = []
-        def fake_probe(path, timeout=25):
-            calls.append(path)
-            return (None, "flac", None, False, None, 240.0, None)
-        self.m.probe_media = fake_probe
-        try:
-            j = self.job(magnet="magnet:?xt=urn:btih:" + "0" * 40)
-            self.m.run_torrent(j)
-        finally:
-            self.m._BACKEND = None
-
-        self.assertEqual(j["kind"], "audio")
-        self.assertEqual(j["duration"], 240.0)
-        # One probe only: no retry through /stream/, no reprobe wait.
-        self.assertEqual(len(calls), 1)
+        # A well-formed URL is not enough by itself: this server 403s any
+        # request with no token or the wrong one, and ffmpeg's own request to
+        # its own reel instance is subject to that check exactly like a
+        # browser's would be. Feed the *actual* URL the live encoder was
+        # handed through the real HTTP handler, the same way ffmpeg's request
+        # would land, and confirm reel's own server actually accepts it.
+        parts = urllib.parse.urlparse(captured["url"])
+        h = m.H.__new__(m.H)
+        h.path = parts.path + "?" + parts.query
+        h.headers = {}
+        h.wfile = io.BytesIO()
+        h.rfile = io.BytesIO(b"")
+        h.client_address = ("127.0.0.1", 0)
+        h.close_connection = False
+        sent = {}
+        h.send_response = lambda c: sent.update(code=c)
+        h.send_header = lambda k, v: None
+        h.end_headers = lambda: None
+        h.do_GET()
+        self.assertNotEqual(sent.get("code"), 403,
+                           "the URL the live encoder is actually fed must be "
+                           "authorized against this server's own token check, "
+                           "not just shaped like a valid one")
 
 
 # --------------------------------------------------------------------------
@@ -2924,6 +2631,68 @@ class TestTorrentSubtitles(Base):
         self.assertFalse(self.m.write_subs(j, b""))
         self.assertFalse(self.m.write_subs(j, b"   \n "))
 
+    # ---- subs_from_torrent goes through the backend, not straight to
+    # webtorrent's own http server: that server only exists for a
+    # WebTorrentBackend job, so calling it directly always failed silently
+    # on the (default) libtorrent backend, no matter how many subtitles the
+    # torrent actually carried. ---------------------------------------------
+
+    @needs_ffmpeg
+    def test_subs_from_torrent_uses_the_backends_fetch_file(self):
+        files = [{"index": 0, "name": "Film.2026.mkv", "size": 6_000_000_000},
+                 {"index": 1, "name": "Subs/English.srt", "size": 40_000}]
+        srt = b"1\n00:00:01,000 --> 00:00:02,000\nHello.\n"
+
+        class Bk:
+            def fetch_file(self, job, port, cand, out_dir, timeout=None):
+                self.calls = getattr(self, "calls", []) + [cand["name"]]
+                return srt if cand["name"] == "Subs/English.srt" else None
+
+        bk = Bk()
+        real_backend = self.m.backend
+        self.m.backend = lambda: bk
+        try:
+            j = self.job()
+            self.m.subs_from_torrent(j, 0, files, files[0], self.dl)
+            deadline = time.time() + 5
+            while time.time() < deadline and j.get("subs_status") != "ready":
+                time.sleep(0.05)
+        finally:
+            self.m.backend = real_backend
+        self.assertEqual(j["subs_status"], "ready")
+        self.assertEqual(j["subs_source"], "torrent")
+        self.assertEqual(bk.calls, ["Subs/English.srt"])
+
+    def test_subs_from_torrent_falls_back_to_search_when_unfetchable(self):
+        # Every candidate the torrent carries fails to fetch (e.g. the
+        # backend-mismatch bug this guards against) -- the job must still
+        # fall through to an internet search rather than being left stuck.
+        files = [{"index": 0, "name": "Film.2026.mkv", "size": 6_000_000_000},
+                 {"index": 1, "name": "Subs/English.srt", "size": 40_000}]
+
+        class Bk:
+            def fetch_file(self, job, port, cand, out_dir, timeout=None):
+                return None
+
+        real_backend = self.m.backend
+        real_search = self.m.subs_search
+        searched = []
+        self.m.backend = lambda: Bk()
+        self.m.subs_search = lambda *a, **k: (searched.append(a) or ([], "test"))
+        try:
+            j = self.job()
+            self.m.subs_from_torrent(j, 0, files, files[0], self.dl)
+            deadline = time.time() + 5
+            while time.time() < deadline and not searched:
+                time.sleep(0.05)
+        finally:
+            self.m.backend = real_backend
+            self.m.subs_search = real_search
+        self.assertTrue(searched, "an unfetchable torrent subtitle must still "
+                                  "fall through to the search path")
+        self.assertIn("none could be fetched",
+                      " ".join(e["m"] for e in j["log"]))
+
 
 # --------------------------------------------------------------------------
 class TestPacks(Base):
@@ -3537,46 +3306,6 @@ class TestCatalogue(Base):
         ], {})
         self.assertIsNotNone(self.m.find_torrent("Ikiru", 1952))
 
-    def test_require_dub_rejects_a_subtitle_only_release(self):
-        # TMDb has no concept of dub availability, so this is the only place
-        # it can be checked -- and a release without the marker is not one.
-        self.m.search_all = lambda q: ([
-            {"infohash": "a" * 40, "name": "Your.Name.2016.1080p.BluRay.x264-GRP",
-             "seeders": 60, "leechers": 1, "size": 3_000_000_000, "files": 1,
-             "magnet": "m"},
-        ], {})
-        self.assertIsNone(self.m.find_torrent("Your Name", 2016, require_dub=True))
-
-    def test_require_dub_accepts_a_dual_audio_release(self):
-        self.m.search_all = lambda q: ([
-            {"infohash": "a" * 40,
-             "name": "Your.Name.2016.1080p.Dual.Audio.BluRay.x264-GRP",
-             "seeders": 60, "leechers": 1, "size": 3_000_000_000, "files": 1,
-             "magnet": "m"},
-        ], {})
-        hit = self.m.find_torrent("Your Name", 2016, require_dub=True)
-        self.assertIsNotNone(hit)
-
-    def test_require_dub_is_off_by_default(self):
-        self.m.search_all = lambda q: ([
-            {"infohash": "a" * 40, "name": "Your.Name.2016.1080p.BluRay.x264-GRP",
-             "seeders": 60, "leechers": 1, "size": 3_000_000_000, "files": 1,
-             "magnet": "m"},
-        ], {})
-        self.assertIsNotNone(self.m.find_torrent("Your Name", 2016))
-
-    def test_cached_torrent_keys_a_dub_search_apart_from_a_plain_one(self):
-        # Otherwise a plain search's cached miss would be handed back to a
-        # dub-requiring caller, or vice versa, for whoever asks second.
-        calls = []
-        def fake_find(title, year=None, min_res=None, require_dub=False):
-            calls.append(require_dub)
-            return {"name": "hit", "magnet": "m"} if require_dub else None
-        self.m.find_torrent = fake_find
-        self.assertIsNone(self.m.cached_torrent("Your Name", 2016))
-        self.assertIsNotNone(self.m.cached_torrent("Your Name", 2016, require_dub=True))
-        self.assertEqual(calls, [False, True])
-
     def test_camera_rips_and_packs_are_not_offered_as_the_copy(self):
         self.m.search_all = lambda q: ([
             {"infohash": "a" * 40, "name": "The.Thing.1982.1080p.TELESYNC-X",
@@ -3604,7 +3333,7 @@ class TestCatalogueShelves(Base):
         # Five shelves asking about the same classics every half hour would be
         # sixty indexer searches per rebuild; almost all of that is memory.
         calls = []
-        def fake_find(title, year=None, require_dub=False):
+        def fake_find(title, year=None):
             calls.append(title)
             return {"infohash": "a" * 40, "name": title, "seeders": 50,
                    "leechers": 1, "size": 2_000_000_000, "magnet": "m"}
@@ -3615,7 +3344,7 @@ class TestCatalogueShelves(Base):
 
     def test_a_cached_miss_is_not_retried_either(self):
         calls = []
-        def fake_find(title, year=None, require_dub=False):
+        def fake_find(title, year=None):
             calls.append(title)
             return None
         self.m.find_torrent = fake_find
@@ -3626,7 +3355,7 @@ class TestCatalogueShelves(Base):
     def test_a_stale_entry_is_asked_about_again(self):
         self.m.AVAIL_TTL = 0.01
         calls = []
-        def fake_find(title, year=None, require_dub=False):
+        def fake_find(title, year=None):
             calls.append(title)
             return None
         self.m.find_torrent = fake_find
@@ -3889,116 +3618,6 @@ class TestShelfAssembly(Base):
 
 
 # --------------------------------------------------------------------------
-class TestAnimeShelf(Base):
-    """build_anime_shelf(): one shelf, films and series merged, both requiring
-    an English dub. tmdb_rows and shelf_from_catalogue are stubbed, same as
-    TestShelfAssembly -- this tests the merge, dedup and genre-resolution
-    logic, not the catalogue or the indexers."""
-
-    def setUp(self):
-        super().setUp()
-        self.m.tmdb_genres = lambda kind="movie": {"animation": 16}
-        self.asked = []
-        self.finders = []
-
-    def stub_rows(self, movie_titles=(), tv_titles=()):
-        def rows(kind="movie", **q):
-            self.asked.append((kind, q))
-            titles = movie_titles if kind == "movie" else tv_titles
-            return [{"title": t, "year": 2020, "rating": 8.0 - i * 0.1,
-                     "votes": 5000} for i, t in enumerate(titles)]
-        self.m.tmdb_rows = rows
-
-    def stub_shelf(self):
-        def shelf(rows_in, want, now, finder=None):
-            self.finders.append(finder)
-            return [{"title": r["title"], "name": r["title"], "size": 1,
-                     "seeders": 99, "score": r["rating"], "why": ""}
-                    for r in rows_in][:want]
-        self.m.shelf_from_catalogue = shelf
-        self.m.feed_dress = lambda rows: rows
-
-    def test_the_query_carries_language_and_genre_for_both_kinds(self):
-        # Neither alone means anime -- Animation alone includes Western
-        # cartoons, Japanese alone includes live-action -- so both kinds'
-        # queries need both, with the genre id from a real lookup rather
-        # than a hardcoded number.
-        self.stub_rows(["Your Name"], ["Frieren"])
-        self.stub_shelf()
-        self.m.build_anime_shelf()
-        by_kind = dict(self.asked)
-        self.assertEqual(by_kind["movie"]["with_original_language"], "ja")
-        self.assertEqual(by_kind["movie"]["with_genres"], 16)
-        self.assertEqual(by_kind["tv"]["with_original_language"], "ja")
-        self.assertEqual(by_kind["tv"]["with_genres"], 16)
-
-    def test_films_and_shows_land_on_one_combined_shelf(self):
-        # The point of the merge: a beloved film and its own franchise's
-        # series belong on the same page, not split by runtime.
-        self.stub_rows(["Your Name"], ["Frieren"])
-        self.stub_shelf()
-        out, _per = self.m.build_anime_shelf()
-        self.assertEqual(len(out), 1)
-        self.assertEqual({f["title"] for f in out[0]["films"]},
-                         {"Your Name", "Frieren"})
-
-    def test_each_kind_is_found_through_its_own_finder(self):
-        # A season pack and a film are not interchangeable copies, so the tv
-        # half must not be searched with the film finder or vice versa.
-        self.stub_rows(["Your Name"], ["Frieren"])
-        self.stub_shelf()
-        self.m.build_anime_shelf()
-        self.assertEqual(len(self.finders), 2)
-        self.assertIsNot(self.finders[0], self.finders[1])
-
-    def test_a_title_surviving_under_both_kinds_is_not_duplicated(self):
-        self.stub_rows(["Same Title"], ["Same Title"])
-        self.stub_shelf()
-        out, _per = self.m.build_anime_shelf()
-        titles = [f["title"] for f in out[0]["films"]]
-        self.assertEqual(titles.count("Same Title"), 1)
-
-    def test_an_unresolvable_genre_returns_no_shelf_at_all(self):
-        # Without the genre id the query would be "everything in Japanese" --
-        # far broader than anime -- so a failed lookup drops the whole shelf
-        # rather than silently widening it.
-        self.m.tmdb_genres = lambda kind="movie": {}
-        self.stub_rows(["Your Name"], ["Frieren"])
-        self.stub_shelf()
-        out, _per = self.m.build_anime_shelf()
-        self.assertEqual(out, [])
-        self.assertEqual(self.asked, [])
-
-    def test_build_shelves_drops_an_anime_title_from_the_general_shelves(self):
-        # The invariant this merge exists to protect: a film sits on exactly
-        # one shelf. Claimed here, offered again by an unrelated general
-        # shelf that has no idea a dub-specific pick already took it.
-        self.m.has_tmdb = lambda: True
-        self.m.build_anime_shelf = lambda: (
-            [{"name": "Anime", "note": "", "films": [{"title": "Your Name"}]}], {})
-        self.m.build_catalogue_shelves = lambda: (
-            [{"name": "Tonight", "note": "", "films": [
-                {"title": "Your Name"}, {"title": "Dune"}]}], None, {})
-        self.m.build_catalogue_shelves_tv = lambda: ([], {})
-        out, _err, _per = self.m.build_shelves()
-        by_name = {s["name"]: s for s in out}
-        self.assertEqual([f["title"] for f in by_name["Tonight"]["films"]], ["Dune"])
-        self.assertEqual([f["title"] for f in by_name["Anime"]["films"]], ["Your Name"])
-
-    def test_a_shelf_emptied_entirely_by_the_claim_is_dropped(self):
-        self.m.has_tmdb = lambda: True
-        self.m.build_anime_shelf = lambda: (
-            [{"name": "Anime", "note": "", "films": [{"title": "Your Name"}]}], {})
-        self.m.build_catalogue_shelves = lambda: (
-            [{"name": "Tonight", "note": "", "films": [{"title": "Your Name"}]}],
-            None, {})
-        self.m.build_catalogue_shelves_tv = lambda: ([], {})
-        out, _err, _per = self.m.build_shelves()
-        self.assertNotIn("Tonight", [s["name"] for s in out])
-        self.assertIn("Anime", [s["name"] for s in out])
-
-
-# --------------------------------------------------------------------------
 class TestSeasonDetection(Base):
     """A TV shelf must offer whole seasons only. Two layers: a cheap name
     check that decides what's worth a request, and a real file-list check
@@ -4131,20 +3750,6 @@ class TestFindSeason(Base):
         got = self.m.find_season("Severance", 2022)
         self.assertEqual(got["id"], "2")
 
-    def test_require_dub_rejects_a_subtitle_only_release(self):
-        self.m.search_all = lambda q: ([
-            self.row("Frieren.S01.1080p.WEB-DL.x265-GRP")], {})
-        self.assertIsNone(self.m.find_season("Frieren", 2023, require_dub=True))
-
-    def test_require_dub_accepts_a_dual_audio_pack(self):
-        self.m.search_all = lambda q: ([
-            self.row("Frieren.S01.Dual.Audio.1080p.WEB-DL.x265-GRP")], {})
-        self.m.torrent_file_list = lambda tid, timeout=6: [
-            {"name": "Frieren.S01E%02d.mkv" % i, "size": 1_200_000_000}
-            for i in range(1, 10)]
-        got = self.m.find_season("Frieren", 2023, require_dub=True)
-        self.assertIsNotNone(got)
-
 
 # --------------------------------------------------------------------------
 class TestTvShelves(Base):
@@ -4156,10 +3761,6 @@ class TestTvShelves(Base):
         self.m._TMDB.clear()
         self.m._TMDB["key"] = "test-key"
         self.m.AVAIL.clear()
-        # build_shelves() calls build_anime_shelf() too whenever a key is
-        # present -- stubbed here so this fake test key never reaches the
-        # real network, the same reasoning as every other TMDb stub here.
-        self.m.build_anime_shelf = lambda: ([], {})
 
     def test_shelf_from_catalogue_uses_the_finder_it_is_given(self):
         calls = []
@@ -4185,15 +3786,15 @@ class TestTvShelves(Base):
 
     def test_movie_and_tv_shelves_are_tagged_by_section(self):
         self.m.build_catalogue_shelves = lambda: (
-            [{"name": "Tonight", "note": "n", "films": [{"title": "Dune"}]}], None, {})
+            [{"name": "Tonight", "note": "n", "films": []}], None, {})
         self.m.build_catalogue_shelves_tv = lambda: (
-            [{"name": "Tonight", "note": "n", "films": [{"title": "Severance"}]}], {})
+            [{"name": "Tonight", "note": "n", "films": []}], {})
         rows, err, per = self.m.build_shelves()
         self.assertEqual([r["section"] for r in rows], ["movie", "tv"])
 
     def test_a_broken_tv_build_does_not_cost_the_movie_shelves(self):
         self.m.build_catalogue_shelves = lambda: (
-            [{"name": "Tonight", "note": "n", "films": [{"title": "Dune"}]}], None, {})
+            [{"name": "Tonight", "note": "n", "films": []}], None, {})
         def broken():
             raise RuntimeError("tv catalogue query failed")
         self.m.build_catalogue_shelves_tv = broken
@@ -4746,85 +4347,6 @@ class TestAudioTracks(Base):
 
     def test_no_tracks_is_a_no_op(self):
         self.assertEqual(self.m.audio_remap_args([]), ([], [], []))
-
-
-# --------------------------------------------------------------------------
-class TestLiveRoute(Base):
-    """/live/: served against a real socket, not a mocked handler, since the
-    bug this covers is specifically about what happens across the network
-    boundary -- a browser that does not retry a failed video load on its own.
-
-    The bug: live_seek() restarts the encoder into a new live_file, but
-    nothing ever sets live_ready back to True for it -- that flag is only
-    ever set once, by run_torrent()'s own startup wait loop. A request that
-    lands in the gap got an immediate 503 forever, indistinguishable from a
-    hung player. Found debugging a real seek on a real download: the bar
-    vanished and playback never recovered."""
-
-    def setUp(self):
-        super().setUp()
-        self.m.COMPAT_WAIT = 1.0     # the hold this test is timing
-        self.srv = self.m.Server(("127.0.0.1", 0), self.m.H)
-        self.port = self.srv.server_address[1]
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-
-    def tearDown(self):
-        self.srv.shutdown()
-        self.srv.server_close()
-        super().tearDown()
-
-    def get(self, path, timeout=5):
-        try:
-            with urllib.request.urlopen(
-                    "http://127.0.0.1:%d%s" % (self.port, path), timeout=timeout) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-
-    def test_a_request_that_lands_before_the_first_fragment_is_held_not_refused(self):
-        j = self.job()
-        j["live_ready"] = False
-        j["live_done"] = False
-        j["live_file"] = os.path.join(self.dl, "x.live.mp4")
-
-        def arm_it():
-            time.sleep(0.3)
-            with open(j["live_file"], "wb") as f:
-                f.write(b"fragment-bytes")
-            j["live_ready"] = True
-            j["live_done"] = True    # so the handler closes rather than
-                                      # holding the connection for more
-        threading.Thread(target=arm_it, daemon=True).start()
-
-        t0 = time.time()
-        status, body = self.get("/live/" + j["id"])
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"fragment-bytes")
-        # Long enough to prove it waited rather than answering instantly.
-        self.assertGreaterEqual(time.time() - t0, 0.25)
-
-    def test_a_job_that_never_becomes_ready_eventually_gives_up(self):
-        j = self.job()
-        j["live_ready"] = False
-        j["live_done"] = False
-        j["live_file"] = os.path.join(self.dl, "never.live.mp4")
-        status, _body = self.get("/live/" + j["id"])
-        self.assertEqual(status, 503)
-
-    def test_an_already_ready_job_is_served_immediately(self):
-        # The common case -- most requests land well after the first
-        # fragment exists -- must not pay the hold at all.
-        j = self.job()
-        j["live_file"] = os.path.join(self.dl, "y.live.mp4")
-        with open(j["live_file"], "wb") as f:
-            f.write(b"already-there")
-        j["live_ready"] = True
-        j["live_done"] = True
-        t0 = time.time()
-        status, body = self.get("/live/" + j["id"])
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"already-there")
-        self.assertLess(time.time() - t0, 0.5)
 
 
 # --------------------------------------------------------------------------
@@ -5414,6 +4936,535 @@ class TestTrackerRefresh(Base):
         self.m.fetch_tracker_list = lambda timeout=10, keep=(): None
         self.assertFalse(self.m.tracker_refresh_tick())
         self.assertEqual(self.m.SEARCH_TRACKERS, stale)
+
+
+class TestStderrDrainNeverDeadlocks(unittest.TestCase):
+    """A child that floods stderr must not be able to wedge the parent.
+
+    Every live/compat/pipe watcher used to read the child's stderr only after
+    proc.wait(); on a corrupt source ffmpeg fills the ~64 KB stderr pipe, blocks,
+    and wait() never returns -- the flagship live-transcode hang. drain_stream()
+    reads stderr continuously so the child can never block, and keeps a bounded
+    tail for the error message.
+    """
+
+    def setUp(self):
+        self.dl = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dl, ignore_errors=True)
+        self.m = load_reel(self.dl)
+
+    def test_flooded_stderr_is_drained_and_a_bounded_tail_is_kept(self):
+        # ~1 MB of stderr, far past any OS pipe buffer, then a clean exit. Were
+        # the pipe not drained, the child would block on write and never exit,
+        # so collect()/wait() below would hang.
+        flood = ("import sys\n"
+                 "sys.stderr.buffer.write(b'E' * (1024 * 1024))\n"
+                 "sys.stderr.buffer.flush()\n")
+        proc = subprocess.Popen([sys.executable, "-c", flood],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.stderr.close)
+        collect = self.m.drain_stream(proc.stderr)
+        # collect() joins the drain thread, which only ends at stderr EOF -- i.e.
+        # once the child has exited. The timeout keeps a regression from hanging
+        # the whole suite.
+        tail = collect(timeout=20)
+        self.assertEqual(proc.wait(timeout=5), 0)
+        self.assertIn(b"E", tail)
+        self.assertLessEqual(len(tail), 256 * 1024,
+                             "tail must be bounded, not the whole megabyte")
+
+    def test_start_compat_watcher_survives_a_source_that_floods_stderr(self):
+        # The real deadlock, end to end: a "ffmpeg" that dumps >64 KB to stderr
+        # then exits. The watcher used to call proc.wait() before reading stderr,
+        # so the child blocked on the full pipe and compat_done was never set.
+        m = self.m
+        src = os.path.join(self.dl, "src.mp4")
+        with open(src, "wb") as fh:
+            fh.write(b"\0" * 4096)
+        job = m.new_job("drive-xyz")
+        job["path"] = src
+        m.probe_media = lambda *a, **k: ("h264", "aac", 1080, False,
+                                         1_000_000, 60.0, "yuv420p")
+        m.enforce_cache_cap = lambda *a, **k: None
+        flood = ("import sys\n"
+                 "sys.stderr.buffer.write(b'E' * (1024 * 1024))\n"
+                 "sys.stderr.buffer.flush()\n")
+        real = m.subprocess
+        m.subprocess = types.SimpleNamespace(
+            Popen=lambda cmd, **k: real.Popen([sys.executable, "-c", flood], **k),
+            PIPE=real.PIPE, DEVNULL=real.DEVNULL, run=real.run)
+        try:
+            self.assertTrue(m.start_compat(job))
+            deadline = time.time() + 20
+            while not job.get("compat_done") and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(job.get("compat_done"),
+                            "start_compat's watcher hung -- stderr was not drained")
+            self.assertFalse(job.get("compat_ready"))
+            self.assertIn("E", job.get("compat_note") or "")
+        finally:
+            m.subprocess = real
+            job["cancel"].set()
+            for p in list(job.get("procs") or []):
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+
+class TestCacheAndSchedulingCorrectness(unittest.TestCase):
+    """Eviction and the work queue must not corrupt state under load or evict
+    what someone is watching. Each test is one confirmed stress-test finding."""
+
+    def setUp(self):
+        self.dl = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dl, ignore_errors=True)
+        self.m = load_reel(self.dl)
+
+    def test_cap_counts_real_disk_use_not_logical_size(self):
+        # A libtorrent download is preallocated to its full logical length before
+        # any piece lands. The cap must count real allocation (disk_bytes/st_blocks),
+        # not logical getsize, or the folder reads as over-cap instantly and the
+        # janitor evicts the download it just started. Made deterministic across
+        # filesystems by standing in for the sparse gap explicitly.
+        m = self.m
+        p = os.path.join(m.DL, "prealloc.bin")
+        with open(p, "wb") as f:
+            f.write(b"\0" * (2 * 1024 * 1024))   # 2 MB logical
+        real = m.disk_bytes
+        m.disk_bytes = lambda path: 4096 if path == p else real(path)
+        got = m.folder_size_bytes(0)
+        self.assertLess(got, 2 * 1024 * 1024,
+                        "cap must sum real disk_bytes, not logical getsize")
+        self.assertLessEqual(got, 8192)
+
+    def test_overflow_victim_is_never_an_item_being_watched(self):
+        # Last-resort overflow used to cancel the newest download unconditionally,
+        # aborting the very stream a viewer was on.
+        m = self.m
+        a = m.new_job("a"); a["status"] = "downloading"
+        b = m.new_job("b"); b["status"] = "downloading"
+        m.JOBS[a["id"]] = a
+        m.JOBS[b["id"]] = b
+        m.STREAMING[b["id"]] = 1              # a viewer is streaming the newest
+        self.assertIs(m.overflow_victim(), a, "must skip the watched download")
+        m.STREAMING[a["id"]] = 1              # now everything is being watched
+        self.assertIsNone(m.overflow_victim(), "must not kill a watched stream")
+
+    def test_enforce_cache_cap_rechecks_in_use_before_deleting(self):
+        # evictable() checks in_use once at snapshot time; a viewer can open an
+        # item between the snapshot and the delete. The delete loop must re-check.
+        m = self.m
+        p = os.path.join(m.DL, "watched.mp4")
+        with open(p, "wb") as f:
+            f.write(b"x" * 4096)
+        job = m.new_job("watched"); job["status"] = "done"; job["path"] = p
+        m.JOBS[job["id"]] = job
+        m.CACHE_CAP_GB = 0.0000001            # force over-cap
+        m.STREAMING[job["id"]] = 1            # opened after the snapshot was taken
+        m.evictable = lambda: [(0.0, job["id"], p, "file")]   # the stale snapshot
+        m.enforce_cache_cap()
+        self.assertTrue(os.path.exists(p),
+                        "must not delete a file a viewer is streaming")
+
+    def test_a_queued_job_is_claimed_by_only_one_worker(self):
+        # Two WORK_Q entries for one jid used to let both workers run it into the
+        # same directories, orphaning one process and corrupting output.
+        m = self.m
+        job = m.new_job("only-once")
+        m.JOBS[job["id"]] = job
+        self.assertIs(m.claim_job(job["id"]), job, "first worker wins the claim")
+        self.assertIsNone(m.claim_job(job["id"]), "a duplicate must be refused")
+        with m.LOCK:
+            job["running"] = False            # the first worker finished
+        self.assertIs(m.claim_job(job["id"]), job, "claimable again once idle")
+        job["cancel"].set()
+        with m.LOCK:
+            job["running"] = False
+        self.assertIsNone(m.claim_job(job["id"]), "a cancelled job is not claimed")
+
+
+class TestStreamingContractAndParsers(unittest.TestCase):
+    """The HTTP body contract and every untrusted-input parser must fail safe:
+    a short read tears the connection down instead of hanging the client, and
+    hostile indexer/torrent input degrades to a skipped row, never a crash."""
+
+    def setUp(self):
+        self.dl = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dl, ignore_errors=True)
+        self.m = load_reel(self.dl)
+
+    def _handler(self, **attrs):
+        h = self.m.H.__new__(self.m.H)
+        h.headers = {}
+        h.wfile = io.BytesIO()
+        h.close_connection = False
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda: None
+        for k, v in attrs.items():
+            setattr(h, k, v)
+        return h
+
+    def test_stream_closes_connection_on_a_short_read(self):
+        # A libtorrent-backed torrent: file preallocated, path still None. If a
+        # piece stops arriving mid-body, _stream has already committed a
+        # Content-Length; it must close the keep-alive connection rather than
+        # send fewer bytes and hang the player forever.
+        m = self.m
+        p = os.path.join(m.DL, "film.mkv")
+        with open(p, "wb") as f:
+            f.write(b"\0" * (4 * 262144))          # 1 MB, preallocated
+        job = m.new_job("t", source="torrent")
+        job["lt_file"] = p
+        m.JOBS[job["id"]] = job
+        calls = {"n": 0}
+
+        class FakeBackend:
+            def ensure_range(self, job, off, length, timeout=None):
+                calls["n"] += 1
+                return calls["n"] <= 1              # pre-flight ok, then stalls
+        m.backend = lambda: FakeBackend()
+        h = self._handler(headers={"Range": "bytes=0-1048575"})
+        h._stream(job["id"])
+        self.assertTrue(h.close_connection,
+                        "a short body on a keep-alive HTTP/1.1 socket must close")
+
+    def test_feed_pool_survives_nonnumeric_indexer_counts(self):
+        # One row with 'N/A'/'1,234' seeders used to raise int() and take down
+        # every shelf for every user on the no-TMDB path.
+        m = self.m
+        m.ratings_for = lambda ids: {}             # no network
+        rows = [
+            {"name": "Alpha 2019 1080p BluRay x264", "info_hash": "a" * 40,
+             "seeders": 100, "leechers": 5, "size": 1_000_000_000},
+            {"name": "Beta 2020 1080p WEB x264", "info_hash": "b" * 40,
+             "seeders": "N/A", "leechers": "1,234", "size": "unknown"},
+        ]
+        out = m.feed_pool(rows)                     # must not raise
+        self.assertIsInstance(out, list)
+        for i in out:
+            self.assertIsInstance(i["seeders"], int)
+            self.assertGreaterEqual(i["seeders"], 0)
+
+    def test_as_bytes_survives_an_absurd_number(self):
+        m = self.m
+        self.assertIsNone(m.as_bytes("1e400", "TB"))    # was OverflowError
+        self.assertIsNone(m.as_bytes(float("inf"), "MB"))
+        self.assertEqual(m.as_bytes("1.5", "KB"), 1500)  # still works
+
+    def test_bdecode_rejects_deep_nesting_with_a_bounded_error(self):
+        m = self.m
+        with self.assertRaises(ValueError):
+            m.bdecode(b"l" * 10000)                 # was RecursionError
+        self.assertEqual(m.bdecode(b"i42e"), (42, 4))
+        self.assertEqual(m.bdecode(b"4:spam"), (b"spam", 6))
+
+    def test_torrent_files_returns_empty_on_a_malformed_info_dict(self):
+        # bencode-valid, but a files entry is missing its 'path' key -- the file
+        # loop used to run outside torrent_files' try/except and raise KeyError.
+        m = self.m
+        entry = b"d6:lengthi10ee"                   # {b'length': 10}, no b'path'
+        info = b"d5:filesl" + entry + b"e4:name3:fooe"
+        blob = b"d4:info" + info + b"e"
+        p = os.path.join(m.DL, "bad.torrent")
+        with open(p, "wb") as f:
+            f.write(blob)
+        self.assertEqual(m.torrent_files(p), [])
+
+    def test_gunzip_refuses_a_decompression_bomb(self):
+        # install_subs used to gzip.decompress() an untrusted body with no
+        # ceiling, so a small crafted gzip could inflate to gigabytes and take
+        # the single process down.
+        m = self.m
+        small = gzip.compress(b"WEBVTT\n\nhello")
+        self.assertEqual(m.gunzip_capped(small, cap=1024), b"WEBVTT\n\nhello")
+        bomb = gzip.compress(b"\0" * (5 * 1024 * 1024))   # 5 MB -> a few KB gzip
+        with self.assertRaises(ValueError):
+            m.gunzip_capped(bomb, cap=1024 * 1024)         # 1 MB ceiling
+
+    def test_find_answers_json_not_a_dropped_connection_when_search_raises(self):
+        # A non-numeric filter made catalogue_search raise ValueError, which
+        # escaped the /find handler as a 500 with a dropped connection.
+        m = self.m
+
+        def boom(body):
+            raise ValueError("invalid literal for int(): 'abc'")
+        m.catalogue_with_copies = boom
+        h = self._handler(path="/find",
+                          headers={"Content-Length": "2",
+                                   "Cookie": "reel_token=" + m.auth_token()},
+                          rfile=io.BytesIO(b"{}"),
+                          client_address=("127.0.0.1", 0))
+        h.do_POST()                                   # must not raise
+        self.assertIn(b"results", h.wfile.getvalue(),
+                      "a failed search must answer a JSON body, not drop")
+
+
+class TestAuthGate(unittest.TestCase):
+    """Every route is gated by a per-install token. The token rides a same-origin
+    cookie so <video>/stream requests carry it automatically; it also arrives by
+    ?t= (the QR/handoff link) or X-Reel-Token header."""
+
+    def setUp(self):
+        self.dl = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dl, ignore_errors=True)
+        self.m = load_reel(self.dl)
+        self.tok = self.m.auth_token()
+
+    def _h(self, path="/jobs", headers=None):
+        h = self.m.H.__new__(self.m.H)
+        h.path = path
+        h.headers = headers or {}
+        h.wfile = io.BytesIO()
+        h.rfile = io.BytesIO(b"")
+        h.client_address = ("127.0.0.1", 0)
+        h.close_connection = False
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda: None
+        return h
+
+    def test_token_is_stable_across_reloads(self):
+        # Persisted in the cache dir so bookmarks and the QR link keep working.
+        again = load_reel(self.dl)
+        self.assertEqual(again.auth_token(), self.tok)
+        self.assertGreaterEqual(len(self.tok), 16)
+
+    def test_authorized_accepts_cookie_query_or_header(self):
+        m = self.m
+        self.assertTrue(m.authorized(self._h(headers={"Cookie": "reel_token=" + self.tok})))
+        self.assertTrue(m.authorized(self._h(path="/jobs?t=" + self.tok)))
+        self.assertTrue(m.authorized(self._h(headers={"X-Reel-Token": self.tok})))
+
+    def test_authorized_rejects_missing_or_wrong_token(self):
+        m = self.m
+        self.assertFalse(m.authorized(self._h()))
+        self.assertFalse(m.authorized(self._h(headers={"Cookie": "reel_token=nope"})))
+        self.assertFalse(m.authorized(self._h(path="/jobs?t=wrong")))
+
+    def test_do_POST_refuses_without_a_token(self):
+        m = self.m
+        ran = {"add": False}
+        m.split_sources = lambda *a, **k: (ran.__setitem__("add", True), ([], [], 0))[1]
+        h = self._h(path="/add", headers={"Content-Length": "2"})
+        h.rfile = io.BytesIO(b"{}")
+        h.do_POST()
+        self.assertFalse(ran["add"], "/add must not run without a valid token")
+
+    def test_do_GET_refuses_jobs_without_a_token(self):
+        m = self.m
+        h = self._h(path="/jobs")
+        h.do_GET()
+        self.assertIn(b"unauthorized", h.wfile.getvalue())
+
+    def test_page_load_with_token_sets_the_cookie(self):
+        m = self.m
+        sent = []
+        h = self._h(path="/?t=" + self.tok)
+        h.send_header = lambda k, v: sent.append((k, v))
+        h.do_GET()
+        self.assertTrue(
+            any(k == "Set-Cookie" and ("reel_token=" + self.tok) in v for k, v in sent),
+            "loading / with a valid token must set the cookie")
+
+
+class TestHlsLivePhase(unittest.TestCase):
+    """The live phase becomes HLS (segments + a growing EVENT playlist) so the
+    browser's own seek bar works. Built in phases; these grow with the work."""
+
+    def setUp(self):
+        self.dl = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dl, ignore_errors=True)
+        self.m = load_reel(self.dl)
+
+    def _h(self, path="/", headers=None):
+        h = self.m.H.__new__(self.m.H)
+        h.path = path
+        h.headers = headers or {}
+        h.wfile = io.BytesIO()
+        h.rfile = io.BytesIO(b"")
+        h.client_address = ("127.0.0.1", 0)
+        h.close_connection = False
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda: None
+        return h
+
+    # ---- Phase 1: vendored hls.js + CSP ---------------------------------
+    def test_hls_js_is_vendored_and_served(self):
+        m = self.m
+        self.assertIsNotNone(m.static_file("hls.min.js"),
+                             "hls.min.js must be a whitelisted /static asset")
+        self.assertTrue(m.has_hls())
+
+    def test_player_is_not_gated_on_hls(self):
+        # Plyr must still work when hls.js is absent (graceful degradation).
+        m = self.m
+        real = m.static_file
+        m.static_file = lambda n: None if n == "hls.min.js" else real(n)
+        self.assertTrue(m.has_player(), "Plyr must not depend on hls.js")
+        self.assertFalse(m.has_hls())
+
+    def test_player_tags_include_hls_when_present(self):
+        self.assertIn("hls.min.js", self.m.player_tags())
+
+    def test_page_csp_allows_blob_media_for_mse(self):
+        # hls.js drives playback through MSE, whose MediaSource object URL is a
+        # blob:, so media-src must permit it.
+        m = self.m
+        sent = []
+        h = self._h(path="/?t=" + m.auth_token())
+        h.send_header = lambda k, v: sent.append((k, v))
+        h.do_GET()
+        csp = next((v for k, v in sent if k == "Content-Security-Policy"), "")
+        self.assertIn("media-src 'self' blob:", csp)
+
+    # ---- Phase 2: segment-dir naming + lifecycle ------------------------
+    def test_live_hls_dir_is_a_job_dir(self):
+        m = self.m
+        jid = "abc123def456"
+        self.assertEqual(m.live_hls_dir(jid), os.path.join(m.DL, jid + ".live.hls"))
+        self.assertIn(m.live_hls_dir(jid), m.job_dirs(jid),
+                      "the HLS dir must be swept with the job's other scratch")
+
+    def test_dropping_a_job_removes_its_hls_segments(self):
+        m = self.m
+        job = m.new_job("drive-d")
+        m.JOBS[job["id"]] = job
+        d = m.live_hls_dir(job["id"])
+        os.makedirs(d)
+        with open(os.path.join(d, "seg00000.m4s"), "wb") as f:
+            f.write(b"x")
+        m.drop(job["id"])
+        self.assertFalse(os.path.exists(d), "drop must rmtree the HLS segment dir")
+
+    def test_restore_discards_leftover_hls_segments(self):
+        # An interrupted HLS live phase leaves a truncated playlist + partial
+        # segments -- non-resumable, so restore() clears it like other scratch.
+        m = self.m
+        d = os.path.join(m.DL, "deadbeef0001.live.hls")
+        os.makedirs(d)
+        with open(os.path.join(d, "index.m3u8"), "wb") as f:
+            f.write(b"#EXTM3U")
+        m.restore()
+        self.assertFalse(os.path.exists(d), "restore must rmtree an interrupted HLS dir")
+
+    def test_sweep_live_removes_the_hls_dir(self):
+        m = self.m
+        job = m.new_job("drive-s")
+        d = m.live_hls_dir(job["id"])
+        os.makedirs(d)
+        with open(os.path.join(d, "seg00000.m4s"), "wb") as f:
+            f.write(b"x")
+        job["live_dir"] = d
+        m.sweep_live(job, delay=0)
+        for _ in range(100):
+            if not os.path.exists(d):
+                break
+            time.sleep(0.02)
+        self.assertFalse(os.path.exists(d), "sweep_live must rmtree the HLS dir")
+
+    # ---- Phase 3: hls_ready, command builder, serving routes ------------
+    def test_hls_ready_needs_init_and_a_listed_segment(self):
+        m = self.m
+        d = m.live_hls_dir("ready01")
+        os.makedirs(d)
+        self.assertFalse(m.hls_ready(d))                       # empty
+        with open(os.path.join(d, "init.mp4"), "wb") as f:
+            f.write(b"x")
+        with open(os.path.join(d, "index.m3u8"), "w") as f:
+            f.write("#EXTM3U\n#EXT-X-VERSION:7\n")             # no segment yet
+        self.assertFalse(m.hls_ready(d))
+        with open(os.path.join(d, "index.m3u8"), "a") as f:
+            f.write("#EXTINF:2.0,\nseg00000.m4s\n")
+        self.assertTrue(m.hls_ready(d))
+
+    def test_hls_ffmpeg_cmd_uses_event_fmp4(self):
+        m = self.m
+        d = m.live_hls_dir("cmd01")
+        cmd = m.hls_ffmpeg_cmd(["-i", "pipe:0"], [], ["-c:v", "copy"], d,
+                               transcoding=False)
+        s = " ".join(cmd)
+        self.assertIn("-f hls", s)
+        self.assertIn("fmp4", s)
+        self.assertIn("event", s)
+        self.assertIn("init.mp4", cmd)
+        self.assertIn(os.path.join(d, "seg%05d.m4s"), cmd)
+        self.assertTrue(cmd[-1].endswith("index.m3u8"))
+
+    def _get(self, path, headers=None):
+        h = self._h(path=path, headers=dict(headers or {},
+                    **{"Cookie": "reel_token=" + self.m.auth_token()}))
+        codes, hdrs = [], []
+        h.send_response = lambda c: codes.append(c)
+        h.send_header = lambda k, v: hdrs.append((k, v))
+        h.do_GET()
+        return codes[0] if codes else None, hdrs, h.wfile.getvalue()
+
+    def test_hls_route_serves_the_growing_playlist(self):
+        m = self.m
+        job = m.new_job("drive-p")
+        m.JOBS[job["id"]] = job
+        d = m.live_hls_dir(job["id"])
+        os.makedirs(d)
+        with open(os.path.join(d, "index.m3u8"), "w") as f:
+            f.write("#EXTM3U\n#EXTINF:2.0,\nseg00000.m4s\n")
+        code, hdrs, body = self._get("/hls/%s/index.m3u8" % job["id"])
+        self.assertEqual(code, 200)
+        self.assertIn(b"seg00000.m4s", body)
+        self.assertIn(("Cache-Control", "no-store"), hdrs)
+
+    def test_hls_route_serves_a_segment_with_range(self):
+        m = self.m
+        job = m.new_job("drive-r")
+        m.JOBS[job["id"]] = job
+        d = m.live_hls_dir(job["id"])
+        os.makedirs(d)
+        with open(os.path.join(d, "seg00000.m4s"), "wb") as f:
+            f.write(b"ABCDEFGHIJ")
+        code, hdrs, body = self._get("/hls/%s/seg00000.m4s" % job["id"],
+                                     {"Range": "bytes=2-5"})
+        self.assertEqual(code, 206)
+        self.assertIn(("Content-Range", "bytes 2-5/10"), hdrs)
+        self.assertEqual(body, b"CDEF")
+
+    def test_hls_route_rejects_non_allowlisted_names(self):
+        m = self.m
+        job = m.new_job("drive-b")
+        m.JOBS[job["id"]] = job
+        os.makedirs(m.live_hls_dir(job["id"]))
+        for bad in ("../reel.py", "evil.txt", "seg0.m4s", "index.m3u8.bak"):
+            code, _h, _b = self._get("/hls/%s/%s" % (job["id"], bad))
+            self.assertNotEqual(code, 200, "must reject %r" % bad)
+
+    # ---- perf: start latency --------------------------------------------
+    def test_hls_segments_are_short_for_fast_start(self):
+        # The first frame can't appear until the first segment closes, so a short
+        # segment is what keeps time-to-first-frame low.
+        m = self.m
+        self.assertEqual(m.HLS_SEGMENT_SEC, 1)
+        cmd = m.hls_ffmpeg_cmd(["-i", "pipe:0"], [], ["-c:v", "copy"],
+                               m.live_hls_dir("seg"), transcoding=False)
+        i = cmd.index("-hls_time")
+        self.assertEqual(cmd[i + 1], "1")
+
+    def test_add_starts_the_first_item_without_waiting_for_the_scheduler(self):
+        # A freshly added item, nothing else running, must be released to the
+        # workers within the /add request -- not up to a second later when the
+        # scheduler loop next ticks.
+        m = self.m
+        body = json.dumps({"links": "abcdefghij0123456789ABCDEFGHIJ"}).encode()
+        h = self._h(path="/add", headers={
+            "Cookie": "reel_token=" + m.auth_token(),
+            "Content-Length": str(len(body))})
+        h.rfile = io.BytesIO(body)
+        h.do_POST()
+        jobs = list(m.JOBS.values())
+        self.assertEqual(len(jobs), 1, "one item was added")
+        self.assertFalse(jobs[0]["hold"],
+                         "the first item must start within /add, not after the tick")
 
 
 if __name__ == "__main__":

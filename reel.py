@@ -11267,47 +11267,62 @@ document.addEventListener('click', e => {
 });
 
 /* Global playback shortcuts. Plyr already binds space/arrows/f/m itself
-   (playerOpts: keyboard.focused), but only while the player has focus --
-   this covers the rest of the page. Skipped entirely while typing, and
-   while focus is inside the player or on the resize handle, so nothing
-   fires twice or steals a keystroke meant for a text field. */
-function shortcutsBlocked() {
+   (playerOpts: keyboard.focused) while the player has focus, so those keys
+   defer to it there rather than double-firing -- but focus lands inside
+   .plyr the moment anyone clicks the video (its own play button included),
+   which is the normal way to start watching. The library toggle uses B
+   rather than L deliberately: Plyr's own vendored build reserves L for its
+   own player.loop toggle (and 0-9/c/f/k/m besides), stopping propagation
+   before a document listener ever sees the keypress -- so L would silently
+   stop working the moment the player had focus. Only typing in a real text
+   field or the panel's resize handle blocks a shortcut here. */
+function typingTarget() {
   const el = document.activeElement;
   if (!el) return false;
   const tag = el.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
-         el.isContentEditable || el.id === 'sideresize' ||
-         (el.closest && !!el.closest('.plyr'));
+         el.isContentEditable || el.id === 'sideresize';
+}
+function insidePlyr() {
+  const el = document.activeElement;
+  return !!(el && el.closest && el.closest('.plyr'));
 }
 document.addEventListener('keydown', e => {
-  if (shortcutsBlocked()) return;
+  if (typingTarget()) return;
   switch (e.key) {
     case ' ':
+      if (insidePlyr()) return;         // Plyr's own binding owns this here
       e.preventDefault();
       v.paused ? v.play().catch(() => {}) : v.pause();
       break;
     case 'f': case 'F':
+      if (insidePlyr()) return;
       if (player) player.fullscreen.toggle();
       else if (v.requestFullscreen) v.requestFullscreen().catch(() => {});
       break;
     case 'm': case 'M':
+      if (insidePlyr()) return;
       v.muted = !v.muted;
       break;
     case 'ArrowLeft':
+      if (insidePlyr()) return;
       if (isFinite(v.duration)) v.currentTime = Math.max(0, v.currentTime - 5);
       break;
     case 'ArrowRight':
+      if (insidePlyr()) return;
       if (isFinite(v.duration)) v.currentTime = Math.min(v.duration, v.currentTime + 5);
       break;
     case 'ArrowUp':
+      if (insidePlyr()) return;
       e.preventDefault();
       v.volume = Math.min(1, v.volume + 0.05);
       break;
     case 'ArrowDown':
+      if (insidePlyr()) return;
       e.preventDefault();
       v.volume = Math.max(0, v.volume - 0.05);
       break;
-    case 'l': case 'L':
+    case 'b': case 'B':
       $('side').classList.contains('open') ? closePanel() : openPanel();
       break;
   }

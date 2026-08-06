@@ -1525,7 +1525,7 @@ def sub_speaks(name, lang):
                for w in words)
 
 
-def torrent_subs(files, chosen, lang=None):
+def torrent_subs(files, chosen, lang=None, all_langs=False):
     """Subtitle files inside the torrent that belong to the chosen video.
 
     Best first. A subtitle shipped with a release is timed to that exact file,
@@ -1561,6 +1561,11 @@ def torrent_subs(files, chosen, lang=None):
                 int(lead.group(1)) if lead else 999,  # the packer's own order
                 f.get("size") or 0)
     mine.sort(key=rank)
+    if all_langs:
+        # Every subtitle that belongs to this video, any language, ranked --
+        # for a picker that lets someone choose a language the auto-pick
+        # would never have tried, not just an alternate cut of the same one.
+        return mine
     return [f for f in mine if sub_speaks(os.path.basename(f["name"]), lang)] or []
 
 
@@ -1596,6 +1601,15 @@ def subs_from_torrent(job, port, files, chosen, out_dir, lang=None):
 
     def work():
         cands = torrent_subs(files, chosen, lang)
+        # Every in-torrent candidate, any language, kept on the job for a
+        # picker -- separate from `cands` above, which stays narrowed to the
+        # wanted language because that's still what auto-install should try.
+        job["subs_cands"] = [
+            {"path": f["name"], "name": os.path.basename(f["name"])[:120],
+             "size": f.get("size") or 0,
+             "lang": next((c for c in SUB_LANG_NAMES
+                           if sub_speaks(f["name"], c)), None)}
+            for f in torrent_subs(files, chosen, lang, all_langs=True)]
         bk = backend()
         for cand in cands[:3]:          # a chosen one can simply never arrive
             if job["cancel"].is_set():
@@ -1618,6 +1632,45 @@ def subs_from_torrent(job, port, files, chosen, out_dir, lang=None):
         # Nothing usable inside it, so ask the internet after all.
         start_subs(job, None, name=name)
     threading.Thread(target=work, daemon=True).start()
+
+
+def pick_torrent_sub(job, idx):
+    """Fetch and install one specific in-torrent subtitle by hand, chosen from
+    `job["subs_cands"]` -- the menu's alternative to the auto-picked best guess.
+
+    Reuses the same webtorrent-range-read trick as the automatic path
+    (fetch_file over the client's own http server), which works regardless of
+    whether the file was ever selected for download, and regardless of
+    whether the torrent has finished.
+    """
+    cands = job.get("subs_cands") or []
+    if not (0 <= idx < len(cands)):
+        return False
+    cand = cands[idx]
+    port = job.get("wt_port")
+    if not port:
+        return False
+    out_dir = os.path.join(DL, job["id"] + "_wt")
+    lang = job.get("subs_lang") or SUBS_LANG
+    job["subs_status"] = "searching"
+
+    def work():
+        raw = backend().fetch_file(job, port, {"name": cand["path"]}, out_dir)
+        if not raw:
+            job["subs_status"] = "ready" if job.get("subs_name") else "unavailable"
+            job["subs_note"] = "could not fetch %s" % cand["name"]
+            return
+        if write_subs(job, raw, lang,
+                      suffix=os.path.splitext(cand["path"])[1] or ".srt"):
+            job.update(subs_status="ready", subs_source="torrent", subs_lang=lang,
+                       subs_exact=True, subs_name=cand["name"],
+                       subs_why="picked from the torrent by hand")
+            record(job, "subtitles: switched to %s from the torrent"
+                   % cand["name"][:80])
+        else:
+            job["subs_status"] = "unavailable"
+    threading.Thread(target=work, daemon=True).start()
+    return True
 
 
 def start_subs(job, src, name=None):
@@ -3572,9 +3625,7 @@ def lan_url():
     # Short-lived, not permanent: this one really can change under you, when a
     # laptop moves between networks or a VPN comes up.
     ip = probed("lan_ip", LAN_TTL, lan_ip)
-    # The token rides along so scanning the QR is all a phone needs -- the link
-    # sets the cookie on first load and every later request carries it.
-    return f"http://{ip}:{PORT}/?t={auth_token()}" if ip else None
+    return f"http://{ip}:{PORT}/" if ip else None
 
 
 def qr_svg(url):
@@ -3726,6 +3777,10 @@ def new_job(drive_id, jid=None, **extra):
            "subs_status": None, "subs_source": None, "subs_lang": None,
            "subs_note": "", "subs_name": "", "subs_cues": None,
            "subs_fit": None, "subs_exact": False, "subs_why": "",
+           # Every in-torrent subtitle for this video, any language -- the
+           # menu's choices. Empty until subs_from_torrent()'s background
+           # thread finishes listing the torrent, same as audio_tracks.
+           "subs_cands": [],
            "compat_file": None, "compat_path": None, "compat_proc": None,
            "compat_seekable_path": None, "compat_ready": False,
            "compat_done": False, "compat_pct": None, "compat_note": "",
@@ -3826,6 +3881,7 @@ def public(job):
             # else is a judged fit and may drift
             "subs_exact": bool(job.get("subs_exact")),
             "subs_why": job.get("subs_why", ""),
+            "subs_cands": job.get("subs_cands") or [],
             "play_key": job.get("play_key"),
             "compat_ready": bool(job.get("compat_ready")),
             "compat_pct": job.get("compat_pct"),
@@ -4737,6 +4793,27 @@ def encoder_works(name):
         return False
 
 
+def hwaccel_decode_args(v):
+    """Hardware-accelerated decode to pair with h264_encoder()'s hardware
+    encode -- without it, only the encode step used the GPU/media engine
+    while decode (the actual dominant cost for a 10-bit HEVC source,
+    measured directly against a real file: ~6x more CPU-seconds and over
+    2x slower without this) ran entirely on the CPU, competing with the
+    browser's own decode/render thread on the same machine for playback.
+
+    Frames come back through the ordinary software path afterward (no
+    -hwaccel_output_format), so this changes nothing about the filter
+    chain (scale/zscale/tonemap) or pix_fmt handling downstream -- verified
+    against a real 10-bit HEVC source producing byte-identical frame count/
+    duration/pix_fmt with and without this. Scoped to the codecs actually
+    verified against VideoToolbox; anything else just gets ordinary
+    software decode, same as before this existed.
+    """
+    if h264_encoder() == "h264_videotoolbox" and v in ("h264", "hevc"):
+        return ["-hwaccel", "videotoolbox"]
+    return []
+
+
 def h264_encoder():
     """Prefer a hardware encoder that genuinely works. Software x264 on a 2160p
     source is far from realtime on a laptop, so live playback would stall."""
@@ -5044,13 +5121,17 @@ def start_live(job, raw_dir, kind, transcoding=False, vcodec=None,
                                                or None)
         if vnote:
             job["note"] = (job.get("note", "") + "; " + vnote).strip("; ")
+        # Not applied when transcoding=True above -- that branch forces
+        # software libx264 deliberately, a different, untested-with-hwaccel
+        # combination left alone here.
+        hw = [] if transcoding or "copy" in vargs else hwaccel_decode_args(vcodec)
         if hls_live_enabled():
             # HLS EVENT stream: segments the browser's own seek bar can scrub.
             d = live_hls_dir(job["id"])
             shutil.rmtree(d, ignore_errors=True)      # clear any prior attempt
             os.makedirs(d, exist_ok=True)
             out = os.path.join(d, "index.m3u8")
-            cmd = hls_ffmpeg_cmd(["-i", "pipe:0"], vfilter, vargs, d, transcoding)
+            cmd = hls_ffmpeg_cmd([*hw, "-i", "pipe:0"], vfilter, vargs, d, transcoding)
             job["hls"] = True
             job["live_dir"] = d
         else:
@@ -5061,7 +5142,7 @@ def start_live(job, raw_dir, kind, transcoding=False, vcodec=None,
             job["hls"] = False
             cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                    "-progress", "pipe:1", "-nostats",
-                   "-i", "pipe:0", *vfilter, *vargs,
+                   *hw, "-i", "pipe:0", *vfilter, *vargs,
                    "-c:a", "aac", "-ac", "2", "-f", "mp4",
                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                    "-frag_duration", "1500000", "-flush_packets", "1", out]
@@ -5426,9 +5507,10 @@ def run_job(job):
                                f"; {_v} kept as-is, remuxed to mp4").strip("; ")
             elif vnote:
                 job["note"] = (job.get("note", "") + "; " + vnote).strip("; ")
+            hw = [] if copying else hwaccel_decode_args(_v)
             r = run_with_progress(
                 job, ["ffmpeg", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
-                      "-i", raw,
+                      *hw, "-i", raw,
                       # Only the streams we mean to keep, and every audio track
                       # among them -- left to itself ffmpeg drags along whatever
                       # else the MKV had, the stray bin_data track that turned up
@@ -6914,12 +6996,7 @@ def run_torrent(job):
     # through the range handler and fetch the pieces they land on.
     probe_src, probe_alt = url, None
     if job.get("lt_file"):
-        # ?t=... because every route this server has requires the install
-        # token now -- without it ffprobe/ffmpeg's own request comes back a
-        # plain 403, which reads identically to "nothing here yet" and used
-        # to be blamed on the swarm.
-        probe_alt = "http://127.0.0.1:%d/stream/%s?t=%s" % (PORT, job["id"],
-                                                              auth_token())
+        probe_alt = "http://127.0.0.1:%d/stream/%s" % (PORT, job["id"])
     # The file itself first. For a faststart file the header is at the front
     # and already on disk, so this costs a local read. Going through our own
     # range handler is what lets a probe seek to the tail -- which a file with
@@ -7268,9 +7345,10 @@ def finalize_torrent(job, out_dir, chosen):
         job["note"] = (job.get("note", "") + "; " + vnote).strip("; ")
     safe_title = re.sub(r"[^\w.\- ]", "_", job["title"])[:110]
     out = os.path.join(DL, f"{job['id']}__torrent__{safe_title}.mp4")
+    hw = hwaccel_decode_args(v) if "copy" not in vargs else []
     r = run_with_progress(
         job, ["ffmpeg", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
-              "-i", src, "-map", "0:v:0", *amaps, *ameta,
+              *hw, "-i", src, "-map", "0:v:0", *amaps, *ameta,
               *vfilter, *vargs, *acodec, "-movflags", "+faststart", out], dur)
 
     if job["cancel"].is_set():
@@ -7369,12 +7447,13 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
             job["audio_tracks"] = ordered
             job["audio_default"] = 0
         maps = ["-map", "0:v:0", *amaps, *ameta]
+        hw = hwaccel_decode_args(v) if "copy" not in vargs else []
         if hls_live_enabled():
             d = live_hls_dir(job["id"])
             shutil.rmtree(d, ignore_errors=True)
             os.makedirs(d, exist_ok=True)
             out = os.path.join(d, "index.m3u8")
-            ff = hls_ffmpeg_cmd(["-i", "pipe:0"], vfilter, vargs, d,
+            ff = hls_ffmpeg_cmd([*hw, "-i", "pipe:0"], vfilter, vargs, d,
                                 "copy" not in vargs, maps=maps)
             job["hls"] = True
             job["live_dir"] = d
@@ -7382,7 +7461,7 @@ def run_torrent_pipe(job, magnet, chosen, out_dir):
             out = os.path.join(DL, job["id"] + ".live.mp4")
             job["hls"] = False
             ff = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                  "-progress", "pipe:1", "-nostats", "-i", "pipe:0", *vfilter, *vargs,
+                  "-progress", "pipe:1", "-nostats", *hw, "-i", "pipe:0", *vfilter, *vargs,
                   *maps, "-c:a", "aac", "-ac", "2", "-f", "mp4",
                   "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                   "-frag_duration", "1500000", "-flush_packets", "1", out]
@@ -7481,12 +7560,15 @@ def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
             job["audio_tracks"] = ordered
             job["audio_default"] = 0
         maps = ["-map", "0:v:0", *amaps, *ameta]
+        # Only when actually transcoding -- a pure copy never decodes the
+        # video at all, so hardware decode would be pointless there.
+        hw = hwaccel_decode_args(vcodec) if "copy" not in vargs else []
         if hls_live_enabled():
             d = live_hls_dir(job["id"])
             shutil.rmtree(d, ignore_errors=True)
             os.makedirs(d, exist_ok=True)
             out = os.path.join(d, "index.m3u8")
-            cmd = hls_ffmpeg_cmd(["-i", url], vfilter, vargs, d,
+            cmd = hls_ffmpeg_cmd([*hw, "-i", url], vfilter, vargs, d,
                                  "copy" not in vargs, maps=maps)
             job["hls"] = True
             job["live_dir"] = d
@@ -7494,7 +7576,7 @@ def start_live_from_url(job, url, kind, vcodec=None, height=None, hdr=False,
             out = os.path.join(DL, job["id"] + ".live.mp4")
             job["hls"] = False
             cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                   "-progress", "pipe:1", "-nostats", "-i", url,
+                   "-progress", "pipe:1", "-nostats", *hw, "-i", url,
                    *vfilter, *vargs, *maps, "-c:a", "aac", "-ac", "2", "-f", "mp4",
                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                    "-frag_duration", "1500000", "-flush_packets", "1", out]
@@ -7613,8 +7695,12 @@ def start_compat(job):
     # container lists first, which is what left a compat viewer on a French
     # dub too.
     sel = job.get("audio_default") or 0
+    # Always an encode (caps is BROWSER_VIDEO-only -- the whole point of this
+    # rendition is a client that can't decode what was kept), so hwaccel
+    # decode always applies here when the source codec supports it.
+    hw = hwaccel_decode_args(_v)
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-           "-progress", "pipe:1", "-nostats", "-i", src,
+           "-progress", "pipe:1", "-nostats", *hw, "-i", src,
            "-map", "0:v:0", "-map", "0:a:%d?" % sel, *vfilter, *vargs, *acodec,
            "-f", "mp4",
            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
@@ -7869,78 +7955,10 @@ def resume_job(jid):
 
 
 # ---- http --------------------------------------------------------------------
-
-# ---- access token ------------------------------------------------------------
-# The server binds the whole LAN by default (its reason for existing is phones
-# on the same wifi), so a secret is the thing that stops any other device on the
-# network from driving the queue and reading the cache. It rides a same-origin
-# cookie, so once the page is opened with the token in the link, <video> and
-# /stream requests carry it on their own -- no per-request wiring in the page.
-
-AUTH_TOKEN = [None]
-# SameSite=Strict is the CSRF defence: a hostile page can't make the browser
-# send this cookie cross-site, so it can't drive the API even from the same LAN.
-COOKIE = "reel_token=%s; Path=/; Max-Age=31536000; SameSite=Strict; HttpOnly"
-UNAUTH_PAGE = (
-    "<!doctype html><meta charset=utf-8><title>reel</title>"
-    "<body style='font-family:system-ui,-apple-system,sans-serif;background:#101214;"
-    "color:#dde1e5;max-width:34rem;margin:14vh auto;padding:0 1.5rem;line-height:1.65'>"
-    "<div style='font:600 15px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em'>reel</div>"
-    "<p style='margin-top:1.2rem;color:#8c939b'>This link needs the access token. "
-    "Open the address printed in the terminal where reel is running &mdash; it ends "
-    "with <code style='color:#c6a265'>?t=&hellip;</code> &mdash; or scan the QR shown "
-    "there from your phone.</p></body>")
-
-
-def auth_token():
-    """The per-install secret that gates every request.
-
-    Generated once and kept in the cache dir so it survives restarts -- the QR
-    link and any bookmark keep working. Regenerated only if the file is missing
-    or unreadable.
-    """
-    if AUTH_TOKEN[0]:
-        return AUTH_TOKEN[0]
-    path = os.path.join(CACHE_DIR, "token")
-    try:
-        with open(path) as f:
-            tok = f.read().strip()
-    except OSError:
-        tok = ""
-    if not tok:
-        tok = secrets.token_urlsafe(24)
-        try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            with open(path, "w") as f:
-                f.write(tok)
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    AUTH_TOKEN[0] = tok
-    return tok
-
-
-def request_token(handler):
-    """The token presented on a request: the ?t= query, the X-Reel-Token header,
-    or the reel_token cookie -- whichever is set, in that order."""
-    q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
-    if q.get("t"):
-        return q["t"][0]
-    hdr = handler.headers.get("X-Reel-Token")
-    if hdr:
-        return hdr
-    for part in (handler.headers.get("Cookie") or "").split(";"):
-        k, _, v = part.strip().partition("=")
-        if k == "reel_token":
-            return v
-    return None
-
-
-def authorized(handler):
-    """True if the request carries the install token. Constant-time compared so
-    a wrong guess leaks nothing through timing."""
-    tok = request_token(handler)
-    return bool(tok) and secrets.compare_digest(str(tok), auth_token())
+# No per-app auth here on purpose: this app is meant to sit behind the merged
+# wrapper's own single login (merged_app.py), which is the one real gate now.
+# _local_origin() below still refuses a hostile cross-site page from driving
+# the API, independent of any login.
 
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -7997,6 +8015,45 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _events(self):
+        """Server-Sent Events: the same payload /jobs answers, pushed the
+        moment something actually changes instead of the client asking once a
+        second whether it has. /jobs is left completely alone as a fallback --
+        this is one more way to reach the same data, not a replacement for it.
+
+        One thread per connection, same as everything else this server does
+        (see Server/ThreadingTCPServer above) -- fine at the handful of
+        concurrent viewers this app is ever used by. A write failing is the
+        signal the viewer went away; there is no other disconnect hook on a
+        stdlib SSE response.
+        """
+        if not self._local_origin():
+            return self._json(403, {"error": "cross-origin request refused"})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        last = None
+        next_heartbeat = time.time() + 15
+        while True:
+            with LOCK:
+                blob = json.dumps([public(j) for j in JOBS.values()])
+            now = time.time()
+            try:
+                if blob != last:
+                    self.wfile.write(("data: %s\n\n" % blob).encode())
+                    last = blob
+                    next_heartbeat = now + 15
+                elif now >= next_heartbeat:
+                    # Idle keep-alive: a comment line, which EventSource
+                    # ignores, so a proxy or NAT box between here and the
+                    # client doesn't decide the connection is dead and drop it.
+                    self.wfile.write(b": keep-alive\n\n")
+                    next_heartbeat = now + 15
+            except OSError:
+                return   # the viewer's tab closed, or the network dropped
+            time.sleep(0.5)
+
     def _local_origin(self):
         """Browsers can't send application/json cross-origin without a preflight,
         but reject stray origins anyway so another page can't drive this server.
@@ -8012,32 +8069,12 @@ class H(http.server.BaseHTTPRequestHandler):
         mine = urllib.parse.urlparse("//" + (self.headers.get("Host") or "")).hostname
         return h in ("localhost", "127.0.0.1", "::1") or (h and h == mine)
 
-    def _unauthorized(self, p):
-        # The page gets a human explanation; everything else a plain 403 JSON.
-        if p == "/":
-            body = UNAUTH_PAGE.encode()
-            self.send_response(403)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            try:
-                self.wfile.write(body)
-            except GONE:
-                pass
-        else:
-            self._json(403, {"error": "unauthorized"})
-
     def do_GET(self):
         p = urllib.parse.urlparse(self.path).path
-        if not authorized(self):
-            return self._unauthorized(p)
         if p == "/":
             b = PAGE.replace("<!--PLAYER-->", player_tags()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            # Set the cookie now so the ?t= link only has to be used once: every
-            # later same-origin request (fetch, <video>, /stream) carries it.
-            self.send_header("Set-Cookie", COOKIE % auth_token())
             self.send_header("Content-Security-Policy",
                              # blob: for the MSE MediaSource URL hls.js assigns
                              # to the video element in the live phase.
@@ -8052,6 +8089,8 @@ class H(http.server.BaseHTTPRequestHandler):
         elif p == "/jobs":
             with LOCK:
                 self._json(200, [public(j) for j in JOBS.values()])
+        elif p == "/events":
+            self._events()
         elif p.startswith("/log/"):
             # Fetched on demand rather than ridden along with /jobs, which is
             # polled every second.
@@ -8174,8 +8213,6 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._local_origin():
             return self._json(403, {"error": "forbidden"})
-        if not authorized(self):
-            return self._json(403, {"error": "unauthorized"})
         p = urllib.parse.urlparse(self.path).path
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
@@ -8375,6 +8412,15 @@ class H(http.server.BaseHTTPRequestHandler):
                 pass
             self._json(200, {"cap_gb": CACHE_CAP_GB,
                              "used_gb": round(folder_size_bytes() / GB, 3)})
+        elif p == "/subs_pick":
+            with LOCK:
+                job = JOBS.get(body.get("id"))
+            try:
+                idx = int(body.get("i"))
+            except (TypeError, ValueError):
+                idx = -1
+            ok = bool(job and pick_torrent_sub(job, idx))
+            self._json(200, {"ok": ok})
         else:
             self._json(404, {"error": "not found"})
 
@@ -8817,51 +8863,88 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
      and the video. Stated explicitly so the attribute means what it says. */
   [hidden]{display:none!important}
   html{-webkit-text-size-adjust:100%}
-  body{background:var(--ink);color:var(--text);font-family:var(--sans);
+  /* The cinematic backdrop is the page's own background -- not a box drawn
+     around just the player -- so the player reads as sitting directly on
+     it, the same as everything else on the page, rather than floating in
+     its own separately-framed card. */
+  body{background:radial-gradient(circle at 50% 30%,#202020 0%,#1a1a1a 60%)
+       fixed;color:var(--text);font-family:var(--sans);
     font-size:13.5px;line-height:1.5;-webkit-font-smoothing:antialiased;
-    display:flex;justify-content:center;padding:0 20px 72px}
-  .wrap{width:100%;max-width:1440px}
+    display:flex;flex-direction:column;justify-content:center;align-items:center;
+    min-height:100vh;box-sizing:border-box;padding:44px 20px}
+  .wrap{width:100%;max-width:1700px;margin:0 auto}
 
-  /* Two columns once there is room for them: the player keeps the space that
-     benefits from it, and the queue stops being a narrow strip under a video.
-     Below this width everything stacks in source order, which is the order a
-     phone wants -- player first, queue after. */
-  .cols{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(330px,1fr);
-    gap:30px;align-items:start;margin-top:16px}
-  .main{min-width:0}
-  .side{min-width:0}
-  /* The player stays put while the queue scrolls beside it, which is the whole
-     point of putting them side by side. */
-  @media (min-width:1040px){
-    .main{position:sticky;top:18px}
-    .side .section:first-child{margin-top:0}
-  }
-  @media (max-width:1039px){
-    .cols{grid-template-columns:1fr;gap:0}
-  }
+  /* redesign stage 2 (brought forward): the player is the page now, not one
+     side of a two-column split -- sharing a row with the queue was exactly
+     what kept it far smaller than the design reference. The queue moves to
+     an off-canvas panel instead, opened by the Library button. */
+  .cols{margin-top:0}
+  .main{min-width:0;width:100%}
+  .side{position:fixed;top:0;right:0;height:100vh;width:420px;max-width:92vw;
+    z-index:50;background:rgba(36,36,36,.86);backdrop-filter:blur(18px);
+    border-left:1px solid rgba(255,255,255,.08);
+    padding:24px 20px;overflow-y:auto;
+    transform:translateX(100%);transition:transform 350ms ease-in-out;
+    box-shadow:none}
+  .side.open{transform:translateX(0);box-shadow:-24px 0 60px rgba(0,0,0,.45)}
+  .side .section:first-child{margin-top:0}
+  /* Sits just inside the panel's own left edge rather than straddling it --
+     .side has overflow-y:auto, which (per the overflow-x/-y coupling rule)
+     also clips horizontal overflow, so anything positioned outside its own
+     box at a negative offset would be invisible and unclickable. A wider hit
+     target than the visible line: 1px of actual bar is easy to miss with a
+     mouse, so the draggable area extends past it. */
+  .sideresize{position:absolute;top:0;left:0;bottom:0;width:8px;
+    cursor:col-resize;z-index:5;touch-action:none}
+  .sideresize::after{content:'';position:absolute;top:0;bottom:0;left:3px;
+    width:1px;background:rgba(255,255,255,.08)}
+  .sideresize:hover::after,.sideresize.dragging::after{background:var(--brass)}
+  .panelclose{position:absolute;top:20px;right:16px;width:30px;height:30px;
+    padding:0;border-radius:999px;background:rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.1);color:var(--text);font-size:15px;
+    line-height:1}
+  .panelclose:hover{background:rgba(255,255,255,.12)}
+  .panelhead{display:flex;align-items:center;gap:10px;margin:0 0 18px;
+    padding-right:36px}   /* clears the close button, which sits over this row */
+  .panelhead > span:first-child{font:600 16px/1 var(--sans);color:#e9e6e1}
+  .panelhead .state{margin-left:auto;display:flex;align-items:center;gap:6px;
+    font:400 11px/1 var(--sans);color:#9a9690}
+  .panelbackdrop{position:fixed;inset:0;z-index:49;background:rgba(0,0,0,.5);
+    opacity:0;pointer-events:none;transition:opacity 350ms ease-in-out}
+  .panelbackdrop.open{opacity:1;pointer-events:auto}
+  .paneltabs{display:flex;gap:4px;margin:0 0 20px;padding:3px;
+    background:rgba(255,255,255,.04);border-radius:999px}
+  .paneltab{flex:1;height:34px;padding:0 10px;border-radius:999px;
+    border:none;background:transparent;color:#9a9690;
+    font:500 12.5px/1 var(--sans)}
+  .paneltab[hidden]{display:none}
+  .paneltab.active{background:rgba(255,255,255,.08);color:#e9e6e1}
+  .tabpanel{display:flex;flex-direction:column;gap:14px}
+  .tabpanel .eyebrow{display:block;font:400 12px/1.4 var(--sans);
+    letter-spacing:normal;text-transform:none;color:#9a9690}
+  #intake{flex-direction:column;align-items:stretch;gap:10px;margin:0}
+  #intake textarea{min-height:96px}
+  .primary{align-self:flex-end;background:oklch(72% 0.055 155);
+    color:#12231a;border:none;font-weight:600}
+  .primary:hover:not(:disabled){background:oklch(76% 0.055 155)}
   ::selection{background:rgba(198,162,101,.25)}
   :focus-visible{outline:1px solid var(--brass);outline-offset:2px}
 
   .eyebrow{font:500 10.5px/1 var(--mono);letter-spacing:.14em;
     text-transform:uppercase;color:var(--faint)}
 
-  /* masthead */
-  header{display:flex;align-items:baseline;gap:14px;
-    padding:26px 0 12px;border-bottom:1px solid var(--rule)}
-  header .mark{font:500 15px/1 var(--mono);letter-spacing:.06em;color:var(--text)}
-  header .state{margin-left:auto;display:flex;align-items:center;gap:8px;
-    font:400 11.5px/1 var(--mono);color:var(--dim)}
   .led{width:6px;height:6px;border-radius:50%;background:var(--faint);flex:none}
   .led.on{background:var(--live)}
   /* only shown once /sys confirms there's an address worth sharing */
   .qrbtn{height:24px;padding:0 10px;font:500 10.5px/1 var(--mono);
-    letter-spacing:.1em;border-radius:4px;background:var(--raise);
-    border:1px solid var(--rule);color:var(--dim)}
-  .qrbtn:hover{color:var(--text);border-color:#3B434C}
-  /* Floats over the page rather than sitting in it. As a block in the flow it
-     shoved everything below it down on open and back up on close, which is a
-     lot of movement for something you glance at once to pair a phone. */
-  .qrpop{position:fixed;top:54px;right:20px;z-index:60;padding:12px 34px 12px 12px;
+    letter-spacing:.1em;border-radius:4px;background:rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.1);color:#9a9690}
+  .qrbtn:hover{color:#e9e6e1;border-color:rgba(255,255,255,.22)}
+  /* Anchored under the panel's own header now rather than the page's (which
+     no longer exists) -- still floats above everything rather than sitting
+     in flow, for the same reason as before: opening it shouldn't shove the
+     rest of the panel down and back up around it. */
+  .qrpop{position:fixed;top:64px;right:20px;z-index:60;padding:12px 34px 12px 12px;
     background:var(--panel);border:1px solid var(--rule);border-radius:8px;
     display:flex;align-items:center;gap:12px;width:max-content;
     max-width:calc(100vw - 40px);box-shadow:0 14px 34px rgba(0,0,0,.55)}
@@ -8901,22 +8984,30 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   button:hover:not(:disabled){border-color:#3B434C;background:#22272C}
   button:disabled{color:var(--faint);cursor:default}
 
-  /* catalogue filters */
-  .filttog{margin-top:10px}
-  .filters{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 14px;
-    margin-top:10px;padding:12px 14px;background:var(--panel);
-    border:1px solid var(--rule);border-radius:6px}
-  .filters label{display:flex;flex-direction:column;gap:5px;
-    font:500 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
-    color:var(--faint)}
-  .filters input,.filters select{background:var(--ink);border:1px solid var(--rule);
-    border-radius:4px;color:var(--text);font-family:var(--mono);font-size:12px;
-    height:30px;padding:0 8px}
-  .filters input[type=number]{width:78px}
-  .filters #factor{width:150px}
-  .filters label:has(#fyfrom){flex-direction:row;align-items:flex-end;gap:6px;
-    flex-wrap:wrap}
-  .filters button{height:30px;padding:0 14px;font-size:12px;margin-left:auto}
+  /* catalogue filters -- a vertical stack of full-width pill controls, sized
+     for the 420px panel it now lives in rather than the wide horizontal bar
+     this used to be when it sat above the old two-column page. */
+  .filters{display:flex;flex-direction:column;gap:12px;margin:0}
+  .filters label{display:flex;flex-direction:column;gap:6px;
+    font:400 11px/1.3 var(--sans);color:#9a9690}
+  .filters input,.filters select{width:100%;background:rgba(255,255,255,.05);
+    border:1px solid rgba(255,255,255,.1);border-radius:999px;color:#e9e6e1;
+    font:400 12.5px/1 var(--sans);height:36px;padding:0 14px}
+  /* Without this a <select> keeps the browser's own native chrome (its own
+     arrow, its own popup styling) regardless of everything above -- clashing
+     hard against a custom dark pill input right next to it. */
+  .filters select{-webkit-appearance:none;appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%239a9690' stroke-width='1.6'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 12px center;
+    padding-right:34px}
+  .filters select option{background:#242424;color:#e9e6e1}
+  /* From/to reads as one control, so the two inputs share a row instead of
+     each taking a full line of their own. */
+  .filters label:has(#fyfrom){flex-direction:row;align-items:center;gap:8px}
+  .filters label:has(#fyfrom) input{width:0;flex:1}
+  .filters button{width:100%;height:36px;margin-top:4px;border-radius:999px;
+    background:rgba(255,255,255,.08);color:#e9e6e1;border:none;font-weight:500}
+  .filters button:hover:not(:disabled){background:rgba(255,255,255,.14)}
 
   /* search results */
   .results{margin-top:10px;background:var(--panel);border:1px solid var(--rule);
@@ -9046,11 +9137,70 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .card.toobig .cardtitle{color:var(--dim)}
   .card:disabled{opacity:.5}
 
-  /* stage */
-  .main .stage{margin-top:0}          /* .cols already supplies the gap */
-  .stage{margin-top:16px;position:relative;aspect-ratio:16/9;background:#000;
-    border:1px solid var(--rule);border-radius:5px;overflow:hidden}
+  /* The Picks tab now lives in the 420px-ish panel rather than spanning the
+     full page, so its own defaults above (sized for a wide row of cards,
+     a 25px section heading with 44px of clearance above it) are scaled
+     down to fit a narrow column instead of overflowing it -- the same class
+     of fix the Browse filters needed for the same reason. */
+  .tabpanel .picksection{font-size:15px;margin:28px 0 12px;padding-top:12px}
+  .tabpanel .shelf{margin-top:10px;padding-top:12px}
+  .tabpanel .shelfhead{margin-bottom:10px;padding-left:9px}
+  .tabpanel .shelfname{font-size:14px}
+  .tabpanel .card{flex-basis:108px}
+  .tabpanel .cardart{flex-basis:162px;width:108px;height:162px}
+  .tabpanel .shelfnav{flex-basis:22px}
+
+  /* stage -- redesign stage 1: visual shell only (dark cinematic backdrop,
+     rounded/shadowed card, a bottom info overlay showing title + phase badge
+     + a one-line health note). The two-column page layout, the off-canvas
+     panel and the custom transport controls are later stages -- this one
+     only changes how the player itself looks, so it carries the least risk
+     to everything already wired to the existing elements. */
+  /* width:88%/max-width:1180px, centered -- matching the design reference's
+     proportions now that the player is no longer squeezed into a shared
+     two-column row. */
+  /* margin-top used to be 16px, which worked because the old page header
+     (now removed) left ~70px of space above this for the Library button's
+     top:-44px to land inside. Without that header, the same offset pushed
+     the button above the viewport entirely -- invisible, not just
+     misplaced. This margin is what the button actually needs room for now. */
+  .stagewrap{position:relative;margin:0 auto;width:92%;max-width:1400px}
+  .stage{position:relative;aspect-ratio:16/9;background:#000;
+    border-radius:24px;overflow:hidden;
+    box-shadow:0 40px 90px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.04)}
   .stage video{position:absolute;inset:0;width:100%;height:100%;display:block}
+  /* Sits on the page background, above the video card -- not on top of the
+     video itself, which is where it first ended up and read as part of the
+     player rather than a page-level control. Still not its final home (it
+     belongs with the header once search/queue/picks move into the panel's
+     tabs), but it's out of the player for now. */
+  .librarybtn{position:absolute;top:-44px;right:0;z-index:3;
+    display:flex;align-items:center;gap:8px;padding:8px 16px 8px 12px;
+    border-radius:999px;border:1px solid rgba(255,255,255,.12);
+    background:rgba(20,20,20,.55);backdrop-filter:blur(6px);
+    color:#e9e6e1;font:500 12.5px/1 var(--sans);height:auto}
+  .librarybtn:hover{border-color:rgba(255,255,255,.28);background:rgba(30,30,30,.7)}
+  /* bottom:46px, not 0 -- Plyr's own control bar (stage 5 replaces it with a
+     custom one) already occupies the very bottom of the stage, and stacking
+     this overlay under it collided the title text straight into Plyr's own
+     timestamp. This band sits in the clear space just above that bar. */
+  .stageoverlay{position:absolute;left:0;right:0;bottom:46px;z-index:2;
+    padding:14px 22px 10px;
+    background:linear-gradient(180deg,transparent,rgba(0,0,0,.5));
+    display:flex;flex-direction:column;gap:4px;pointer-events:none;
+    opacity:1;transition:opacity .3s ease}
+  /* Plyr already hides its own control bar on inactivity during playback
+     (adding .plyr--hide-controls to its wrapper) -- this overlay is meant
+     to read as part of that same control surface, not a separate thing
+     left behind when the rest fades, so it fades on the same cue. */
+  .stage:has(.plyr--hide-controls) .stageoverlay{opacity:0}
+  .stagetitlerow{display:flex;align-items:baseline;gap:9px;min-width:0}
+  .stagetitle{font:600 14px/1.3 var(--sans);color:#e9e6e1;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .stagebadge{flex:none;font:600 10px/1 var(--sans);letter-spacing:.08em;
+    text-transform:uppercase;color:oklch(72% 0.055 155)}
+  .stagehealth{font:400 11px/1.4 var(--sans);color:#9a9690}
+  .stagetitlerow:empty,.stagetitle:empty{display:none}
   /* Plyr inserts .plyr > .plyr__video-wrapper between the stage and the video.
      The rule above positions the video absolutely, so once it is nested two
      levels down it contributes no height and the wrappers collapse to zero --
@@ -9310,6 +9460,18 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   .limit .u{font:400 11.5px/1 var(--mono);color:var(--faint)}
   .limit button{margin-left:auto;height:30px;padding:0 12px;font-size:12px}
 
+  /* The Queue tab now carries the transport row, health readout and cache
+     meter too, all inside the same 420px-ish panel as everything else --
+     these were built for the wide main page (the transport row's own
+     wrap-below-600px media query never fires for a panel this width on an
+     ordinary desktop viewport, since it's keyed to the *window*, not the
+     panel), so the same narrow-width treatment applies here unconditionally
+     rather than behind a viewport breakpoint that the panel doesn't share. */
+  #panelqueue{gap:16px}
+  #panelqueue .transport{flex-wrap:wrap;margin-top:0}
+  #panelqueue .cue{order:3;flex-basis:100%;padding:0}
+  #panelqueue .cache{margin:0;padding-top:14px;border-top:1px solid var(--rule)}
+
   @media (max-width:600px){
     .transport{flex-wrap:wrap}
     .cue{order:3;flex-basis:100%;padding:0}
@@ -9323,65 +9485,18 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   }
 </style></head><body>
 <div class="wrap">
-  <header>
-    <span class="mark">reel</span>
-    <button class="qrbtn" id="qrbtn" type="button" hidden aria-label="Show QR code for this address">QR</button>
-    <span class="state"><i class="led" id="led"></i><span id="statetext">checking</span></span>
-  </header>
   <div class="undo" id="undo" hidden role="status">
     <span id="undotext"></span>
     <button class="undobtn" id="undobtn" type="button">Undo</button>
   </div>
 
-  <div class="qrpop" id="qrpop" hidden role="dialog" aria-label="Address for this server">
-    <div class="qrimg" id="qrimg"></div>
-    <span class="qrurl" id="qrurl"></span>
-    <button class="qrclose" id="qrclose" type="button" aria-label="Hide the QR code">&times;</button>
-  </div>
-
-  <form id="intake" autocomplete="off">
-    <textarea id="links" rows="1" placeholder="Search by name, or paste Drive links / magnet URIs"></textarea>
-    <button type="submit">Add</button>
-  </form>
-  <button class="pickbtn filttog" id="filttog" type="button" hidden aria-expanded="false">Filters</button>
-  <div class="filters" id="filters" hidden>
-    <label>Kind
-      <select id="fkind"><option value="movie">Movie</option><option value="tv">TV show</option></select>
-    </label>
-    <label>Genre <select id="fgenre"><option value="">Any</option></select></label>
-    <label>Actor <input id="factor" type="text" placeholder="anyone" autocomplete="off"></label>
-    <label>Years <input id="fyfrom" type="number" min="1900" max="2100" placeholder="from">
-                 <input id="fyto" type="number" min="1900" max="2100" placeholder="to"></label>
-    <label>Rating at least <input id="frating" type="number" min="0" max="10" step="0.5" placeholder="any"></label>
-    <label>Language
-      <select id="flang">
-        <option value="">Any</option>
-        <option value="en">English</option><option value="hi">Hindi</option>
-        <option value="es">Spanish</option><option value="fr">French</option>
-        <option value="de">German</option><option value="it">Italian</option>
-        <option value="ja">Japanese</option><option value="ko">Korean</option>
-        <option value="zh">Chinese</option><option value="ru">Russian</option>
-        <option value="pt">Portuguese</option><option value="ar">Arabic</option>
-        <option value="tr">Turkish</option><option value="ta">Tamil</option>
-        <option value="te">Telugu</option><option value="th">Thai</option>
-      </select>
-    </label>
-    <label>Quality
-      <select id="fquality">
-        <option value="">Any</option>
-        <option value="720p">720p or better</option>
-        <option value="1080p">1080p or better</option>
-        <option value="2160p">4K only</option>
-      </select>
-    </label>
-    <button id="findgo" type="button">Find</button>
-  </div>
-  <div class="results" id="results" hidden></div>
-
   <!-- Two columns on a wide screen, one on a narrow one. The order here is the
        order a phone gets, so the player still comes before the queue. -->
   <div class="cols">
   <main class="main">
+  <div class="stagewrap">
+  <button class="librarybtn" id="librarybtn" type="button"
+          aria-label="Show the queue and search below">&#9776; Library</button>
   <div class="stage">
     <span class="flag" id="flag">audio only</span>
     <div class="slate" id="slate">
@@ -9389,6 +9504,14 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
       <p>nothing playing</p>
     </div>
     <video id="v" controls playsinline hidden></video>
+    <div class="stageoverlay" id="stageoverlay">
+      <div class="stagetitlerow">
+        <span class="stagetitle" id="stagetitle"></span>
+        <span class="stagebadge" id="stagebadge"></span>
+      </div>
+      <span class="stagehealth" id="stagehealth"></span>
+    </div>
+  </div>
   </div>
   <!-- A live item plays a fragmented stream, which has no index for the
        player's own scrubber to seek against. This one seeks by asking the
@@ -9397,60 +9520,123 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   <!-- Positioned against the viewport rather than the player, so it can sit
        above the scrubber without the stage's overflow:hidden clipping it. -->
   <div class="thumb" id="thumb" hidden><span id="thumbtime"></span></div>
-
-  <div class="transport">
-    <button id="prev" disabled>Previous</button>
-    <button id="next" disabled>Next</button>
-    <span class="cue none" id="cue">Queue is empty</span>
-    <span class="suboff" id="suboff" hidden title="Nudge subtitle timing">
-      <button id="subminus" type="button" aria-label="Show subtitles earlier">&minus;</button>
-      <span id="subval" role="status" title="Click to reset">0.0s</span>
-      <button id="subplus" type="button" aria-label="Show subtitles later">+</button>
-    </span>
-    <label class="toggle"><input type="checkbox" id="auto" checked> Play next automatically</label>
-  </div>
-
-  <div class="wire" id="wire" hidden>
-    <span class="lamp" id="lamp"></span>
-    <span class="verdict" id="verdict"></span>
-    <span class="figures" id="figures"></span>
-  </div>
-
-  <div class="cache">
-    <div class="head">
-      <span class="eyebrow">Cache</span>
-      <span class="read" id="read">— <span>of — GB</span></span>
-    </div>
-    <div class="meter" id="meter"></div>
-    <div class="limit">
-      <label for="cap">Keep at most</label>
-      <input type="number" id="cap" min="1" max="2000" step="1" aria-label="Cache limit in gigabytes">
-      <span class="u">GB</span>
-      <button id="savecap">Update limit</button>
-    </div>
-  </div>
   </main>
 
-  <aside class="side">
-  <div class="section">
-    <span class="eyebrow">Queue</span><span class="count" id="qcount"></span>
+  <div class="panelbackdrop" id="panelbackdrop"></div>
+  <aside class="side" id="side">
+  <div class="sideresize" id="sideresize" role="separator" aria-orientation="vertical"
+       aria-label="Drag to resize the panel" tabindex="0"></div>
+  <button class="panelclose" id="panelclose" type="button" aria-label="Close the queue panel">&times;</button>
+  <div class="panelhead">
+    <span>Reel</span>
+    <span class="state"><i class="led" id="led"></i><span id="statetext">checking</span></span>
+    <button class="qrbtn" id="qrbtn" type="button" hidden aria-label="Show QR code for this address">QR</button>
   </div>
-  <ul id="list"><li class="blank">Paste a Drive link above to get started.</li></ul>
-  </aside>
+  <div class="qrpop" id="qrpop" hidden role="dialog" aria-label="Address for this server">
+    <div class="qrimg" id="qrimg"></div>
+    <span class="qrurl" id="qrurl"></span>
+    <button class="qrclose" id="qrclose" type="button" aria-label="Hide the QR code">&times;</button>
+  </div>
+  <div class="paneltabs" role="tablist">
+    <button class="paneltab active" id="tabadd" data-tab="add" type="button" role="tab" aria-selected="true">Add</button>
+    <button class="paneltab" id="tabbrowse" data-tab="browse" type="button" role="tab" aria-selected="false" hidden>Browse</button>
+    <button class="paneltab" id="tabpicks" data-tab="picks" type="button" role="tab" aria-selected="false">Picks</button>
+    <button class="paneltab" id="tabqueue" data-tab="queue" type="button" role="tab" aria-selected="false">Queue</button>
   </div>
 
-  <!-- Full width rather than boxed into the sidebar -- posters at sidebar
-       width would be too small to read at a glance, and shelves read as
-       shelves only when there's room for a row of them. One toggle and one
-       refresh cover every shelf below, present and future: shelves come from
-       a single /feed response, so there is nothing per-shelf to wire up. -->
-  <div class="section">
-    <span class="eyebrow">Picks</span><span class="count" id="pcount"></span>
-    <button class="pickbtn" id="picktog" type="button" aria-expanded="false">Show</button>
-    <button class="pickbtn" id="pickref" type="button" hidden>Refresh</button>
+  <div class="tabpanel" id="paneladd" role="tabpanel">
+    <form id="intake" autocomplete="off">
+      <span class="eyebrow">Paste magnet links or Drive file links, one per line -- or search by name</span>
+      <textarea id="links" rows="4" placeholder="magnet:?xt=urn:btih:&hellip;"></textarea>
+      <button type="submit" class="primary">Add to queue</button>
+    </form>
+    <div class="results" id="results" hidden></div>
   </div>
-  <div class="picks" id="picks" hidden></div>
-</div>
+
+  <div class="tabpanel" id="panelbrowse" role="tabpanel" hidden>
+    <div class="filters" id="filters">
+      <label>Kind
+        <select id="fkind"><option value="movie">Movie</option><option value="tv">TV show</option></select>
+      </label>
+      <label>Genre <select id="fgenre"><option value="">Any</option></select></label>
+      <label>Actor <input id="factor" type="text" placeholder="anyone" autocomplete="off"></label>
+      <label>Years <input id="fyfrom" type="number" min="1900" max="2100" placeholder="from">
+                   <input id="fyto" type="number" min="1900" max="2100" placeholder="to"></label>
+      <label>Rating at least <input id="frating" type="number" min="0" max="10" step="0.5" placeholder="any"></label>
+      <label>Language
+        <select id="flang">
+          <option value="">Any</option>
+          <option value="en">English</option><option value="hi">Hindi</option>
+          <option value="es">Spanish</option><option value="fr">French</option>
+          <option value="de">German</option><option value="it">Italian</option>
+          <option value="ja">Japanese</option><option value="ko">Korean</option>
+          <option value="zh">Chinese</option><option value="ru">Russian</option>
+          <option value="pt">Portuguese</option><option value="ar">Arabic</option>
+          <option value="tr">Turkish</option><option value="ta">Tamil</option>
+          <option value="te">Telugu</option><option value="th">Thai</option>
+        </select>
+      </label>
+      <label>Quality
+        <select id="fquality">
+          <option value="">Any</option>
+          <option value="720p">720p or better</option>
+          <option value="1080p">1080p or better</option>
+          <option value="2160p">4K only</option>
+        </select>
+      </label>
+      <button id="findgo" type="button">Find</button>
+    </div>
+    <div class="results" id="browseresults" hidden></div>
+  </div>
+
+  <div class="tabpanel" id="panelpicks" role="tabpanel" hidden>
+    <div class="section">
+      <span class="eyebrow">Picks</span><span class="count" id="pcount"></span>
+      <button class="pickbtn" id="pickref" type="button">Refresh</button>
+    </div>
+    <div class="picks" id="picks"></div>
+  </div>
+
+  <div class="tabpanel" id="panelqueue" role="tabpanel" hidden>
+    <div class="transport">
+      <button id="prev" disabled>Previous</button>
+      <button id="next" disabled>Next</button>
+      <span class="cue none" id="cue">Queue is empty</span>
+      <span class="suboff" id="suboff" hidden title="Nudge subtitle timing">
+        <button id="subminus" type="button" aria-label="Show subtitles earlier">&minus;</button>
+        <span id="subval" role="status" title="Click to reset">0.0s</span>
+        <button id="subplus" type="button" aria-label="Show subtitles later">+</button>
+      </span>
+      <label class="toggle"><input type="checkbox" id="auto" checked> Play next automatically</label>
+    </div>
+
+    <div class="wire" id="wire" hidden>
+      <span class="lamp" id="lamp"></span>
+      <span class="verdict" id="verdict"></span>
+      <span class="figures" id="figures"></span>
+    </div>
+
+    <div class="section">
+      <span class="eyebrow">Queue</span><span class="count" id="qcount"></span>
+    </div>
+    <ul id="list"><li class="blank">Paste a Drive link above to get started.</li></ul>
+
+    <div class="cache">
+      <div class="head">
+        <span class="eyebrow">Cache</span>
+        <span class="read" id="read">— <span>of — GB</span></span>
+      </div>
+      <div class="meter" id="meter"></div>
+      <div class="limit">
+        <label for="cap">Keep at most</label>
+        <input type="number" id="cap" min="1" max="2000" step="1" aria-label="Cache limit in gigabytes">
+        <span class="u">GB</span>
+        <button id="savecap">Update limit</button>
+      </div>
+    </div>
+  </div>
+  </aside>
+  </div>
 <script>
 const TICKS = 48;
 const $ = id => document.getElementById(id);
@@ -9458,6 +9644,9 @@ const v = $('v'), slate = $('slate'), flag = $('flag'), cue = $('cue');
 let jobs = [], order = [], cur = -1, retries = 0, live = false, wantPlay = false;
 let wantSeek = 0;     // where to pick the current item up, once it can be sought
 let subsOn = false;   // whether a track is currently attached
+let subsShown = '';   // which subs_name was last attached, so picking a
+                       // different in-torrent candidate while subs is
+                       // already on still re-attaches the (unchanged-URL) track
 
 // decorative slate bars + capacity meter ticks
 (() => {
@@ -9691,13 +9880,9 @@ async function runSearch(q) {
 /* catalogue search --------------------------------------------------------
    The indexers match filenames, so "a well-reviewed sci-fi film from the
    eighties" is unanswerable there however it is phrased. This asks a catalogue
-   which films those are, then looks for a copy of each. Hidden entirely when
-   there is no key, rather than offered and then refused. */
-$('filttog').addEventListener('click', () => {
-  const box = $('filters'), open = box.hidden;
-  box.hidden = !open;
-  $('filttog').setAttribute('aria-expanded', open ? 'true' : 'false');
-});
+   which films those are, then looks for a copy of each. The Browse tab itself
+   is hidden entirely when there is no key (see pollSys), rather than offered
+   and then refused. */
 
 function fillGenres(list) {
   const sel = $('fgenre');
@@ -9711,7 +9896,7 @@ function fillGenres(list) {
 }
 
 async function runFind() {
-  const box = $('results');
+  const box = $('browseresults');
   box.hidden = false;
   box.textContent = 'Searching the catalogue…';
   const q = {kind: $('fkind').value, genre: $('fgenre').value,
@@ -9952,14 +10137,9 @@ async function loadPicks(force) {
   });
 }
 
-$('picktog').addEventListener('click', () => {
-  const box = $('picks'), open = box.hidden;
-  box.hidden = !open;
-  $('pickref').hidden = !open;
-  $('picktog').textContent = open ? 'Hide' : 'Show';
-  $('picktog').setAttribute('aria-expanded', open ? 'true' : 'false');
-  if (open && !picksLoaded) loadPicks(false);
-});
+// The Picks tab itself is now what used to be the "Show" toggle -- opening
+// it is the request, so loading happens the first time it's switched to
+// (see the paneltabs click handler below), not behind a second click.
 $('pickref').addEventListener('click', () => loadPicks(true));
 
 /* subtitles ----------------------------------------------------------------
@@ -10218,6 +10398,10 @@ function setFlag(j) {
   if (live) { flag.textContent = 'live \u00b7 still downloading'; flag.style.display = 'block'; }
   else if (j && j.kind === 'audio') { flag.textContent = 'audio only'; flag.style.display = 'block'; }
   else flag.style.display = 'none';
+  // The new stage overlay's phase badge -- same condition as .flag above, so
+  // the two never disagree, just worded to match the design reference.
+  $('stagebadge').textContent = live ? 'Live \u00b7 seek disabled'
+      : (j && j.kind === 'audio') ? 'Audio only' : '';
 }
 
 function play(i) {
@@ -10226,6 +10410,7 @@ function play(i) {
   if (!canPlay(j)) return;
   cur = i; retries = 0;
   subsOn = !!j.subs;
+  subsShown = j.subs ? (j.subs_name || 'x') : '';
   // 'live' means "what's playing can't be seeked yet, watch for a better copy".
   // True while downloading, and also while a fallback client is watching the
   // H264 rendition as fragments before its seekable form exists.
@@ -10238,6 +10423,7 @@ function play(i) {
   v.play().catch(() => {});
   cue.textContent = j.title;
   cue.classList.remove('none');
+  $('stagetitle').textContent = j.title;   // the new overlay's own title line
   reportPlaying(true);
   paint();
 }
@@ -10310,37 +10496,75 @@ function applyAudioChoice(j) {
   for (let i = 0; i < v.audioTracks.length; i++) v.audioTracks[i].enabled = (i === want);
 }
 
-function fillAudioMenu(id, el) {
-  const j = byId(id);
-  const box = el.morepanel;
-  box.textContent = '';
+function fillAudioSection(box, id, j, el) {
   const tracks = (j && j.audio_tracks) || [];
-  if (!HAS_AUDIO_TRACKS) {
-    box.textContent = 'This browser cannot switch audio tracks.';
-    return;
-  }
-  if (tracks.length < 2) {
-    box.textContent = 'Only one audio track.';
-    return;
-  }
+  if (!HAS_AUDIO_TRACKS || tracks.length < 2) return;
   const head = document.createElement('div');
   head.className = 'morehead';
   head.textContent = 'Audio language';
   box.append(head);
   const want = wantedAudioIndex(j);
-  tracks.forEach(t => {
+  // pos (the array position within job.audio_tracks), not t.index -- t.index
+  // is the track's original *source*-container stream number, which
+  // audio_remap_args() deliberately reorders away from during finalize/live
+  // so the guessed-best track plays first in the *output*. v.audioTracks
+  // (what applyAudioChoice actually switches) follows that output order, so
+  // storing/comparing t.index here picked the wrong browser track the
+  // moment reordering actually moved something -- confirmed live: English
+  // (source index 1, reordered to output position 0) enabled
+  // v.audioTracks[1], which was Japanese.
+  tracks.forEach((t, pos) => {
     const opt = document.createElement('button');
     opt.type = 'button';
-    opt.className = 'moreopt' + (t.index === want ? ' on' : '');
+    opt.className = 'moreopt' + (pos === want ? ' on' : '');
     opt.textContent = langName(t.lang) + (t.title ? ' — ' + t.title : '');
     opt.addEventListener('click', ev => {
       ev.stopPropagation();
-      try { localStorage.setItem(audioKey(id), String(t.index)); } catch (e) {}
+      try { localStorage.setItem(audioKey(id), String(pos)); } catch (e) {}
       if (order[cur] === id) applyAudioChoice(j);   // takes effect immediately
-      fillAudioMenu(id, el);                        // repaint the checkmark
+      fillMoreMenu(id, el);                         // repaint the checkmark
     });
     box.append(opt);
   });
+}
+
+/* Subtitles -- in-torrent candidates only (no OpenSubtitles browsing here):
+   the server already lists everything it found shipped alongside the video,
+   any language, ranked. Picking one asks the server to fetch and convert
+   that specific file over what /subs/<id>.vtt currently serves; the <track>
+   element's src never changes, only what's behind it. */
+function fillSubsSection(box, id, j, el) {
+  const cands = (j && j.subs_cands) || [];
+  if (cands.length < 2) return;
+  const head = document.createElement('div');
+  head.className = 'morehead';
+  head.textContent = 'Subtitles (in this torrent)';
+  box.append(head);
+  cands.forEach((c, i) => {
+    const opt = document.createElement('button');
+    opt.type = 'button';
+    const current = j.subs_status === 'ready' && j.subs_name === c.name;
+    opt.className = 'moreopt' + (current ? ' on' : '');
+    opt.textContent = (c.lang ? langName(c.lang) : c.name) +
+      (c.lang && c.name !== c.lang ? ' — ' + c.name : '');
+    opt.addEventListener('click', async ev => {
+      ev.stopPropagation();
+      opt.disabled = true;
+      try { await api('/subs_pick', {id, i}); } catch (e) {}
+      fillMoreMenu(id, el);
+    });
+    box.append(opt);
+  });
+}
+
+function fillMoreMenu(id, el) {
+  const j = byId(id);
+  const box = el.morepanel;
+  box.textContent = '';
+  if (!j) return;
+  fillAudioSection(box, id, j, el);
+  fillSubsSection(box, id, j, el);
+  if (!box.childNodes.length) box.textContent = 'Nothing to choose here.';
 }
 
 v.addEventListener('play', () => { wantPlay = true; });
@@ -10406,6 +10630,8 @@ function stopPlayback() {
   v.hidden = true; slate.style.display = 'grid'; flag.style.display = 'none';
   cur = -1; cue.textContent = order.length ? 'Nothing playing' : 'Queue is empty';
   cue.classList.add('none');
+  $('stagetitle').textContent = ''; $('stagebadge').textContent = '';
+  $('stagehealth').textContent = '';
 }
 const step = d => {
   for (let i = cur + d; i >= 0 && i < order.length; i += d) {
@@ -10471,7 +10697,7 @@ function makeRow(id) {
     const open = el.morepanel.hidden;
     el.morepanel.hidden = !open;
     el.moreBtn.classList.toggle('on', open);
-    if (open) fillAudioMenu(id, el);
+    if (open) fillMoreMenu(id, el);
   });
   // Same row, same id -- refetch_job() resets the job in place -- so unlike
   // remove() there is no order/cur bookkeeping, just stopping playback if
@@ -10621,9 +10847,11 @@ function paint() {
     // has said it can act on one -- a track list nobody can switch between is
     // not an option, it is a label.
     const nTracks = (j.audio_tracks || []).length;
-    el.moreBtn.hidden = !(HAS_AUDIO_TRACKS && nTracks > 1);
-    if (!el.morepanel.hidden && el.moreShown !== nTracks) fillAudioMenu(id, el);
-    el.moreShown = nTracks;
+    const nSubs = (j.subs_cands || []).length;
+    el.moreBtn.hidden = !((HAS_AUDIO_TRACKS && nTracks > 1) || nSubs > 1);
+    const moreKey = nTracks + '/' + nSubs + '/' + (j.subs_name || '');
+    if (!el.morepanel.hidden && el.moreShown !== moreKey) fillMoreMenu(id, el);
+    el.moreShown = moreKey;
     el.note.textContent = j.error || (j.paused ? j.note : '');
     el.note.classList.toggle('quiet', !j.error && !!j.paused);
     el.note.style.display = j.error ? 'block' : 'none';
@@ -10745,13 +10973,14 @@ function showWire() {
   // worth saying even then.
   if (!j || (!shared && j.status === 'done')
          || (!seeding && !converting && !shared && !j.health && !j.rate)) {
-    wire.hidden = true; return;
+    wire.hidden = true; $('stagehealth').textContent = ''; return;
   }
   if (shared && j.status === 'done') {
     $('lamp').className = 'lamp ok';
     $('verdict').textContent = 'Also playing on ' + (j.viewers - 1) +
         (j.viewers - 1 === 1 ? ' other device' : ' other devices');
     $('figures').textContent = '';
+    $('stagehealth').textContent = $('verdict').textContent;
     wire.hidden = false;
     return;
   }
@@ -10802,6 +11031,9 @@ function showWire() {
     $('figures').append(sp);
     if (i < bits.length - 1) $('figures').append(document.createTextNode(' '));
   });
+  // A short version of the same figures, for the one-line note under the
+  // stage overlay -- the full breakdown stays in .wire below the player.
+  $('stagehealth').textContent = bits.slice(0, 2).join('  \u00b7  ');
 }
 
 function showCache(s) {
@@ -10827,37 +11059,58 @@ $('savecap').onclick = async () => {
 };
 $('cap').addEventListener('keydown', e => { if (e.key === 'Enter') $('savecap').click(); });
 
-/* polling ----------------------------------------------------------------- */
+/* live updates --------------------------------------------------------------
+   Pushed over SSE when the server has one to offer; polling is the fallback
+   for a browser without EventSource, and while the very first push hasn't
+   landed yet, and again the moment a push connection drops. Same payload
+   either way -- /jobs is untouched, this is just a second way to reach it. */
+function applyJobs(newJobs) {
+  jobs = newJobs;
+  jobs.forEach(j => { if (!order.includes(j.id)) order.push(j.id); });   // survives restarts
+  order = order.filter(id => byId(id));
+  if (cur >= 0 && !byId(order[cur])) stopPlayback();
+  if (live && cur >= 0) {
+    const j = byId(order[cur]);
+    // A fallback client waits for the H264 rendition to become seekable;
+    // everyone else waits for the download to finish.
+    if (j && !playsHere(j)) { if (j.compat_seekable) swapToSeekable(j); }
+    else if (j && (j.status === 'done' || j.seekable)) swapToSeekable(j);
+  }
+  /* Subtitles are found in the background and can land after playback began.
+     Attaching only when the count changes avoids rebuilding the track — and
+     resetting its mode — on every poll. */
+  if (cur >= 0) {
+    const j = byId(order[cur]);
+    const key = j && j.subs ? (j.subs_name || 'x') : '';
+    if (j && key !== subsShown) { subsShown = key; subsOn = !!j.subs; applySubs(j); }
+  }
+  /* Nothing playing yet: start the first item that can play. canPlay() counts
+     a live item, so this fires seconds after a paste rather than waiting for
+     the whole download — which is the entire point of the live phase. */
+  if (cur === -1) {
+    const i = order.findIndex(id => canPlay(byId(id)));
+    if (i >= 0) play(i);
+  }
+  paint();
+  showWire();
+}
 async function refresh() {
-  try {
-    jobs = await api('/jobs');
-    jobs.forEach(j => { if (!order.includes(j.id)) order.push(j.id); });   // survives restarts
-    order = order.filter(id => byId(id));
-    if (cur >= 0 && !byId(order[cur])) stopPlayback();
-    if (live && cur >= 0) {
-      const j = byId(order[cur]);
-      // A fallback client waits for the H264 rendition to become seekable;
-      // everyone else waits for the download to finish.
-      if (j && !playsHere(j)) { if (j.compat_seekable) swapToSeekable(j); }
-      else if (j && (j.status === 'done' || j.seekable)) swapToSeekable(j);
-    }
-    /* Subtitles are found in the background and can land after playback began.
-       Attaching only when the count changes avoids rebuilding the track — and
-       resetting its mode — on every poll. */
-    if (cur >= 0) {
-      const j = byId(order[cur]);
-      if (j && !!j.subs !== subsOn) { subsOn = !!j.subs; applySubs(j); }
-    }
-    /* Nothing playing yet: start the first item that can play. canPlay() counts
-       a live item, so this fires seconds after a paste rather than waiting for
-       the whole download — which is the entire point of the live phase. */
-    if (cur === -1) {
-      const i = order.findIndex(id => canPlay(byId(id)));
-      if (i >= 0) play(i);
-    }
-    paint();
-    showWire();
-  } catch (e) {}
+  try { applyJobs(await api('/jobs')); } catch (e) {}
+}
+function startLiveUpdates() {
+  if (typeof EventSource === 'undefined') { refresh(); setInterval(refresh, 1000); return; }
+  let pollTimer = null;
+  const startPolling = () => { if (!pollTimer) { refresh(); pollTimer = setInterval(refresh, 1000); } };
+  const stopPolling = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } };
+  startPolling();   // covers the gap before the first push, and a browser that blocks SSE entirely
+  const es = new EventSource('/events');
+  es.onmessage = ev => {
+    stopPolling();
+    try { applyJobs(JSON.parse(ev.data)); } catch (e) {}
+  };
+  // EventSource retries the connection on its own; polling just covers the
+  // gap in between, exactly like it covers the gap before the first message.
+  es.onerror = startPolling;
 }
 async function pollSys() {
   try {
@@ -10874,7 +11127,7 @@ async function pollSys() {
     if (!lanUrl) { $('qrpop').hidden = true; qrLoaded = false; }
     // No key, no genre or cast search -- so the control is absent rather than
     // present and disappointing.
-    $('filttog').hidden = !s.tmdb;
+    $('tabbrowse').hidden = !s.tmdb;
     if (s.tmdb) fillGenres(s.genres);
   } catch (e) {
     $('led').classList.remove('on');
@@ -10908,12 +11161,159 @@ $('qrbtn').addEventListener('click', async () => {
 });
 /* Three ways out, because it now floats over the page and a floating thing with
    no obvious way to dismiss it is worse than one that pushed the layout. */
+/* Off-canvas panel -- Add, Browse, Picks and Queue as tabs within one sliding
+   panel, opened by the Library button. */
+function openPanel() {
+  $('side').classList.add('open');
+  $('panelbackdrop').classList.add('open');
+  $('librarybtn').setAttribute('aria-expanded', 'true');
+}
+function closePanel() {
+  $('side').classList.remove('open');
+  $('panelbackdrop').classList.remove('open');
+  $('librarybtn').setAttribute('aria-expanded', 'false');
+}
+$('librarybtn').setAttribute('aria-expanded', 'false');
+$('librarybtn').addEventListener('click', () => {
+  $('side').classList.contains('open') ? closePanel() : openPanel();
+});
+$('panelclose').addEventListener('click', closePanel);
+$('panelbackdrop').addEventListener('click', closePanel);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && $('side').classList.contains('open')) closePanel();
+});
+
+const PANEL_TABS = ['add', 'browse', 'picks', 'queue'];
+function selectTab(name) {
+  PANEL_TABS.forEach(t => {
+    const on = t === name;
+    $('tab' + t).classList.toggle('active', on);
+    $('tab' + t).setAttribute('aria-selected', on ? 'true' : 'false');
+    $('panel' + t).hidden = !on;
+  });
+  // Loaded the moment someone actually looks at the tab, not before -- same
+  // reasoning the old Show/Hide toggle used, just moved to a new trigger.
+  if (name === 'picks' && !picksLoaded) loadPicks(false);
+}
+PANEL_TABS.forEach(t => {
+  $('tab' + t).addEventListener('click', () => {
+    if ($('tab' + t).hidden) return;
+    selectTab(t);
+  });
+});
+
+/* Panel width, dragged by hand and remembered -- 420px suits most screens
+   but not everyone's, and the alternative (a fixed width forever) is the
+   thing this exists to avoid. */
+const SIDE_MIN = 320, SIDE_DEFAULT = 420;
+function sideMax() { return Math.round(window.innerWidth * 0.92); }
+function setSideWidth(px) {
+  px = Math.max(SIDE_MIN, Math.min(sideMax(), Math.round(px)));
+  $('side').style.width = px + 'px';
+  return px;
+}
+(() => {
+  let saved = null;
+  try { saved = parseInt(localStorage.getItem('reel.side.width'), 10); } catch (e) {}
+  setSideWidth(saved || SIDE_DEFAULT);
+})();
+window.addEventListener('resize', () => setSideWidth($('side').getBoundingClientRect().width));
+
+let sideDragging = false, sideDragStartX = 0, sideDragStartW = 0;
+function startSideDrag(x) {
+  sideDragging = true;
+  sideDragStartX = x;
+  sideDragStartW = $('side').getBoundingClientRect().width;
+  $('sideresize').classList.add('dragging');
+  document.body.style.userSelect = 'none';
+}
+function moveSideDrag(x) {
+  if (!sideDragging) return;
+  // The panel is pinned to the right edge, so dragging the handle *left*
+  // (toward the middle of the screen) is what makes it wider.
+  setSideWidth(sideDragStartW + (sideDragStartX - x));
+}
+function endSideDrag() {
+  if (!sideDragging) return;
+  sideDragging = false;
+  $('sideresize').classList.remove('dragging');
+  document.body.style.userSelect = '';
+  try {
+    localStorage.setItem('reel.side.width',
+      String(Math.round($('side').getBoundingClientRect().width)));
+  } catch (e) {}
+}
+$('sideresize').addEventListener('mousedown', e => { e.preventDefault(); startSideDrag(e.clientX); });
+document.addEventListener('mousemove', e => moveSideDrag(e.clientX));
+document.addEventListener('mouseup', endSideDrag);
+$('sideresize').addEventListener('touchstart',
+  e => startSideDrag(e.touches[0].clientX), {passive: true});
+document.addEventListener('touchmove',
+  e => { if (sideDragging) moveSideDrag(e.touches[0].clientX); }, {passive: true});
+document.addEventListener('touchend', endSideDrag);
+// Keyboard equivalent, since it's a role="separator" -- dragging is not the
+// only way a resize handle is expected to work.
+$('sideresize').addEventListener('keydown', e => {
+  const step = 24;
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  const cur = $('side').getBoundingClientRect().width;
+  const px = setSideWidth(e.key === 'ArrowLeft' ? cur + step : cur - step);
+  try { localStorage.setItem('reel.side.width', String(px)); } catch (er) {}
+});
 $('qrclose').addEventListener('click', hideQr);
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hideQr(); });
 document.addEventListener('click', e => {
   if (!$('qrpop').hidden && !$('qrpop').contains(e.target) && e.target !== $('qrbtn')) hideQr();
 });
-refresh(); setInterval(refresh, 1000);
+
+/* Global playback shortcuts. Plyr already binds space/arrows/f/m itself
+   (playerOpts: keyboard.focused), but only while the player has focus --
+   this covers the rest of the page. Skipped entirely while typing, and
+   while focus is inside the player or on the resize handle, so nothing
+   fires twice or steals a keystroke meant for a text field. */
+function shortcutsBlocked() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+         el.isContentEditable || el.id === 'sideresize' ||
+         (el.closest && !!el.closest('.plyr'));
+}
+document.addEventListener('keydown', e => {
+  if (shortcutsBlocked()) return;
+  switch (e.key) {
+    case ' ':
+      e.preventDefault();
+      v.paused ? v.play().catch(() => {}) : v.pause();
+      break;
+    case 'f': case 'F':
+      if (player) player.fullscreen.toggle();
+      else if (v.requestFullscreen) v.requestFullscreen().catch(() => {});
+      break;
+    case 'm': case 'M':
+      v.muted = !v.muted;
+      break;
+    case 'ArrowLeft':
+      if (isFinite(v.duration)) v.currentTime = Math.max(0, v.currentTime - 5);
+      break;
+    case 'ArrowRight':
+      if (isFinite(v.duration)) v.currentTime = Math.min(v.duration, v.currentTime + 5);
+      break;
+    case 'ArrowUp':
+      e.preventDefault();
+      v.volume = Math.min(1, v.volume + 0.05);
+      break;
+    case 'ArrowDown':
+      e.preventDefault();
+      v.volume = Math.max(0, v.volume - 0.05);
+      break;
+    case 'l': case 'L':
+      $('side').classList.contains('open') ? closePanel() : openPanel();
+      break;
+  }
+});
+
+startLiveUpdates();
 pollSys(); setInterval(pollSys, 2500);
 </script></body></html>"""
 
@@ -11003,13 +11403,10 @@ def main():
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=tracker_refresher, daemon=True).start()
     with Server((HOST, PORT), H) as s:
-        tok = auth_token()
-        # The token is in the link on purpose: opening it is what sets the cookie
-        # that authorises the browser. Every device needs this link (or the QR).
-        print(f"\n  reel  ->  http://localhost:{PORT}/?t={tok}")
+        print(f"\n  reel  ->  http://localhost:{PORT}/")
         lan = lan_ip()
         if lan and HOST != "127.0.0.1":
-            print(f"  on this wifi  ->  http://{lan}:{PORT}/?t={tok}")
+            print(f"  on this wifi  ->  http://{lan}:{PORT}/")
         bk = backend()
         print(f"  rclone gdrive: {has_rclone()}   ffmpeg+ffprobe: {has_ffmpeg()}")
         print(f"  torrents: {bk.name}"

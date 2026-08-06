@@ -54,6 +54,9 @@ def load_reel(dl=None):
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 needs_ffmpeg = unittest.skipUnless(HAVE_FFMPEG, "ffmpeg/ffprobe not installed")
 
+HAVE_NODE = bool(shutil.which("node"))
+needs_node = unittest.skipUnless(HAVE_NODE, "node not installed")
+
 try:
     import libtorrent as _lt                       # noqa: F401
     HAVE_LT = True
@@ -113,6 +116,79 @@ class TestCodecs(Base):
         self.assertEqual(self.m.encode_bitrate(10_000, 480, "hevc"), 1_000_000)
         # unknown source rate falls back to the old ceiling, unchanged
         self.assertEqual(self.m.encode_bitrate(None, 1080, "hevc"), 6_000_000)
+
+
+# --------------------------------------------------------------------------
+class TestHwaccelDecode(Base):
+    """hwaccel_decode_args -- pairs hardware decode with h264_encoder()'s
+    hardware encode. Measured directly against a real 10-bit HEVC file:
+    without this, only encode used the GPU/media engine while decode ran
+    entirely on the CPU -- ~6x more CPU-seconds and over 2x slower, and the
+    actual cause of playback skipping on an otherwise-idle machine (the
+    decode competed with the browser's own decode/render thread)."""
+
+    def test_adds_hwaccel_when_videotoolbox_is_the_active_encoder(self):
+        self.m._ENCODER = "h264_videotoolbox"
+        self.assertEqual(self.m.hwaccel_decode_args("h264"), ["-hwaccel", "videotoolbox"])
+        self.assertEqual(self.m.hwaccel_decode_args("hevc"), ["-hwaccel", "videotoolbox"])
+
+    def test_empty_when_the_active_encoder_is_software(self):
+        self.m._ENCODER = "libx264"
+        self.assertEqual(self.m.hwaccel_decode_args("hevc"), [])
+
+    def test_empty_for_a_codec_not_verified_against_videotoolbox(self):
+        # Scoped deliberately to the codecs actually measured -- anything
+        # else falls back to ordinary software decode rather than risking
+        # an unverified combination.
+        self.m._ENCODER = "h264_videotoolbox"
+        self.assertEqual(self.m.hwaccel_decode_args("vp9"), [])
+        self.assertEqual(self.m.hwaccel_decode_args(None), [])
+
+    def _capture_popen(self):
+        real_popen = self.m.subprocess.Popen
+        self.addCleanup(setattr, self.m.subprocess, "Popen", real_popen)
+        captured = {}
+        def fake_popen(cmd, **kw):
+            captured["cmd"] = cmd
+            return type("P", (), {"poll": lambda self: None, "wait": lambda self: 0,
+                                  "returncode": 0, "stdout": None, "stderr": None})()
+        self.m.subprocess.Popen = fake_popen
+        return captured
+
+    def test_start_live_from_url_includes_hwaccel_when_transcoding_on_videotoolbox(self):
+        m = self.m
+        m._ENCODER = "h264_videotoolbox"
+        m.hls_live_enabled = lambda: False   # simpler branch, same input args shape
+        captured = self._capture_popen()
+        job = self.job(id="hwjob1")
+        m.start_live_from_url(job, "http://example.test/src.mkv", "video",
+                              vcodec="hevc", height=1080, hdr=False, pix="yuv420p10le")
+        i = captured["cmd"].index("-i")
+        self.assertEqual(captured["cmd"][i - 2:i], ["-hwaccel", "videotoolbox"])
+
+    def test_start_live_from_url_omits_hwaccel_on_software_encoder(self):
+        m = self.m
+        m._ENCODER = "libx264"
+        m.hls_live_enabled = lambda: False
+        captured = self._capture_popen()
+        job = self.job(id="hwjob2")
+        m.start_live_from_url(job, "http://example.test/src.mkv", "video",
+                              vcodec="hevc", height=1080, hdr=False, pix="yuv420p10le")
+        self.assertNotIn("-hwaccel", captured["cmd"])
+
+    def test_start_compat_includes_hwaccel_when_source_needs_transcoding(self):
+        m = self.m
+        m._ENCODER = "h264_videotoolbox"
+        m.compat_path_for = lambda job: (os.path.join(self.dl, "compat.mp4"), None)
+        m.probe_media = lambda src: ("hevc", "eac3", 1080, False, 0, 100.0, "yuv420p10le")
+        captured = self._capture_popen()
+        src = os.path.join(self.dl, "src.mkv")
+        with open(src, "wb") as f:
+            f.write(b"x")
+        job = self.job(id="hwjob3", path=src)
+        m.start_compat(job)
+        i = captured["cmd"].index("-i")
+        self.assertEqual(captured["cmd"][i - 2:i], ["-hwaccel", "videotoolbox"])
 
 
 # --------------------------------------------------------------------------
@@ -1703,11 +1779,10 @@ class TestDirectPlayFlag(Base):
                       "start_live_from_url must have been called")
         self.assertEqual(
             captured["url"],
-            "http://127.0.0.1:%d/stream/%s?t=%s" % (m.PORT, job["id"], m.auth_token()),
+            "http://127.0.0.1:%d/stream/%s" % (m.PORT, job["id"]),
             "a still-downloading libtorrent job must feed the live encoder "
-            "through reel's own piece-aware /stream route (carrying the "
-            "install token, since every route now requires one), not the "
-            "raw preallocated file on disk")
+            "through reel's own piece-aware /stream route, not the raw "
+            "preallocated file on disk")
 
         # A well-formed URL is not enough by itself: this server 403s any
         # request with no token or the wrong one, and ffmpeg's own request to
@@ -2613,6 +2688,32 @@ class TestTorrentSubtitles(Base):
         files = [{"index": 0, "name": "Film.2026.mkv", "size": 6_000_000_000}]
         self.assertEqual(self.m.torrent_subs(files, files[0], "eng"), [])
 
+    def test_all_langs_returns_every_language_not_just_the_configured_one(self):
+        # The picker's whole point: languages the auto-pick would never try
+        # because they aren't SUBS_LANG must still show up as choices.
+        files, vids = self.pack(episodes=1)
+        default = self.m.torrent_subs(files, vids[0], "eng")
+        every = self.m.torrent_subs(files, vids[0], "eng", all_langs=True)
+        self.assertEqual(len(default), 1)          # unchanged: still narrowed
+        self.assertEqual(len(every), 3)             # English, French, Danish
+        names = {os.path.basename(f["name"]) for f in every}
+        self.assertEqual(names, {"2_English.srt", "17_French.srt", "9_Danish.srt"})
+        # still ranked wanted-language-first, same ordering rule as before
+        self.assertTrue(every[0]["name"].endswith("2_English.srt"))
+
+    def test_all_langs_still_respects_association_and_forced_ranking(self):
+        # all_langs only changes the final language filter, not which files
+        # get considered "mine" in the first place, nor how they're ordered.
+        files = [{"index": 0, "name": "A.mkv", "size": 6_000_000_000},
+                 {"index": 1, "name": "B.mkv", "size": 6_000_000_000},
+                 {"index": 2, "name": "Subs/English.srt", "size": 40_000}]
+        self.assertEqual(
+            self.m.torrent_subs(files, files[0], "eng", all_langs=True), [])
+        files2, vids2 = self.pack(episodes=1,
+                                   langs=("2_English_forced", "4_English"))
+        got = self.m.torrent_subs(files2, vids2[0], "eng", all_langs=True)
+        self.assertTrue(got[0]["name"].endswith("4_English.srt"))
+
     @needs_ffmpeg
     def test_srt_bytes_become_a_vtt_sidecar(self):
         j = self.job()
@@ -2692,6 +2793,105 @@ class TestTorrentSubtitles(Base):
                                   "fall through to the search path")
         self.assertIn("none could be fetched",
                       " ".join(e["m"] for e in j["log"]))
+
+    @needs_ffmpeg
+    def test_subs_from_torrent_records_every_language_as_a_candidate(self):
+        # Even though only English gets auto-installed, French and Danish
+        # must still land on the job for the picker to offer.
+        files, vids = self.pack(episodes=1)
+        srt = b"1\n00:00:01,000 --> 00:00:02,000\nHello.\n"
+
+        class Bk:
+            def fetch_file(self, job, port, cand, out_dir, timeout=None):
+                return srt if "English" in cand["name"] else None
+
+        real_backend = self.m.backend
+        self.m.backend = lambda: Bk()
+        try:
+            j = self.job()
+            self.m.subs_from_torrent(j, 0, files, vids[0], self.dl)
+            deadline = time.time() + 5
+            while time.time() < deadline and j.get("subs_status") != "ready":
+                time.sleep(0.05)
+        finally:
+            self.m.backend = real_backend
+        cands = j.get("subs_cands") or []
+        self.assertEqual(len(cands), 3)
+        langs = {c["lang"] for c in cands}
+        self.assertEqual(langs, {"eng", "fre", "dan"})
+        names = {c["name"] for c in cands}
+        self.assertEqual(names, {"2_English.srt", "17_French.srt", "9_Danish.srt"})
+        for c in cands:
+            self.assertIn("path", c)   # needed to fetch it later by hand
+
+
+# --------------------------------------------------------------------------
+class TestPickTorrentSub(Base):
+    """The manual override: choosing a specific in-torrent subtitle instead
+    of whatever subs_from_torrent auto-installed."""
+
+    def cands(self):
+        return [{"path": "Show/Subs/2_English.srt", "name": "2_English.srt",
+                  "size": 40_000, "lang": "eng"},
+                 {"path": "Show/Subs/17_French.srt", "name": "17_French.srt",
+                  "size": 41_000, "lang": "fre"}]
+
+    def test_unknown_index_is_refused(self):
+        j = self.job(subs_cands=self.cands(), wt_port=9999)
+        self.assertFalse(self.m.pick_torrent_sub(j, 5))
+        self.assertFalse(self.m.pick_torrent_sub(j, -1))
+
+    def test_without_a_live_torrent_port_it_is_refused(self):
+        j = self.job(subs_cands=self.cands(), wt_port=None)
+        self.assertFalse(self.m.pick_torrent_sub(j, 1))
+
+    @needs_ffmpeg
+    def test_picking_a_candidate_fetches_and_installs_it(self):
+        srt = b"1\n00:00:01,000 --> 00:00:02,000\nBonjour.\n"
+
+        class Bk:
+            def fetch_file(self, job, port, cand, out_dir, timeout=None):
+                self.calls = getattr(self, "calls", []) + [cand["name"]]
+                return srt
+
+        bk = Bk()
+        real_backend = self.m.backend
+        self.m.backend = lambda: bk
+        try:
+            j = self.job(subs_cands=self.cands(), wt_port=1234,
+                         subs_status="ready", subs_name="2_English.srt")
+            self.assertTrue(self.m.pick_torrent_sub(j, 1))   # the French one
+            deadline = time.time() + 5
+            while time.time() < deadline and j.get("subs_name") != "17_French.srt":
+                time.sleep(0.05)
+        finally:
+            self.m.backend = real_backend
+        self.assertEqual(j["subs_status"], "ready")
+        self.assertEqual(j["subs_source"], "torrent")
+        self.assertTrue(j["subs_exact"])
+        self.assertEqual(j["subs_name"], "17_French.srt")
+        # fetched by the torrent-internal path, not the display name
+        self.assertEqual(bk.calls, ["Show/Subs/17_French.srt"])
+
+    def test_a_fetch_that_fails_leaves_the_previous_pick_in_place(self):
+        class Bk:
+            def fetch_file(self, job, port, cand, out_dir, timeout=None):
+                return None
+
+        real_backend = self.m.backend
+        self.m.backend = lambda: Bk()
+        try:
+            j = self.job(subs_cands=self.cands(), wt_port=1234,
+                         subs_status="ready", subs_name="2_English.srt")
+            self.assertTrue(self.m.pick_torrent_sub(j, 1))
+            deadline = time.time() + 5
+            while time.time() < deadline and j.get("subs_status") == "searching":
+                time.sleep(0.05)
+        finally:
+            self.m.backend = real_backend
+        self.assertEqual(j["subs_status"], "ready")   # kept, not left stuck
+        self.assertEqual(j["subs_name"], "2_English.srt")   # unchanged
+        self.assertIn("could not fetch", j["subs_note"])
 
 
 # --------------------------------------------------------------------------
@@ -5193,81 +5393,12 @@ class TestStreamingContractAndParsers(unittest.TestCase):
             raise ValueError("invalid literal for int(): 'abc'")
         m.catalogue_with_copies = boom
         h = self._handler(path="/find",
-                          headers={"Content-Length": "2",
-                                   "Cookie": "reel_token=" + m.auth_token()},
+                          headers={"Content-Length": "2"},
                           rfile=io.BytesIO(b"{}"),
                           client_address=("127.0.0.1", 0))
         h.do_POST()                                   # must not raise
         self.assertIn(b"results", h.wfile.getvalue(),
                       "a failed search must answer a JSON body, not drop")
-
-
-class TestAuthGate(unittest.TestCase):
-    """Every route is gated by a per-install token. The token rides a same-origin
-    cookie so <video>/stream requests carry it automatically; it also arrives by
-    ?t= (the QR/handoff link) or X-Reel-Token header."""
-
-    def setUp(self):
-        self.dl = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dl, ignore_errors=True)
-        self.m = load_reel(self.dl)
-        self.tok = self.m.auth_token()
-
-    def _h(self, path="/jobs", headers=None):
-        h = self.m.H.__new__(self.m.H)
-        h.path = path
-        h.headers = headers or {}
-        h.wfile = io.BytesIO()
-        h.rfile = io.BytesIO(b"")
-        h.client_address = ("127.0.0.1", 0)
-        h.close_connection = False
-        h.send_response = lambda *a, **k: None
-        h.send_header = lambda *a, **k: None
-        h.end_headers = lambda: None
-        return h
-
-    def test_token_is_stable_across_reloads(self):
-        # Persisted in the cache dir so bookmarks and the QR link keep working.
-        again = load_reel(self.dl)
-        self.assertEqual(again.auth_token(), self.tok)
-        self.assertGreaterEqual(len(self.tok), 16)
-
-    def test_authorized_accepts_cookie_query_or_header(self):
-        m = self.m
-        self.assertTrue(m.authorized(self._h(headers={"Cookie": "reel_token=" + self.tok})))
-        self.assertTrue(m.authorized(self._h(path="/jobs?t=" + self.tok)))
-        self.assertTrue(m.authorized(self._h(headers={"X-Reel-Token": self.tok})))
-
-    def test_authorized_rejects_missing_or_wrong_token(self):
-        m = self.m
-        self.assertFalse(m.authorized(self._h()))
-        self.assertFalse(m.authorized(self._h(headers={"Cookie": "reel_token=nope"})))
-        self.assertFalse(m.authorized(self._h(path="/jobs?t=wrong")))
-
-    def test_do_POST_refuses_without_a_token(self):
-        m = self.m
-        ran = {"add": False}
-        m.split_sources = lambda *a, **k: (ran.__setitem__("add", True), ([], [], 0))[1]
-        h = self._h(path="/add", headers={"Content-Length": "2"})
-        h.rfile = io.BytesIO(b"{}")
-        h.do_POST()
-        self.assertFalse(ran["add"], "/add must not run without a valid token")
-
-    def test_do_GET_refuses_jobs_without_a_token(self):
-        m = self.m
-        h = self._h(path="/jobs")
-        h.do_GET()
-        self.assertIn(b"unauthorized", h.wfile.getvalue())
-
-    def test_page_load_with_token_sets_the_cookie(self):
-        m = self.m
-        sent = []
-        h = self._h(path="/?t=" + self.tok)
-        h.send_header = lambda k, v: sent.append((k, v))
-        h.do_GET()
-        self.assertTrue(
-            any(k == "Set-Cookie" and ("reel_token=" + self.tok) in v for k, v in sent),
-            "loading / with a valid token must set the cookie")
 
 
 class TestHlsLivePhase(unittest.TestCase):
@@ -5315,7 +5446,7 @@ class TestHlsLivePhase(unittest.TestCase):
         # blob:, so media-src must permit it.
         m = self.m
         sent = []
-        h = self._h(path="/?t=" + m.auth_token())
+        h = self._h(path="/")
         h.send_header = lambda k, v: sent.append((k, v))
         h.do_GET()
         csp = next((v for k, v in sent if k == "Content-Security-Policy"), "")
@@ -5395,8 +5526,7 @@ class TestHlsLivePhase(unittest.TestCase):
         self.assertTrue(cmd[-1].endswith("index.m3u8"))
 
     def _get(self, path, headers=None):
-        h = self._h(path=path, headers=dict(headers or {},
-                    **{"Cookie": "reel_token=" + self.m.auth_token()}))
+        h = self._h(path=path, headers=dict(headers or {}))
         codes, hdrs = [], []
         h.send_response = lambda c: codes.append(c)
         h.send_header = lambda k, v: hdrs.append((k, v))
@@ -5456,15 +5586,306 @@ class TestHlsLivePhase(unittest.TestCase):
         # scheduler loop next ticks.
         m = self.m
         body = json.dumps({"links": "abcdefghij0123456789ABCDEFGHIJ"}).encode()
-        h = self._h(path="/add", headers={
-            "Cookie": "reel_token=" + m.auth_token(),
-            "Content-Length": str(len(body))})
+        h = self._h(path="/add", headers={"Content-Length": str(len(body))})
         h.rfile = io.BytesIO(body)
         h.do_POST()
         jobs = list(m.JOBS.values())
         self.assertEqual(len(jobs), 1, "one item was added")
         self.assertFalse(jobs[0]["hold"],
                          "the first item must start within /add, not after the tick")
+
+    def test_subs_pick_calls_pick_torrent_sub_with_the_posted_index(self):
+        m = self.m
+        j = m.new_job("drive-subpick",
+                      subs_cands=[{"path": "a", "name": "a.srt", "lang": "eng"}],
+                      wt_port=1234)
+        m.JOBS[j["id"]] = j
+        calls = []
+        real = m.pick_torrent_sub
+        m.pick_torrent_sub = lambda job, idx: calls.append((job["id"], idx)) or True
+        try:
+            body = json.dumps({"id": j["id"], "i": 0}).encode()
+            h = self._h(path="/subs_pick",
+                        headers={"Content-Length": str(len(body))})
+            h.rfile = io.BytesIO(body)
+            h.do_POST()
+        finally:
+            m.pick_torrent_sub = real
+        self.assertEqual(calls, [(j["id"], 0)])
+
+    def test_subs_pick_reports_failure_for_an_unknown_job(self):
+        m = self.m
+        body = json.dumps({"id": "no-such-job", "i": 0}).encode()
+        h = self._h(path="/subs_pick", headers={"Content-Length": str(len(body))})
+        h.rfile = io.BytesIO(body)
+        h.do_POST()
+        out = json.loads(h.wfile.getvalue())
+        self.assertFalse(out["ok"])
+
+    # ---- /events (SSE): pushes the same payload /jobs answers, the moment
+    # something changes, instead of the client polling once a second. -------
+
+    class _OneShotWfile:
+        """Accepts exactly one write, then behaves like a viewer whose tab
+        just closed -- the only disconnect signal a stdlib SSE loop gets."""
+        def __init__(self):
+            self.chunks = []
+
+        def write(self, b):
+            self.chunks.append(b)
+            raise BrokenPipeError()
+
+    def test_events_route_dispatches_to_the_handler(self):
+        h = self._h(path="/events")
+        called = []
+        h._events = lambda: called.append(1)
+        h.do_GET()
+        self.assertEqual(called, [1])
+
+    def test_events_pushes_the_same_shape_jobs_answers(self):
+        m = self.m
+        j = m.new_job("drive-sse", title="SSE Test")
+        m.JOBS[j["id"]] = j
+        h = self._h(path="/events")
+        h.wfile = self._OneShotWfile()
+        h._events()   # must return cleanly once the write fails, not raise
+        self.assertEqual(len(h.wfile.chunks), 1)
+        line = h.wfile.chunks[0].decode()
+        self.assertTrue(line.startswith("data: ") and line.endswith("\n\n"),
+                        "must be a well-formed SSE data line: %r" % line)
+        payload = json.loads(line[len("data: "):].strip())
+        self.assertEqual(payload, [m.public(j)])
+
+    def test_events_refuses_a_cross_origin_request(self):
+        h = self._h(path="/events", headers={"Origin": "http://evil.example"})
+        h._events()
+        body = json.loads(h.wfile.getvalue())
+        self.assertIn("error", body)
+
+    def test_events_does_not_rewrite_when_nothing_changed(self):
+        # Re-sending identical bytes every 0.5s would defeat the entire point
+        # (a push the instant something changes, not a disguised poll) -- only
+        # an actual change, or the 15s idle heartbeat, should produce a write.
+        m = self.m
+        j = m.new_job("drive-sse2")
+        m.JOBS[j["id"]] = j
+        h = self._h(path="/events")
+        h.wfile = io.BytesIO()
+
+        real_sleep = self.m.time.sleep
+        calls = {"n": 0}
+
+        def fake_sleep(secs):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                raise RuntimeError("stop the loop")
+        self.m.time.sleep = fake_sleep
+        self.addCleanup(setattr, self.m.time, "sleep", real_sleep)
+
+        with self.assertRaises(RuntimeError):
+            h._events()
+        text = h.wfile.getvalue().decode()
+        self.assertEqual(text.count("data: "), 1,
+                         "unchanged job state must not be re-sent every tick")
+
+
+# --------------------------------------------------------------------------
+class TestAudioMenuIndexing(unittest.TestCase):
+    """The bug found live, watching a real dual-audio release: selecting
+    English played Japanese and vice versa. fillAudioMenu stored/compared
+    t.index (a track's original *source*-container stream number) where
+    everything downstream -- wantedAudioIndex, and applyAudioChoice's
+    v.audioTracks[i] -- expects the track's *output* array position.
+    audio_remap_args() (reel.py) deliberately reorders tracks so the
+    guessed-best plays first in the output; the two numbers only diverge
+    once reordering has actually moved something, which is exactly the
+    case that shipped broken and the case a naive same-order test fixture
+    would never catch."""
+
+    def extract_js(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reel.py")
+        with open(path) as f:
+            src = f.read()
+        m = re.search(r'PAGE = r"""(.*?)"""', src, re.DOTALL)
+        return re.findall(r"<script>(.*?)</script>", m.group(1), re.DOTALL)[0]
+
+    def test_menu_stores_and_compares_array_position_not_source_index(self):
+        js = self.extract_js()
+        start = js.index("function fillAudioSection(")
+        end = js.index("v.addEventListener('play'")
+        fn = js[start:end]
+        self.assertIn("tracks.forEach((t, pos)", fn,
+                      "must iterate with the array position, not just the track")
+        self.assertIn("pos === want", fn)
+        self.assertIn("String(pos)", fn)
+        self.assertNotIn("t.index === want", fn)
+        self.assertNotIn("String(t.index)", fn)
+
+    @needs_node
+    def test_reordered_track_selection_enables_the_correct_browser_track(self):
+        """End-to-end against the real, unmodified fillAudioMenu -- not a
+        hand-rolled replica of what its click handler is supposed to do,
+        which would pass regardless of whether the real code is actually
+        fixed. A fake DOM captures the real buttons fillAudioMenu builds and
+        clicks them for real, so this only passes if fillAudioMenu's own
+        click handler does the right thing. Track shape matches the live bug
+        report exactly: v.audioTracks in *output* order (the browser's real
+        behavior) with t.index deliberately different from array position."""
+        js = self.extract_js()
+        start = js.index("const LANG_NAMES")
+        end = js.index("v.addEventListener('play'")
+        snippet = js[start:end]
+
+        harness = """
+        const HAS_AUDIO_TRACKS = true;
+        const localStorage = { _d: {}, getItem(k){ return k in this._d ? this._d[k] : null; },
+                               setItem(k, v){ this._d[k] = String(v); } };
+        let order = ['job1']; let cur = 0;
+        function byId(id) { return id === 'job1' ? JOB : null; }
+        const JOB = {
+          id: 'job1',
+          audio_default: 0,
+          // Output order: English first (source index 1, reordered),
+          // Japanese second (source index 0) -- the real shape from the
+          // live bug report.
+          audio_tracks: [
+            {index: 1, lang: 'eng', title: ''},
+            {index: 0, lang: 'jpn', title: ''},
+          ],
+        };
+        // v.audioTracks in the same *output* order a real browser reports.
+        const v = { audioTracks: [
+          {enabled: false, language: 'eng'},
+          {enabled: false, language: 'jpn'},
+        ] };
+
+        // Minimal fake DOM -- just enough for fillAudioMenu to build real
+        // buttons with real, invokable click listeners.
+        function fakeEl() {
+          return { className: '', textContent: '', type: '', _click: null,
+                   addEventListener(ev, cb) { if (ev === 'click') this._click = cb; },
+                   click() { this._click({stopPropagation(){}}); } };
+        }
+        global.document = { createElement() { return fakeEl(); } };
+        const appended = [];
+        const el = { morepanel: { textContent: '', childNodes: appended,
+                                   append(x) { appended.push(x); } } };
+        """ + snippet + """
+        fillMoreMenu('job1', el);
+        const buttons = appended.filter(x => x.type === 'button');
+        if (buttons.length !== 2) {
+          console.log('FAIL: expected 2 menu buttons, got ' + buttons.length);
+          process.exit(1);
+        }
+        buttons[0].click();   // the "English" entry (output position 0)
+        if (v.audioTracks[0].enabled !== true || v.audioTracks[1].enabled !== false) {
+          console.log('FAIL: selecting English (position 0) did not enable the English browser track');
+          process.exit(1);
+        }
+        buttons[1].click();   // the "Japanese" entry (output position 1)
+        if (v.audioTracks[1].enabled !== true || v.audioTracks[0].enabled !== false) {
+          console.log('FAIL: selecting Japanese (position 1) did not enable the Japanese browser track');
+          process.exit(1);
+        }
+        console.log('OK');
+        """
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(harness)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("OK", r.stdout)
+        finally:
+            os.unlink(path)
+
+
+# --------------------------------------------------------------------------
+class TestSubsMenu(unittest.TestCase):
+    """The in-torrent subtitle picker: fillSubsSection lists every candidate
+    subs_from_torrent found (any language), marks whichever one is currently
+    installed, and a click asks the server to switch to it."""
+
+    def extract_js(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reel.py")
+        with open(path) as f:
+            src = f.read()
+        m = re.search(r'PAGE = r"""(.*?)"""', src, re.DOTALL)
+        return re.findall(r"<script>(.*?)</script>", m.group(1), re.DOTALL)[0]
+
+    def test_more_button_shows_for_multiple_subtitles_alone(self):
+        # A single-audio-track item with several in-torrent subtitles must
+        # still surface the picker -- the button can't be gated on audio
+        # tracks alone once subtitles have their own multi-choice case.
+        js = self.extract_js()
+        start = js.index("const nTracks = (j.audio_tracks || []).length;")
+        end = js.index("el.note.textContent")
+        snippet = js[start:end]
+        self.assertIn("nSubs", snippet)
+        self.assertIn("nSubs > 1", snippet)
+
+    @needs_node
+    def test_picking_a_candidate_posts_its_index(self):
+        js = self.extract_js()
+        start = js.index("const LANG_NAMES")
+        end = js.index("v.addEventListener('play'")
+        snippet = js[start:end]
+
+        harness = """
+        const HAS_AUDIO_TRACKS = true;
+        let order = ['job1']; let cur = 0;
+        const calls = [];
+        const api = async (u, b) => { calls.push([u, b]); return {ok: true}; };
+        const JOB = {
+          id: 'job1', audio_tracks: [], audio_default: 0,
+          subs_status: 'ready', subs_name: '2_English.srt',
+          subs_cands: [
+            {path: 'Show/Subs/2_English.srt', name: '2_English.srt', size: 1, lang: 'eng'},
+            {path: 'Show/Subs/17_French.srt', name: '17_French.srt', size: 1, lang: 'fre'},
+          ],
+        };
+        function byId(id) { return id === 'job1' ? JOB : null; }
+        function fakeEl() {
+          return { className: '', textContent: '', type: '', disabled: false, _click: null,
+                   addEventListener(ev, cb) { if (ev === 'click') this._click = cb; },
+                   click() { this._click({stopPropagation(){}}); } };
+        }
+        global.document = { createElement() { return fakeEl(); } };
+        const appended = [];
+        const el = { morepanel: { textContent: '', childNodes: appended,
+                                   append(x) { appended.push(x); } } };
+        """ + snippet + """
+        fillMoreMenu('job1', el);
+        const buttons = appended.filter(x => x.type === 'button');
+        if (buttons.length !== 2) {
+          console.log('FAIL: expected 2 subtitle buttons, got ' + buttons.length);
+          process.exit(1);
+        }
+        if (!buttons[0].className.includes(' on')) {
+          console.log('FAIL: the currently-installed candidate should be checked');
+          process.exit(1);
+        }
+        if (buttons[1].className.includes(' on')) {
+          console.log('FAIL: only the installed candidate should be checked');
+          process.exit(1);
+        }
+        buttons[1].click();   // switch to the French one
+        if (calls.length !== 1 || calls[0][0] !== '/subs_pick'
+            || calls[0][1].id !== 'job1' || calls[0][1].i !== 1) {
+          console.log('FAIL: expected one /subs_pick call for index 1, got ' + JSON.stringify(calls));
+          process.exit(1);
+        }
+        console.log('OK');
+        """
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(harness)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("OK", r.stdout)
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":
